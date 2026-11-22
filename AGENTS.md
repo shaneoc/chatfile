@@ -23,3 +23,12 @@ conversations stored as plain Markdown files inside nested directories.
 ## Build & Verification Rules
 - Use `cargo check` and `cargo test` after every module change.
 - Keep dependencies minimal and well-maintained.
+
+## Rust Dependencies
+- Only use crates available as `librust-*-dev` packages in Debian (installed in
+  `/usr/share/cargo/registry`).
+- Before adding any new dependency to `Cargo.toml`, check if it exists in
+  Debian via `apt-cache search librust-<name>-dev`. If the package exists as a
+  Debian package however it has not been installed to
+  `/usr/share/cargo/registry`, then temporarily stop your work and inform the
+  user that the package needs to be installed.
