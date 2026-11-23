@@ -31,7 +31,7 @@ enum Command {
     /// Read the conversation file and run the next assistant turn.
     ///
     /// The reply is streamed to stdout and appended to the file as a
-    /// `<!-- role: assistant -->` turn.
+    /// `# Assistant` turn.
     Run {
         /// Path to the conversation .md file.
         file: PathBuf,
@@ -91,7 +91,7 @@ async fn run(file: &Path) -> Result<()> {
     }
     if messages.is_empty() {
         bail!(
-            "{} has no turns and no system prompt; add a `<!-- role: user -->` turn first",
+            "{} has no turns and no system prompt; add a `# User` turn first",
             file.display()
         );
     }
@@ -136,7 +136,9 @@ async fn run(file: &Path) -> Result<()> {
     if !raw.ends_with('\n') {
         appendage.push('\n');
     }
-    appendage.push_str(&format!("\n<!-- role: assistant -->\n\n{}\n", reply.trim_end()));
+    // Demote any headers in the reply so it can't be mistaken for a turn marker.
+    let reply = parser::demote_headers(reply.trim_end());
+    appendage.push_str(&format!("\n# Assistant\n\n{}\n", reply));
 
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -160,7 +162,7 @@ fn new(file: &Path) -> Result<()> {
         }
     }
     let template = format!(
-        "---\nmodel: {0}\nendpoint: {1}\nsystem_prompt:\n---\n\n<!-- role: user -->\n\nYour prompt here\n",
+        "---\nmodel: {0}\nendpoint: {1}\nsystem_prompt:\n---\n\n# User\n\nYour prompt here\n",
         DEFAULT_MODEL,
         llm::DEFAULT_ENDPOINT
     );
@@ -183,7 +185,7 @@ mod tests {
         let content = std::fs::read_to_string(&file).unwrap();
         assert!(content.starts_with("---\nmodel: local-model\n"));
         assert!(content.contains(llm::DEFAULT_ENDPOINT));
-        assert!(content.contains("<!-- role: user -->"));
+        assert!(content.contains("# User"));
 
         // Must parse cleanly, with a single empty user turn.
         let conv = parser::parse(&content).unwrap();
