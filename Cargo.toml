@@ -8,10 +8,14 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.27", features = ["event-stream"] }
 futures = "0.3"
+ratatui = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+unicode-width = "0.1"

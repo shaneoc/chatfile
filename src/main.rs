@@ -1,9 +1,12 @@
 //! mdchat — manage LLM conversations as plain Markdown files.
 //!
-//! Milestone 1: core CLI and the Markdown conversation loop.
-//!   - `mdchat run <file.md>`  stream the next assistant turn into stdout
+//!   - `mdchat <file>`         open the interactive TUI on a conversation
+//!                             (`.chat.md` is appended when no extension is
+//!                             given; the file is created with default YAML
+//!                             frontmatter if it does not exist yet)
+//!   - `mdchat run <file>`     stream the next assistant turn into stdout
 //!                             and append it to the file
-//!   - `mdchat new <file.md>`  create a starter conversation template
+//!   - `mdchat new <file>`     create a starter conversation template
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,7 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use mdchat::{context, llm, parser};
+use mdchat::{context, llm, parser, tui};
 
 /// Environment variable overrides (frontmatter wins over these).
 const ENV_ENDPOINT: &str = "MDCHAT_ENDPOINT";
@@ -19,26 +22,33 @@ const ENV_MODEL: &str = "MDCHAT_MODEL";
 const ENV_API_KEY: &str = "MDCHAT_API_KEY";
 const DEFAULT_MODEL: &str = "local-model";
 
+/// The only file extension accepted for conversation files.
+const CONVERSATION_EXT: &str = "chat.md";
+
 #[derive(Parser)]
 #[command(name = "mdchat", version, about = "Manage LLM conversations as plain Markdown files")]
 struct Cli {
+    /// Conversation file to open in the interactive TUI.
+    #[arg(value_name = "FILE")]
+    file: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
     /// Read the conversation file and run the next assistant turn.
     ///
-    /// The reply is streamed to stdout and appended to the file as a
-    /// `# Assistant` turn.
+    /// The reply is streamed to stdout and appended to the file as an
+    /// `**Assistant**` turn.
     Run {
-        /// Path to the conversation .md file.
+        /// Path to the conversation .chat.md file.
         file: PathBuf,
     },
     /// Create a starter conversation template at the given path.
     New {
-        /// Path for the new conversation .md file (parents are created).
+        /// Path for the new conversation file (parents are created; the
+        /// `.chat.md` extension is applied when missing).
         file: PathBuf,
     },
 }
@@ -47,17 +57,94 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { file } => run(&file).await,
-        Command::New { file } => new(&file),
+        Some(Command::Run { file }) => run(&file).await,
+        Some(Command::New { file }) => new(&file),
+        None => match cli.file {
+            Some(file) => open_tui(file).await,
+            None => bail!("missing conversation file; try `mdchat --help`"),
+        },
     }
+}
+
+/// True when the path ends with the `.chat.md` extension.
+fn has_conversation_ext(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|n| n.ends_with(&format!(".{CONVERSATION_EXT}")))
+}
+
+/// Normalize a path for `new`: append `.chat.md` when the name has no
+/// `.chat.md` extension (a plain `.md` is replaced).
+fn with_conversation_ext(path: &Path) -> PathBuf {
+    if has_conversation_ext(path) {
+        return path.to_path_buf();
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let new_name = if name.ends_with(".md") {
+        format!("{}.chat.md", &name[..name.len() - 3])
+    } else {
+        format!("{name}.chat.md")
+    };
+    let mut out = path.to_path_buf();
+    out.pop();
+    out.push(new_name);
+    out
+}
+
+/// The metadata portion of a boundary line (` · *...*`), or empty when the
+/// metadata is absent.
+fn meta_boundary_suffix(meta: &parser::TurnMeta) -> String {
+    match meta.render() {
+        Some(r) => format!(" · *{r}*"),
+        None => String::new(),
+    }
+}
+
+/// Reject paths that do not carry the `.chat.md` extension.
+fn require_conversation_ext(path: &Path) -> Result<()> {
+    if !has_conversation_ext(path) {
+        bail!(
+            "{} is not a conversation file; expected a .{CONVERSATION_EXT} extension",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// `mdchat <file>` — open the interactive TUI.
+async fn open_tui(path: PathBuf) -> Result<()> {
+    // Append the extension when none was given; otherwise require it.
+    let path = if path.extension().is_none() {
+        path.with_extension(CONVERSATION_EXT)
+    } else {
+        path
+    };
+    require_conversation_ext(&path)?;
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create parent directories for {}", path.display()))?;
+            }
+        }
+        std::fs::write(&path, default_template())
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        eprintln!("[mdchat] created {} with default frontmatter", path.display());
+    }
+    tui::run_tui(path).await
 }
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// `mdchat run <file.md>`
+/// `mdchat run <file.chat.md>`
 async fn run(file: &Path) -> Result<()> {
+    require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
     let conv = parser::parse(&raw)
@@ -91,13 +178,13 @@ async fn run(file: &Path) -> Result<()> {
     }
     if messages.is_empty() {
         bail!(
-            "{} has no turns and no system prompt; add a `# User` turn first",
+            "{} has no turns and no system prompt; add a `**User**` turn first",
             file.display()
         );
     }
 
     eprintln!("[mdchat] model={} endpoint={}", model, endpoint);
-    let client = llm::Client::new(endpoint, model, api_key);
+    let client = llm::Client::new(endpoint, model.clone(), api_key);
     let mut stream = client.stream_chat(&messages).await?;
 
     // Stream the reply to stdout while accumulating it.
@@ -136,9 +223,15 @@ async fn run(file: &Path) -> Result<()> {
     if !raw.ends_with('\n') {
         appendage.push('\n');
     }
-    // Demote any headers in the reply so it can't be mistaken for a turn marker.
-    let reply = parser::demote_headers(reply.trim_end());
-    appendage.push_str(&format!("\n# Assistant\n\n{}\n", reply));
+    // Escape any boundary pattern in the reply so it can't be mistaken for a
+    // real turn marker, and stamp the turn with time and model metadata.
+    let ts = parser::now_timestamp();
+    let meta = parser::TurnMeta {
+        timestamp: Some(ts),
+        tags: vec![("model".into(), model.clone())],
+    };
+    let reply = parser::escape_boundaries(reply.trim_end());
+    appendage.push_str(&format!("\n---\n**Assistant**{}\n\n{}\n", meta_boundary_suffix(&meta), reply));
 
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -150,8 +243,19 @@ async fn run(file: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `mdchat new <file.md>`
+/// The starter template written by `new` (and by the TUI when it creates a
+/// missing file).
+fn default_template() -> String {
+    format!(
+        "---\nmodel: {0}\nendpoint: {1}\nsystem_prompt:\n---\n\n---\n**User**\n\nYour prompt here\n",
+        DEFAULT_MODEL,
+        llm::DEFAULT_ENDPOINT
+    )
+}
+
+/// `mdchat new <file>`
 fn new(file: &Path) -> Result<()> {
+    let file = with_conversation_ext(file);
     if file.exists() {
         bail!("{} already exists; refusing to overwrite", file.display());
     }
@@ -161,12 +265,7 @@ fn new(file: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create parent directories for {}", file.display()))?;
         }
     }
-    let template = format!(
-        "---\nmodel: {0}\nendpoint: {1}\nsystem_prompt:\n---\n\n# User\n\nYour prompt here\n",
-        DEFAULT_MODEL,
-        llm::DEFAULT_ENDPOINT
-    );
-    std::fs::write(file, template).with_context(|| format!("failed to write {}", file.display()))?;
+    std::fs::write(&file, default_template()).with_context(|| format!("failed to write {}", file.display()))?;
     eprintln!("[mdchat] created {}", file.display());
     Ok(())
 }
@@ -182,19 +281,55 @@ mod tests {
         let file = dir.join("a").join("b").join("conv.md");
 
         new(&file).unwrap();
-        let content = std::fs::read_to_string(&file).unwrap();
+        // A plain `.md` name is normalized to `.chat.md`.
+        let created = dir.join("a").join("b").join("conv.chat.md");
+        assert!(created.exists());
+        let content = std::fs::read_to_string(&created).unwrap();
         assert!(content.starts_with("---\nmodel: local-model\n"));
         assert!(content.contains(llm::DEFAULT_ENDPOINT));
-        assert!(content.contains("# User"));
+        assert!(content.contains("**User**"));
 
-        // Must parse cleanly, with a single empty user turn.
+        // Must parse cleanly, with a single user turn.
         let conv = parser::parse(&content).unwrap();
         assert!(conv.had_frontmatter);
         assert_eq!(conv.turns.len(), 1);
         assert_eq!(conv.turns[0].role, parser::Role::User);
+        assert_eq!(conv.turns[0].content, "Your prompt here");
 
         // Refuse to overwrite an existing file.
         assert!(new(&file).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_appends_default_extension() {
+        let dir = std::env::temp_dir().join(format!("mdchat-newext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("notes");
+
+        new(&file).unwrap();
+        assert!(dir.join("notes.chat.md").exists());
+
+        // An explicit `.chat.md` is left untouched.
+        new(&dir.join("exact.chat.md")).unwrap();
+        assert!(dir.join("exact.chat.md").exists());
+        assert!(!dir.join("exact.chat.chat.md").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_rejects_wrong_extension() {
+        let dir = std::env::temp_dir().join(format!("mdchat-runext-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("conv.md");
+        std::fs::write(&file, "---\n**User**\n\nhi\n").unwrap();
+
+        let err = require_conversation_ext(&file).unwrap_err().to_string();
+        assert!(err.contains(".chat.md"), "unexpected error: {err}");
+        assert!(require_conversation_ext(&dir.join("ok.chat.md")).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

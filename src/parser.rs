@@ -8,28 +8,32 @@
 //! system_prompt: You are terse.
 //! ---
 //!
-//! Optional preamble text before the first role header.
+//! Optional preamble text before the first turn boundary.
 //!
-//! # User
+//! ---
+//! **User** · *2026-11-22 14:30*
 //!
 //! Hello!
 //!
-//! # Assistant
+//! ---
+//! **Assistant** · *2026-11-22 14:31 · model: local-model*
 //!
 //! Hi there.
 //! ```
 //!
-//! Turns are delimited by depth-1 ATX headers (`# User`, `# Assistant`,
-//! `# Tool`, `# System`). When a conversation is serialized, every ATX
-//! header found in turn content (outside fenced code blocks) is demoted one
-//! level so that message content can never be confused with mdchat's own
-//! section headers; the parser reverses this on the way back in.
+//! Turns are delimited by a horizontal rule (`---`) followed on the next line
+//! by the role in bold, optionally with metadata in italics:
+//! `**<role>** · *YYYY-MM-DD HH:MM · key: value · ...*`. The metadata block
+//! and every tag inside it are optional. When serializing, any occurrence of
+//! this exact pattern in unfenced message content is escaped (a backslash is
+//! added before the role's first asterisk) so it cannot be mistaken for a
+//! real turn boundary on the next parse.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Roles recognized by their depth-1 header (`# User`, ...).
+/// Roles recognized in turn boundaries (`**User**`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -49,7 +53,7 @@ impl Role {
         }
     }
 
-    /// The title used in section headers (`# User`, ...).
+    /// The title used in turn boundaries (`**User**`, ...).
     pub fn title(self) -> &'static str {
         match self {
             Role::System => "System",
@@ -77,6 +81,38 @@ impl fmt::Display for Role {
     }
 }
 
+/// Metadata attached to a turn boundary line.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TurnMeta {
+    /// Timestamp in `YYYY-MM-DD HH:MM` form, if present.
+    pub timestamp: Option<String>,
+    /// Arbitrary `key: value` tags (e.g. `("model", "local-model")`).
+    pub tags: Vec<(String, String)>,
+}
+
+impl TurnMeta {
+    /// The metadata as it appears inside the italic block of a boundary line,
+    /// or `None` when there is none.
+    pub fn render(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ts) = &self.timestamp {
+            parts.push(ts.clone());
+        }
+        for (k, v) in &self.tags {
+            parts.push(if v.is_empty() {
+                k.clone()
+            } else {
+                format!("{k}: {v}")
+            });
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    }
+}
+
 /// YAML frontmatter fields. Unknown keys are ignored on parse.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Frontmatter {
@@ -101,11 +137,12 @@ impl Frontmatter {
     }
 }
 
-/// A single conversation turn: a role header plus its content.
+/// A single conversation turn: a boundary line plus its content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Turn {
     pub role: Role,
     pub content: String,
+    pub meta: TurnMeta,
 }
 
 /// A parsed conversation file.
@@ -114,42 +151,61 @@ pub struct Conversation {
     pub frontmatter: Frontmatter,
     /// Whether the source file began with a YAML frontmatter block.
     pub had_frontmatter: bool,
-    /// Body text before the first role header (kept for lossless round-trips).
+    /// Body text before the first turn boundary (kept for lossless round-trips).
     pub preamble: String,
     pub turns: Vec<Turn>,
 }
 
-/// Recognize an ATX header line (CommonMark subset).
+/// Current local time formatted as `YYYY-MM-DD HH:MM`.
+pub fn now_timestamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// True for a horizontal-rule line: exactly `---` (whitespace tolerated).
+fn is_hr_line(line: &str) -> bool {
+    line.trim() == "---"
+}
+
+/// True when `s` looks like a `YYYY-MM-DD HH:MM` timestamp.
+fn looks_like_timestamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 16
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b' '
+        && b[13] == b':'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit())
+}
+
+/// Parse a boundary role line: `**<role>**` optionally followed by
+/// ` · *<timestamp> · <key>: <value> · ...*`.
 ///
-/// Returns `(depth, text)` when the line is a header: at most 3 leading
-/// spaces, 1–6 `#` characters, then a space/tab or end of line. An optional
-/// closing sequence (`## Title ##`) is stripped from the returned text.
-fn atx_header(line: &str) -> Option<(usize, &str)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
+/// The metadata block is optional, and so is every part of it: a line may be
+/// just `**User**`, or carry only a timestamp, only tags, or both.
+fn parse_role_line(line: &str) -> Option<(Role, TurnMeta)> {
+    let t = line.trim();
+    let rest = t.strip_prefix("**")?;
+    let end = rest.find("**")?;
+    let role = Role::parse(&rest[..end])?;
+    let mut meta = TurnMeta::default();
+    let after = rest[end + 2..].trim_start();
+    if !after.is_empty() {
+        let after_dot = after.strip_prefix('·')?;
+        let inner = after_dot.trim_start().strip_prefix('*')?;
+        let inner = inner.trim_end().strip_suffix('*')?;
+        for part in inner.split('·').map(str::trim).filter(|s| !s.is_empty()) {
+            if meta.timestamp.is_none() && looks_like_timestamp(part) {
+                meta.timestamp = Some(part.to_string());
+            } else if let Some((k, v)) = part.split_once(':') {
+                meta.tags.push((k.trim().to_string(), v.trim().to_string()));
+            } else {
+                meta.tags.push((part.to_string(), String::new()));
+            }
+        }
     }
-    let rest = &line[indent..];
-    let depth = rest.chars().take_while(|&c| c == '#').count();
-    if !(1..=6).contains(&depth) {
-        return None;
-    }
-    let after = &rest[depth..];
-    if !after.is_empty() && !after.starts_with([' ', '\t']) {
-        return None;
-    }
-    let mut text = after.trim();
-    // Strip an optional closing sequence: a trailing run of `#` preceded by
-    // whitespace (or starting the text, e.g. `## ###`).
-    let bytes = text.as_bytes();
-    let mut i = bytes.len();
-    while i > 0 && bytes[i - 1] == b'#' {
-        i -= 1;
-    }
-    if i < bytes.len() && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
-        text = text[..i].trim_end();
-    }
-    Some((depth, text))
+    Some((role, meta))
 }
 
 /// Tracks whether the scanner is inside a fenced code block (CommonMark subset).
@@ -207,19 +263,13 @@ impl FenceTracker {
     }
 }
 
-/// A line that is a depth-1 ATX header whose text names a role (`# User`, ...).
-fn parse_marker(line: &str) -> Option<Role> {
-    let (depth, text) = atx_header(line)?;
-    if depth != 1 {
-        return None;
-    }
-    Role::parse(text)
-}
-
 /// Split off a leading `---`-fenced YAML block.
 ///
 /// Returns `(Some(yaml), body)` when the file starts with frontmatter,
 /// otherwise `(None, input)`. The closing fence may be `---` or `...`.
+/// A line that parses as a turn boundary aborts frontmatter detection, so a
+/// file that begins directly with a conversation (no frontmatter) is not
+/// misread as YAML.
 fn split_frontmatter(input: &str) -> (Option<&str>, &str) {
     let mut offset = 0usize;
     let mut yaml_start: Option<usize> = None;
@@ -239,6 +289,9 @@ fn split_frontmatter(input: &str) -> (Option<&str>, &str) {
                     offset += line.len();
                     return (Some(yaml), &input[offset..]);
                 }
+                if parse_role_line(line).is_some() {
+                    return (None, input);
+                }
                 offset += line.len();
             }
         }
@@ -257,36 +310,45 @@ pub fn parse(input: &str) -> Result<Conversation> {
         conv.had_frontmatter = true;
     }
 
-    let mut preamble: Vec<String> = Vec::new();
-    let mut turn: Option<(Role, Vec<String>)> = None;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut preamble: Vec<&str> = Vec::new();
+    let mut turn: Option<(Role, TurnMeta, Vec<&str>)> = None;
     let mut fence = FenceTracker::default();
-
-    for line in body.lines() {
-        // `true` = inside a fenced code block: the line is content, never a marker.
-        let in_fence = fence.next_line(line);
-        if !in_fence {
-            if let Some(role) = parse_marker(line) {
-                match turn.take() {
-                    Some((r, lines)) => conv.turns.push(Turn {
-                        role: r,
-                        content: undemote_headers(lines.join("\n").trim()),
-                    }),
-                    None => conv.preamble = preamble.join("\n").trim().to_string(),
-                }
-                turn = Some((role, Vec::new()));
-                continue;
+    let mut i = 0usize;
+    while i < lines.len() {
+        // `true` = the line is inside a fenced code block.
+        let in_fence = fence.next_line(lines[i]);
+        let boundary = !in_fence
+            && is_hr_line(lines[i])
+            && i + 1 < lines.len()
+            && parse_role_line(lines[i + 1]).is_some();
+        if boundary {
+            let (role, meta) = parse_role_line(lines[i + 1]).unwrap();
+            fence.next_line(lines[i + 1]); // keep the tracker in sync
+            match turn.take() {
+                Some((r, m, ls)) => conv.turns.push(Turn {
+                    role: r,
+                    meta: m,
+                    content: ls.join("\n").trim().to_string(),
+                }),
+                None => conv.preamble = preamble.join("\n").trim().to_string(),
             }
-        }
-        if let Some((_, lines)) = &mut turn {
-            lines.push(line.to_string());
+            turn = Some((role, meta, Vec::new()));
+            i += 2;
         } else {
-            preamble.push(line.to_string());
+            if let Some((_, _, ls)) = &mut turn {
+                ls.push(lines[i]);
+            } else {
+                preamble.push(lines[i]);
+            }
+            i += 1;
         }
     }
-    if let Some((r, lines)) = turn {
+    if let Some((r, m, ls)) = turn {
         conv.turns.push(Turn {
             role: r,
-            content: undemote_headers(lines.join("\n").trim()),
+            meta: m,
+            content: ls.join("\n").trim().to_string(),
         });
     } else {
         conv.preamble = preamble.join("\n").trim().to_string();
@@ -294,61 +356,43 @@ pub fn parse(input: &str) -> Result<Conversation> {
     Ok(conv)
 }
 
-/// Apply `transform` to every ATX header line of `content` that is not inside
-/// a fenced code block; all other lines pass through verbatim.
-fn map_header_lines(content: &str, mut transform: impl FnMut(&str) -> String) -> String {
+/// Escape any turn-boundary pattern in `content` that would be parsed as a
+/// real boundary later: for every unfenced `---` line directly followed by a
+/// role line, a backslash is inserted before the role's first asterisk
+/// (`\**User**`). In rendered Markdown the backslash shows as a literal `*`,
+/// and on the next parse the line no longer matches the boundary pattern.
+/// Lines inside fenced code blocks are left untouched.
+pub fn escape_boundaries(content: &str) -> String {
     let mut out = String::with_capacity(content.len());
     let mut fence = FenceTracker::default();
+    let mut prev_hr = false;
     for line in content.split_inclusive('\n') {
         let (text, nl) = match line.ends_with('\n') {
             true => (&line[..line.len() - 1], "\n"),
             false => (line, ""),
         };
-        if fence.next_line(text) {
-            out.push_str(line);
+        let in_fence = fence.next_line(text);
+        let escaped = if !in_fence && prev_hr && parse_role_line(text).is_some() {
+            // Backslash before the role's first asterisk; both asterisks stay.
+            let trimmed = text.trim_start();
+            let prefix = &text[..text.len() - trimmed.len()];
+            format!("{prefix}\\{trimmed}")
         } else {
-            out.push_str(&transform(text));
-            out.push_str(nl);
-        }
+            text.to_string()
+        };
+        out.push_str(&escaped);
+        out.push_str(nl);
+        prev_hr = !in_fence && is_hr_line(text);
     }
     out
 }
 
-/// Demote every ATX header in `content` that is not inside a fenced code
-/// block by one level (`#` → `##`, ...). Headers already at the maximum
-/// depth of 6 are left unchanged.
-pub fn demote_headers(content: &str) -> String {
-    map_header_lines(content, |line| match atx_header(line) {
-        Some((depth, _)) if depth < 6 => {
-            let indent = line.len() - line.trim_start_matches(' ').len();
-            format!("{}#{}", &line[..indent], &line[indent..])
-        }
-        _ => line.to_string(),
-    })
-}
-
-/// The inverse of [`demote_headers`]: promote headers of depth 2–6 back by one
-/// level. Depth-1 headers are left alone (they cannot be the product of a
-/// demotion). A depth-6 header is ambiguous — it may have been depth 5 before
-/// demotion or an unchanged depth 6 — and is promoted either way, so a file
-/// round-trips stably even if one original level-6 header loses a level.
-fn undemote_headers(content: &str) -> String {
-    map_header_lines(content, |line| match atx_header(line) {
-        Some((depth, _)) if (2..=6).contains(&depth) => {
-            let indent = line.len() - line.trim_start_matches(' ').len();
-            format!("{}{}", &line[..indent], &line[indent + 1..])
-        }
-        _ => line.to_string(),
-    })
-}
-
 /// Serialize a [`Conversation`] back to canonical Markdown.
 ///
-/// Turn content is emitted with its ATX headers demoted one level (see
-/// [`demote_headers`]), so message headers always sit one level below the
-/// depth-1 role headers and can never be mistaken for them. The output always
-/// ends with a single trailing newline, and `parse(to_markdown(c)) == c` for
-/// any `c` produced by `parse`.
+/// Each turn is emitted as `---` + `**<Role>**` plus its metadata (when any),
+/// followed by the content with any colliding boundary patterns escaped (see
+/// [`escape_boundaries`]). The output always ends with a single trailing
+/// newline, and `parse(to_markdown(c)) == c` for any `c` produced by `parse`.
 pub fn to_markdown(conv: &Conversation) -> String {
     let mut out = String::new();
 
@@ -389,8 +433,13 @@ pub fn to_markdown(conv: &Conversation) -> String {
         if i > 0 || has_preamble || !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("# {}\n\n", t.role.title()));
-        out.push_str(&demote_headers(t.content.trim()));
+        out.push_str("---\n");
+        out.push_str(&format!("**{}**", t.role.title()));
+        if let Some(meta) = t.meta.render() {
+            out.push_str(&format!(" · *{meta}*"));
+        }
+        out.push_str("\n\n");
+        out.push_str(&escape_boundaries(t.content.trim()));
         out.push('\n');
     }
 
@@ -409,370 +458,4 @@ impl Conversation {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_full_document() {
-        let input = "\
----
-model: local-model
-endpoint: http://localhost:9000/v1/chat/completions
-system_prompt: Be terse.
-tools:
-  - name: shell
----
-
-# My convo
-
-# User
-
-Hello!
-
-# Assistant
-
-Hi there.
-
-# Tool
-
-exit code 0
-";
-        let conv = parse(input).unwrap();
-        assert!(conv.had_frontmatter);
-        assert_eq!(conv.frontmatter.model.as_deref(), Some("local-model"));
-        assert_eq!(
-            conv.frontmatter.endpoint.as_deref(),
-            Some("http://localhost:9000/v1/chat/completions")
-        );
-        assert_eq!(conv.frontmatter.system_prompt.as_deref(), Some("Be terse."));
-        assert!(conv.frontmatter.tools.is_some());
-        assert_eq!(conv.preamble, "# My convo");
-        assert_eq!(conv.turns.len(), 3);
-        assert_eq!(conv.turns[0].role, Role::User);
-        assert_eq!(conv.turns[0].content, "Hello!");
-        assert_eq!(conv.turns[1].role, Role::Assistant);
-        assert_eq!(conv.turns[1].content, "Hi there.");
-        assert_eq!(conv.turns[2].role, Role::Tool);
-        assert_eq!(conv.turns[2].content, "exit code 0");
-    }
-
-    #[test]
-    fn parse_no_frontmatter_and_preamble_only() {
-        let conv = parse("Just some notes.\n").unwrap();
-        assert!(!conv.had_frontmatter);
-        assert!(conv.frontmatter.is_empty());
-        assert_eq!(conv.preamble, "Just some notes.");
-        assert!(conv.turns.is_empty());
-    }
-
-    #[test]
-    fn parse_empty_file() {
-        let conv = parse("").unwrap();
-        assert!(!conv.had_frontmatter);
-        assert_eq!(conv.preamble, "");
-        assert!(conv.turns.is_empty());
-    }
-
-    #[test]
-    fn parse_multiline_content_preserved() {
-        let input = "\
-# User
-
-line one
-line two
-
-  indented line
-";
-        let conv = parse(input).unwrap();
-        assert_eq!(conv.turns.len(), 1);
-        assert_eq!(conv.turns[0].content, "line one\nline two\n\n  indented line");
-    }
-
-    #[test]
-    fn parse_marker_whitespace_tolerant() {
-        let input = "  #   USER   \n\ntext\n";
-        let conv = parse(input).unwrap();
-        assert_eq!(conv.turns[0].role, Role::User);
-        assert_eq!(conv.turns[0].content, "text");
-    }
-
-    #[test]
-    fn parse_marker_case_insensitive() {
-        let conv = parse("# assistant\n\nhi\n").unwrap();
-        assert_eq!(conv.turns.len(), 1);
-        assert_eq!(conv.turns[0].role, Role::Assistant);
-    }
-
-    #[test]
-    fn parse_deeper_headers_are_not_markers() {
-        // Depth-2 role names are content, not turn boundaries.
-        let conv = parse("# User\n\n## Assistant should not start a turn\n").unwrap();
-        assert_eq!(conv.turns.len(), 1);
-        assert_eq!(conv.turns[0].role, Role::User);
-        // Demoted on the way in, restored on the way out.
-        assert_eq!(conv.turns[0].content, "# Assistant should not start a turn");
-    }
-
-    #[test]
-    fn parse_marker_inside_code_block_ignored() {
-        let input = "\
-# User
-
-```markdown
-# Assistant
-
-this is just text in a fence
-```
-
-still user content
-";
-        let conv = parse(input).unwrap();
-        assert_eq!(conv.turns.len(), 1);
-        assert_eq!(conv.turns[0].role, Role::User);
-        assert_eq!(
-            conv.turns[0].content,
-            "```markdown\n# Assistant\n\nthis is just text in a fence\n```\n\nstill user content"
-        );
-    }
-
-    #[test]
-    fn parse_undemotes_content_headers() {
-        let input = "\
-# User
-
-## Original h1 became h2
-
-plain
-
-###### Already at the bottom
-";
-        let conv = parse(input).unwrap();
-        assert_eq!(
-            conv.turns[0].content,
-            "# Original h1 became h2\n\nplain\n\n##### Already at the bottom"
-        );
-    }
-
-    #[test]
-    fn parse_unterminated_frontmatter_is_preamble() {
-        let input = "---\nmodel: x\nno closing fence\n";
-        let conv = parse(input).unwrap();
-        assert!(!conv.had_frontmatter);
-        assert_eq!(conv.preamble, "---\nmodel: x\nno closing fence");
-    }
-
-    #[test]
-    fn parse_invalid_frontmatter_fails() {
-        let input = "---\nmodel: [unclosed\n---\ntext\n";
-        assert!(parse(input).is_err());
-    }
-
-    #[test]
-    fn atx_header_recognition() {
-        assert_eq!(atx_header("# User"), Some((1, "User")));
-        assert_eq!(atx_header("   # Spaced"), Some((1, "Spaced")));
-        assert_eq!(atx_header("###### Six"), Some((6, "Six")));
-        assert_eq!(atx_header("# Closing ##"), Some((1, "Closing")));
-        assert_eq!(atx_header("#Empty"), None); // no space after #
-        assert_eq!(atx_header("####### Seven"), None); // depth 7 is not a header
-        assert_eq!(atx_header("    # Four spaces"), None); // too much indent
-        assert_eq!(atx_header("##Title#"), None); // no space, trailing # kept as text
-        assert_eq!(atx_header("# Title#"), Some((1, "Title#")));
-    }
-
-    #[test]
-    fn demote_headers_one_level() {
-        let input = "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nplain text\n";
-        assert_eq!(
-            demote_headers(input),
-            "## One\n### Two\n#### Three\n##### Four\n###### Five\n###### Six\nplain text\n"
-        );
-    }
-
-    #[test]
-    fn demote_leaves_depth_six_unchanged() {
-        assert_eq!(demote_headers("###### Max"), "###### Max");
-    }
-
-    #[test]
-    fn demote_skips_headers_inside_backtick_fences() {
-        let input = "# Real\n\n```\n# In fence\n## Also in fence\n```\n\n# After\n";
-        assert_eq!(
-            demote_headers(input),
-            "## Real\n\n```\n# In fence\n## Also in fence\n```\n\n## After\n"
-        );
-    }
-
-    #[test]
-    fn demote_skips_headers_inside_tilde_fences() {
-        let input = "~~~\n# Tilde fence\n~~~\n# Outside\n";
-        assert_eq!(demote_headers(input), "~~~\n# Tilde fence\n~~~\n## Outside\n");
-    }
-
-    #[test]
-    fn demote_unclosed_fence_treated_as_fenced() {
-        let input = "```\n# Never closed\nstill in fence\n";
-        assert_eq!(demote_headers(input), "```\n# Never closed\nstill in fence\n");
-    }
-
-    #[test]
-    fn demote_respects_fence_length_and_char() {
-        // A shorter or differently-charred run inside a fence is content.
-        let input = "````\n```\n# Content line\n````\n# Outside\n";
-        assert_eq!(demote_headers(input), "````\n```\n# Content line\n````\n## Outside\n");
-    }
-
-    #[test]
-    fn demote_backtick_info_string_rule() {
-        // Backticks in the info string prevent a backtick fence from opening.
-        let input = "`` `not a fence`\n# Header here\n";
-        assert_eq!(demote_headers(input), "`` `not a fence`\n## Header here\n");
-    }
-
-    #[test]
-    fn demote_preserves_indent_and_closing_sequence() {
-        let input = "  ## Indented ##\n";
-        assert_eq!(demote_headers(input), "  ### Indented ##\n");
-    }
-
-    #[test]
-    fn undemote_is_inverse_of_demote() {
-        // Strict inverse for headers that demotion can represent (depth <= 5).
-        let original = "# A\n## B\n### C\n#### D\n##### E\n";
-        assert_eq!(undemote_headers(&demote_headers(original)), original);
-    }
-
-    #[test]
-    fn depth_six_header_is_ambiguous_but_stable() {
-        // A depth-6 header cannot be demoted, so parse must pick one reading;
-        // it promotes to depth 5. The file form is stable across round trips.
-        let original = "###### F\n";
-        let demoted = demote_headers(original);
-        assert_eq!(demoted, "###### F\n"); // unchanged at max depth
-        assert_eq!(undemote_headers(&demoted), "##### F\n");
-        // File-level round trip is idempotent even though one level is lost.
-        let conv = parse(&format!("# User\n\n{demoted}")).unwrap();
-        let once = to_markdown(&conv);
-        assert_eq!(to_markdown(&parse(&once).unwrap()), once);
-    }
-
-    #[test]
-    fn demote_no_newline_at_end() {
-        assert_eq!(demote_headers("# X"), "## X");
-    }
-
-    #[test]
-    fn serialize_round_trip_is_idempotent() {
-        let input = "\
----
-model: local-model
-system_prompt: Be terse.
----
-
-# User
-
-Hello!
-
-# Assistant
-
-Hi there.
-";
-        let once = to_markdown(&parse(input).unwrap());
-        let twice = to_markdown(&parse(&once).unwrap());
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn serialize_round_trip_with_headers_in_content() {
-        // Message content carrying its own headers must survive a round trip.
-        // The file stores demoted headers; parse restores the originals.
-        let input = "\
-# User
-
-## My question
-
-some body
-
-# Assistant
-
-### Answer heading
-
-text
-";
-        let once = to_markdown(&parse(input).unwrap());
-        let twice = to_markdown(&parse(&once).unwrap());
-        assert_eq!(once, twice);
-        // The in-memory content keeps the original (undemoted) headers.
-        let conv = parse(&once).unwrap();
-        assert_eq!(conv.turns[0].content, "# My question\n\nsome body");
-        assert_eq!(conv.turns[1].content, "## Answer heading\n\ntext");
-    }
-
-    #[test]
-    fn serialize_canonical_form() {
-        let conv = Conversation {
-            frontmatter: Frontmatter {
-                model: Some("m".into()),
-                endpoint: None,
-                system_prompt: Some("Be terse.".into()),
-                tools: None,
-            },
-            had_frontmatter: true,
-            preamble: String::new(),
-            turns: vec![Turn {
-                role: Role::User,
-                content: "Hello!".into(),
-            }],
-        };
-        let md = to_markdown(&conv);
-        assert_eq!(md, "---\nmodel: m\nsystem_prompt: Be terse.\n---\n\n# User\n\nHello!\n");
-    }
-
-    #[test]
-    fn serialize_demotes_content_headers() {
-        let conv = Conversation {
-            turns: vec![Turn {
-                role: Role::Assistant,
-                content: "# Title\nbody".into(),
-            }],
-            ..Default::default()
-        };
-        assert_eq!(to_markdown(&conv), "# Assistant\n\n## Title\nbody\n");
-    }
-
-    #[test]
-    fn serialize_empty_conversation() {
-        assert_eq!(to_markdown(&Conversation::default()), "");
-    }
-
-    #[test]
-    fn serialize_multiline_system_prompt_quotes() {
-        let conv = Conversation {
-            frontmatter: Frontmatter {
-                system_prompt: Some("line1\nline2".into()),
-                ..Default::default()
-            },
-            had_frontmatter: true,
-            ..Default::default()
-        };
-        let md = to_markdown(&conv);
-        // Must round-trip through YAML.
-        let back = parse(&md).unwrap();
-        assert_eq!(back.frontmatter.system_prompt.as_deref(), Some("line1\nline2"));
-    }
-
-    #[test]
-    fn role_parse_case_insensitive() {
-        assert_eq!(Role::parse("Assistant"), Some(Role::Assistant));
-        assert_eq!(Role::parse(" tool "), Some(Role::Tool));
-        assert_eq!(Role::parse("narrator"), None);
-    }
-
-    #[test]
-    fn role_titles() {
-        assert_eq!(Role::System.title(), "System");
-        assert_eq!(Role::User.title(), "User");
-        assert_eq!(Role::Assistant.title(), "Assistant");
-        assert_eq!(Role::Tool.title(), "Tool");
-    }
-}
+mod tests;
