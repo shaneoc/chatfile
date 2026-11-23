@@ -387,6 +387,53 @@ pub fn escape_boundaries(content: &str) -> String {
     out
 }
 
+/// The opening tag of a persisted reasoning block (line-anchored).
+pub const THINK_OPEN: &str = "think";
+/// The closing tag of a persisted reasoning block (line-anchored).
+pub const THINK_CLOSE: &str = "endthink";
+
+/// Split turn content into `(reasoning, answer)` at line-anchored
+/// `think` / `endthink` tags.
+///
+/// Returns `(None, content)` when no complete tag pair is present, so
+/// content that merely mentions the words is left untouched. Only the
+/// first pair is treated as reasoning; any text before it is prepended to
+/// the answer.
+pub fn split_reasoning(content: &str) -> (Option<String>, String) {
+    let lines: Vec<&str> = content.lines().collect();
+    let Some(open) = lines.iter().position(|l| l.trim() == THINK_OPEN) else {
+        return (None, content.to_string());
+    };
+    let Some(rel_close) = lines[open + 1..]
+        .iter()
+        .position(|l| l.trim() == THINK_CLOSE)
+    else {
+        return (None, content.to_string());
+    };
+    let close = open + 1 + rel_close;
+    let reasoning = lines[open + 1..close].join("\n").trim().to_string();
+    let before = lines[..open].join("\n").trim().to_string();
+    let after = lines[close + 1..].join("\n").trim().to_string();
+    let answer = match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after,
+        (false, true) => before,
+        (false, false) => format!("{before}\n\n{after}"),
+    };
+    (Some(reasoning), answer)
+}
+
+/// Format reasoning plus answer into the canonical persisted form:
+/// `think` / `endthink` tags around the reasoning, a blank line, then the
+/// answer. With no reasoning, just the (trimmed) answer.
+pub fn with_reasoning(reasoning: Option<&str>, answer: &str) -> String {
+    let answer = answer.trim();
+    match reasoning.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!("{THINK_OPEN}\n{r}\n{THINK_CLOSE}\n\n{answer}"),
+        None => answer.to_string(),
+    }
+}
+
 /// Serialize a [`Conversation`] back to canonical Markdown.
 ///
 /// Each turn is emitted as `---` + `**<Role>**` plus its metadata (when any),

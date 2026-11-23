@@ -399,3 +399,58 @@ fn now_timestamp_shape() {
     let ts = now_timestamp();
     assert!(looks_like_timestamp(&ts), "bad timestamp shape: {ts}");
 }
+
+#[test]
+fn split_reasoning_no_tags() {
+    let (reason, answer) = split_reasoning("just an answer");
+    assert_eq!(reason, None);
+    assert_eq!(answer, "just an answer");
+}
+
+#[test]
+fn split_reasoning_full_block() {
+    let content = "think\nstep one\nstep two\nendthink\n\nthe answer";
+    let (reason, answer) = split_reasoning(content);
+    assert_eq!(reason.as_deref(), Some("step one\nstep two"));
+    assert_eq!(answer, "the answer");
+}
+
+#[test]
+fn split_reasoning_unclosed_tag_is_content() {
+    let content = "think\nstill thinking...\nmore text";
+    let (reason, answer) = split_reasoning(content);
+    assert_eq!(reason, None);
+    assert_eq!(answer, content);
+}
+
+#[test]
+fn split_reasoning_word_in_prose_is_ignored() {
+    // "think" mid-line is not a tag.
+    let content = "you should think\nabout this\nendthink\n\nhmm";
+    let (reason, answer) = split_reasoning(content);
+    assert_eq!(reason, None);
+    assert_eq!(answer, content);
+}
+
+#[test]
+fn split_reasoning_text_before_block_goes_to_answer() {
+    let content = "preamble line\nthink\nreason\nendthink\n\nfinal";
+    let (reason, answer) = split_reasoning(content);
+    assert_eq!(reason.as_deref(), Some("reason"));
+    assert_eq!(answer, "preamble line\n\nfinal");
+}
+
+#[test]
+fn with_reasoning_round_trips_through_split() {
+    let rendered = with_reasoning(Some("because 6*9"), "54");
+    assert_eq!(rendered, "think\nbecause 6*9\nendthink\n\n54");
+    let (reason, answer) = split_reasoning(&rendered);
+    assert_eq!(reason.as_deref(), Some("because 6*9"));
+    assert_eq!(answer, "54");
+}
+
+#[test]
+fn with_reasoning_empty_reasoning_is_plain_answer() {
+    assert_eq!(with_reasoning(Some("   "), "hi"), "hi");
+    assert_eq!(with_reasoning(None, "  hi  "), "hi");
+}

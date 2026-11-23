@@ -187,8 +187,11 @@ async fn run(file: &Path) -> Result<()> {
     let client = llm::Client::new(endpoint, model.clone(), api_key);
     let mut stream = client.stream_chat(&messages).await?;
 
-    // Stream the reply to stdout while accumulating it.
+    // Stream the reply to stdout while accumulating it. Reasoning deltas
+    // (thinking models) are collected but not printed, so stdout stays a
+    // clean stream of just the answer.
     let mut reply = String::new();
+    let mut reasoning = String::new();
     let stdout = std::io::stdout();
     loop {
         tokio::select! {
@@ -197,7 +200,10 @@ async fn run(file: &Path) -> Result<()> {
                 break;
             }
             next = stream.next() => match next {
-                Some(Ok(chunk)) => {
+                Some(Ok(llm::StreamDelta::Reasoning(chunk))) => {
+                    reasoning.push_str(&chunk);
+                }
+                Some(Ok(llm::StreamDelta::Content(chunk))) => {
                     reply.push_str(&chunk);
                     let mut out = stdout.lock();
                     let _ = out.write_all(chunk.as_bytes());
@@ -219,19 +225,30 @@ async fn run(file: &Path) -> Result<()> {
         eprintln!("[mdchat] no reply produced; file unchanged");
         return Ok(());
     }
+    if !reasoning.trim().is_empty() {
+        eprintln!(
+            "[mdchat] captured {} chars of reasoning",
+            reasoning.trim().chars().count()
+        );
+    }
     let mut appendage = String::new();
     if !raw.ends_with('\n') {
         appendage.push('\n');
     }
-    // Escape any boundary pattern in the reply so it can't be mistaken for a
-    // real turn marker, and stamp the turn with time and model metadata.
+    // Persist reasoning (between think/endthink tags) plus the answer,
+    // escaping any boundary pattern so it can't be mistaken for a real turn
+    // marker, and stamp the turn with time and model metadata.
     let ts = parser::now_timestamp();
     let meta = parser::TurnMeta {
         timestamp: Some(ts),
         tags: vec![("model".into(), model.clone())],
     };
-    let reply = parser::escape_boundaries(reply.trim_end());
-    appendage.push_str(&format!("\n---\n**Assistant**{}\n\n{}\n", meta_boundary_suffix(&meta), reply));
+    let content = parser::with_reasoning(
+        (!reasoning.trim().is_empty()).then_some(reasoning.trim()),
+        reply.trim_end(),
+    );
+    let content = parser::escape_boundaries(&content);
+    appendage.push_str(&format!("\n---\n**Assistant**{}\n\n{}\n", meta_boundary_suffix(&meta), content));
 
     let mut f = std::fs::OpenOptions::new()
         .create(true)

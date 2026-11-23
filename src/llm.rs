@@ -1,8 +1,10 @@
 //! OpenAI-compatible chat completion client with SSE streaming.
 //!
 //! Targets `POST {endpoint}` (default: llama.cpp at
-//! `http://localhost:9000/v1/chat/completions`) and yields content deltas
-//! as they arrive.
+//! `http://localhost:9000/v1/chat/completions`) and yields deltas as they
+//! arrive. Thinking models (e.g. Qwen3 served by llama.cpp) stream their
+//! reasoning in a separate `reasoning_content` field before the answer
+//! starts; both are surfaced as [`StreamDelta`] variants.
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -75,9 +77,9 @@ impl Client {
 
     /// Send a streaming chat completion request.
     ///
-    /// Returns a stream of content deltas; the stream ends on `data: [DONE]`
-    /// or when the connection closes. HTTP-level failures (non-2xx) are
-    /// returned as `Err` before any chunks are produced.
+    /// Returns a stream of reasoning and content deltas; the stream ends on
+    /// `data: [DONE]` or when the connection closes. HTTP-level failures
+    /// (non-2xx) are returned as `Err` before any chunks are produced.
     pub async fn stream_chat(&self, messages: &[Message]) -> Result<SseStream> {
         let body = serde_json::json!({
             "model": self.model,
@@ -105,11 +107,22 @@ impl Client {
     }
 }
 
+/// One streamed delta: either reasoning (thinking) text or answer content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    /// Reasoning text from `delta.reasoning_content` (thinking models).
+    Reasoning(String),
+    /// Answer text from `delta.content`.
+    Content(String),
+}
+
 /// Result of interpreting one SSE line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseLine {
+    /// A reasoning delta (possibly empty).
+    Reasoning(String),
     /// A content delta (possibly empty).
-    Data(String),
+    Content(String),
     /// Terminal `data: [DONE]` marker.
     Done,
     /// Comment, blank, or non-data line: skip.
@@ -120,7 +133,10 @@ pub enum SseLine {
 ///
 /// Handles `data:` with or without a leading space, `:`-comments, and the
 /// terminal `[DONE]` marker. Malformed JSON payloads are ignored so that
-/// keep-alives from quirky servers don't kill the stream.
+/// keep-alives from quirky servers don't kill the stream. A delta carrying
+/// both fields (non-standard) is split into reasoning first; callers
+/// receive one [`SseLine`] per line, so a non-empty `reasoning_content`
+/// wins and any `content` on the same line is dropped.
 pub fn parse_sse_line(line: &str) -> SseLine {
     let line = line.trim_end();
     if line.is_empty() || line.starts_with(':') {
@@ -138,15 +154,23 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
     match serde_json::from_str::<serde_json::Value>(data) {
         Ok(v) => {
-            let content = v
+            let delta = v
                 .get("choices")
                 .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
+                .and_then(|c| c.get("delta"));
+            let reasoning = delta
+                .and_then(|d| d.get("reasoning_content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            if !reasoning.is_empty() {
+                return SseLine::Reasoning(reasoning.to_string());
+            }
+            let content = delta
                 .and_then(|d| d.get("content"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
-            SseLine::Data(content)
+            SseLine::Content(content)
         }
         Err(_) => SseLine::Ignore,
     }
@@ -185,7 +209,7 @@ impl SseStream {
 }
 
 impl Stream for SseStream {
-    type Item = Result<String>;
+    type Item = Result<StreamDelta>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -205,8 +229,11 @@ impl Stream for SseStream {
                             (!self.buf.trim().is_empty()).then(|| std::mem::take(&mut self.buf).trim().to_string())
                         }) {
                             match parse_sse_line(&line) {
-                                SseLine::Data(c) if !c.is_empty() => {
-                                    return Poll::Ready(Some(Ok(c)))
+                                SseLine::Reasoning(r) if !r.is_empty() => {
+                                    return Poll::Ready(Some(Ok(StreamDelta::Reasoning(r))))
+                                }
+                                SseLine::Content(c) if !c.is_empty() => {
+                                    return Poll::Ready(Some(Ok(StreamDelta::Content(c))))
                                 }
                                 _ => {}
                             }
@@ -218,9 +245,14 @@ impl Stream for SseStream {
             };
 
             match parse_sse_line(&line) {
-                SseLine::Data(c) if !c.is_empty() => return Poll::Ready(Some(Ok(c))),
+                SseLine::Reasoning(r) if !r.is_empty() => {
+                    return Poll::Ready(Some(Ok(StreamDelta::Reasoning(r))))
+                }
+                SseLine::Content(c) if !c.is_empty() => {
+                    return Poll::Ready(Some(Ok(StreamDelta::Content(c))))
+                }
                 SseLine::Done => return Poll::Ready(None),
-                SseLine::Ignore | SseLine::Data(_) => continue,
+                SseLine::Ignore | SseLine::Reasoning(_) | SseLine::Content(_) => continue,
             }
         }
     }
@@ -235,13 +267,25 @@ mod tests {
     #[test]
     fn parse_data_line_with_delta() {
         let line = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert_eq!(parse_sse_line(line), SseLine::Data("Hello".into()));
+        assert_eq!(parse_sse_line(line), SseLine::Content("Hello".into()));
     }
 
     #[test]
     fn parse_data_line_without_space() {
         let line = r#"data:{"choices":[{"delta":{"content":"x"}}]}"#;
-        assert_eq!(parse_sse_line(line), SseLine::Data("x".into()));
+        assert_eq!(parse_sse_line(line), SseLine::Content("x".into()));
+    }
+
+    #[test]
+    fn parse_reasoning_content_delta() {
+        let line = r#"data: {"choices":[{"delta":{"reasoning_content":"We"}}]}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Reasoning("We".into()));
+    }
+
+    #[test]
+    fn parse_role_only_delta_is_empty_content() {
+        let line = r#"data: {"choices":[{"delta":{"role":"assistant","content":null}}]}"#;
+        assert_eq!(parse_sse_line(line), SseLine::Content(String::new()));
     }
 
     #[test]
@@ -270,7 +314,7 @@ mod tests {
     #[test]
     fn parse_missing_delta_ignored() {
         let line = r#"data: {"choices":[{"delta":{}}]}"#;
-        assert_eq!(parse_sse_line(line), SseLine::Data(String::new()));
+        assert_eq!(parse_sse_line(line), SseLine::Content(String::new()));
     }
 
     /// Spawn a one-shot TCP server that replies with `raw_response`.
@@ -315,7 +359,46 @@ data: [DONE]\n\n";
         while let Some(chunk) = stream.next().await {
             chunks.push(chunk.unwrap());
         }
-        assert_eq!(chunks, vec!["Hello".to_string(), ",".into(), " world".into()]);
+        assert_eq!(
+            chunks,
+            vec![
+                StreamDelta::Content("Hello".into()),
+                StreamDelta::Content(",".into()),
+                StreamDelta::Content(" world".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_reasoning_then_content_in_order() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me think.\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" \"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"42\"}}]}\n\n\
+data: [DONE]\n\n";
+        let url = serve_once(raw.to_vec()).await;
+
+        let client = Client::new(url, "test-model", None);
+        let mut stream = client
+            .stream_chat(&[Message::user("hi")])
+            .await
+            .unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.unwrap());
+        }
+        assert_eq!(
+            chunks,
+            vec![
+                StreamDelta::Reasoning("Let me think.".into()),
+                StreamDelta::Reasoning(" ".into()),
+                StreamDelta::Content("42".into())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -350,6 +433,6 @@ data: {\"choices\":[{\"delta\":{\"content\":\"only\"}}]}\n\n";
         while let Some(chunk) = stream.next().await {
             chunks.push(chunk.unwrap());
         }
-        assert_eq!(chunks, vec!["only".to_string()]);
+        assert_eq!(chunks, vec![StreamDelta::Content("only".into())]);
     }
 }

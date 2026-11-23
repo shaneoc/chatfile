@@ -42,8 +42,8 @@ const SCROLL_STEP: usize = 10;
 
 /// Events produced by the background streaming task.
 enum StreamEvent {
-    /// A chunk of streamed reply text.
-    Chunk(String),
+    /// A streamed delta: reasoning (thinking) text or answer content.
+    Delta(llm::StreamDelta),
     /// The stream finished successfully.
     Done,
     /// The stream failed with an error message.
@@ -75,6 +75,8 @@ pub struct App {
     pub stick: bool,
     /// True while an assistant reply is streaming.
     pub streaming: bool,
+    /// In-progress reasoning (thinking) text for the active reply.
+    pub reason_buf: String,
     /// In-progress assistant reply text.
     pub stream_buf: String,
     /// User message queued by [`App::handle_key`] for the event loop to send.
@@ -121,6 +123,7 @@ impl App {
             scroll: 0,
             stick: true,
             streaming: false,
+            reason_buf: String::new(),
             stream_buf: String::new(),
             pending_send: None,
             cancel_requested: false,
@@ -247,7 +250,8 @@ impl App {
             lines.push(Line::default());
         }
         for t in &self.conv.turns {
-            push_turn(&mut lines, t.role, &t.meta, &t.content);
+            let (reason, answer) = parser::split_reasoning(&t.content);
+            push_turn(&mut lines, t.role, &t.meta, reason.as_deref(), &answer);
             lines.push(Line::default());
         }
         if self.streaming {
@@ -255,7 +259,14 @@ impl App {
                 timestamp: Some(parser::now_timestamp()),
                 tags: vec![("model".into(), self.model.clone())],
             };
-            push_turn(&mut lines, parser::Role::Assistant, &meta, &self.stream_buf);
+            let reason = (!self.reason_buf.is_empty()).then_some(self.reason_buf.as_str());
+            push_turn(
+                &mut lines,
+                parser::Role::Assistant,
+                &meta,
+                reason,
+                &self.stream_buf,
+            );
         }
         lines
     }
@@ -375,10 +386,17 @@ impl App {
         let s_area = chunks[2];
         if s_area.height > 0 {
             let state = if self.streaming {
-                format!(
-                    "streaming… ({} chars)",
-                    self.stream_buf.chars().count()
-                )
+                if self.stream_buf.is_empty() && !self.reason_buf.is_empty() {
+                    format!(
+                        "thinking… ({} chars)",
+                        self.reason_buf.chars().count()
+                    )
+                } else {
+                    format!(
+                        "streaming… ({} chars)",
+                        self.stream_buf.chars().count()
+                    )
+                }
             } else if self.status.is_empty() {
                 "ready".to_string()
             } else {
@@ -404,8 +422,16 @@ impl App {
     }
 }
 
-/// Push one turn (role line + content) into `lines` with role styling.
-fn push_turn(lines: &mut Vec<Line<'static>>, role: parser::Role, meta: &parser::TurnMeta, content: &str) {
+/// Push one turn (role line, optional reasoning block, content) into
+/// `lines` with role styling. Reasoning renders dimmed and italic so it is
+/// clearly secondary to the answer.
+fn push_turn(
+    lines: &mut Vec<Line<'static>>,
+    role: parser::Role,
+    meta: &parser::TurnMeta,
+    reasoning: Option<&str>,
+    content: &str,
+) {
     let mut spans = vec![Span::styled(
         role.title().to_string(),
         role_style(role).add_modifier(Modifier::BOLD),
@@ -417,6 +443,12 @@ fn push_turn(lines: &mut Vec<Line<'static>>, role: parser::Role, meta: &parser::
         ));
     }
     lines.push(Line::from(spans));
+    let reason_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+    if let Some(r) = reasoning {
+        for l in r.lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), reason_style)));
+        }
+    }
     for l in content.lines() {
         lines.push(Line::from(l.to_string()));
     }
@@ -484,6 +516,7 @@ async fn event_loop(
                 h.abort();
             }
             app.streaming = false;
+            app.reason_buf.clear();
             app.stream_buf.clear();
             app.status = "stream cancelled".into();
         }
@@ -503,7 +536,10 @@ async fn event_loop(
             }
             maybe_event = rx.recv() => {
                 match maybe_event {
-                    Some(StreamEvent::Chunk(s)) => {
+                    Some(StreamEvent::Delta(llm::StreamDelta::Reasoning(s))) => {
+                        app.reason_buf.push_str(&s);
+                    }
+                    Some(StreamEvent::Delta(llm::StreamDelta::Content(s))) => {
                         app.stream_buf.push_str(&s);
                     }
                     Some(StreamEvent::Done) => {
@@ -517,6 +553,7 @@ async fn event_loop(
                             let _ = h.await;
                         }
                         app.streaming = false;
+                        app.reason_buf.clear();
                         app.stream_buf.clear();
                         app.status = format!("error: {e}");
                     }
@@ -570,8 +607,8 @@ async fn submit(
         };
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(text) => {
-                    if tx.send(StreamEvent::Chunk(text)).is_err() {
+                Ok(delta) => {
+                    if tx.send(StreamEvent::Delta(delta)).is_err() {
                         break;
                     }
                 }
@@ -584,24 +621,33 @@ async fn submit(
         let _ = tx.send(StreamEvent::Done);
     });
     app.streaming = true;
+    app.reason_buf.clear();
     app.stream_buf.clear();
     Ok(task)
 }
 
 /// Persist the completed assistant reply (header with timestamp and model
 /// tag, then the response) and push it into the in-memory conversation.
+/// Any reasoning captured during the stream is persisted between
+/// `think` / `endthink` tags ahead of the answer.
 fn finish_stream(app: &mut App) -> Result<()> {
     let reply = app.stream_buf.trim_end().to_string();
+    let reasoning = app.reason_buf.trim_end().to_string();
     app.streaming = false;
     if reply.is_empty() {
+        app.reason_buf.clear();
         app.stream_buf.clear();
         app.status = "no reply produced".into();
         return Ok(());
     }
+    let content = parser::with_reasoning(
+        (!reasoning.is_empty()).then_some(reasoning.as_str()),
+        &reply,
+    );
     let ts = parser::now_timestamp();
     let turn = parser::Turn {
         role: parser::Role::Assistant,
-        content: reply,
+        content,
         meta: parser::TurnMeta {
             timestamp: Some(ts),
             tags: vec![("model".into(), app.model.clone())],
@@ -609,6 +655,7 @@ fn finish_stream(app: &mut App) -> Result<()> {
     };
     append_turn_to_file(&app.path, &turn)?;
     app.conv.turns.push(turn);
+    app.reason_buf.clear();
     app.stream_buf.clear();
     app.status.clear();
     Ok(())
@@ -667,6 +714,7 @@ mod tests {
             scroll: 0,
             stick: true,
             streaming: false,
+            reason_buf: String::new(),
             stream_buf: String::new(),
             pending_send: None,
             cancel_requested: false,
@@ -723,6 +771,32 @@ mod tests {
         let screen = render(&app, 80, 24).join("\n");
         assert!(screen.contains("partial answer"));
         assert!(screen.contains("streaming…"));
+    }
+
+    #[test]
+    fn render_streaming_shows_reasoning_and_thinking_status() {
+        let mut app = test_app();
+        app.streaming = true;
+        app.reason_buf = "let me work this out".into();
+        let screen = render(&app, 80, 24).join("\n");
+        assert!(screen.contains("let me work this out"));
+        assert!(screen.contains("thinking…"));
+    }
+
+    #[test]
+    fn render_persisted_turn_splits_reasoning_from_answer() {
+        let mut app = test_app();
+        app.conv.turns.push(parser::Turn {
+            role: parser::Role::Assistant,
+            content: "think\nbecause 6*9\nendthink\n\n54".into(),
+            meta: parser::TurnMeta {
+                timestamp: Some("2026-11-23 00:00".into()),
+                tags: vec![],
+            },
+        });
+        let screen = render(&app, 80, 24).join("\n");
+        assert!(screen.contains("because 6*9"));
+        assert!(screen.contains("54"));
     }
 
     #[test]
