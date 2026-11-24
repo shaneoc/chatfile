@@ -3,7 +3,11 @@ name = "chatfile"
 version = "0.1.0"
 edition = "2024"
 description = "Manage LLM conversations as plain Markdown files"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shaneoc/chatfile"
+readme = "README.md"
+keywords = ["llm", "chat", "markdown", "tui", "agent"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"
