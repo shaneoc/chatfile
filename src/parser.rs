@@ -11,19 +11,21 @@
 //! You are terse.
 //!
 //! ---
-//! **User** · *2026-11-22 14:30*
+//! **User** | 2026-11-22 14:30
 //!
 //! Hello!
 //!
 //! ---
-//! **Assistant** · *2026-11-22 14:31 · model: local-model*
+//! **Assistant** | 2026-11-22 14:31 | model: local-model
 //!
 //! Hi there.
 //! ```
 //!
-//! Sections are introduced by the role in bold, optionally with metadata in
-//! italics: `**<role>** · *YYYY-MM-DD HH:MM · key: value · ...*`. The
-//! metadata block and every tag inside it are optional. The first section
+//! Sections are introduced by the role in bold, optionally followed by plain
+//! (unitalicized) metadata segments separated by ` | `:
+//! `**<role>** | YYYY-MM-DD HH:MM | key: value | ...`. The first metadata
+//! segment may be a bare timestamp; every later segment must be `key: value`.
+//! All metadata is optional. The first section
 //! must be `**System**` or `**User**`; the frontmatter's closing fence (or
 //! the start of the file, when there is no frontmatter) serves as its
 //! leading horizontal rule, so it carries no `---` of its own. Every later
@@ -111,7 +113,8 @@ pub struct TurnMeta {
 }
 
 impl TurnMeta {
-    /// The metadata as it appears inside the italic block of a boundary line,
+    /// The metadata as it appears after the role in a header line — plain
+    /// segments joined by ` | ` (timestamp first, then `key: value` pairs) —
     /// or `None` when there is none.
     pub fn render(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -119,16 +122,14 @@ impl TurnMeta {
             parts.push(ts.clone());
         }
         for (k, v) in &self.tags {
-            parts.push(if v.is_empty() {
-                k.clone()
-            } else {
-                format!("{k}: {v}")
-            });
+            // Always `key: value` (a bare key would not re-parse); an empty
+            // value leaves a trailing space, which the parser trims.
+            parts.push(format!("{k}: {v}"));
         }
         if parts.is_empty() {
             None
         } else {
-            Some(parts.join(" · "))
+            Some(parts.join(" | "))
         }
     }
 }
@@ -384,33 +385,97 @@ fn looks_like_timestamp(s: &str) -> bool {
             .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit())
 }
 
-/// Parse a boundary role line: `**<role>**` optionally followed by
-/// ` · *<timestamp> · <key>: <value> · ...*`.
+/// True when the line begins with a bold recognized role (`**User**`, ...),
+/// i.e. it is attempting to be a section header line. Used to decide whether
+/// a `---` line introduces a new section (versus being plain content) and to
+/// escape would-be boundaries inside message bodies.
+fn is_role_header_line(line: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("**") else {
+        return false;
+    };
+    let Some(end) = rest.find("**") else {
+        return false;
+    };
+    Role::parse(&rest[..end]).is_some()
+}
+
+/// Strictly parse a section header line: `**<role>**` optionally followed by
+/// plain (unitalicized) metadata segments separated by exactly ` | ` — an
+/// optional bare `YYYY-MM-DD HH:MM` timestamp first, then `key: value`
+/// pairs.
 ///
-/// The metadata block is optional, and so is every part of it: a line may be
-/// just `**User**`, or carry only a timestamp, only tags, or both.
-fn parse_role_line(line: &str) -> Option<(Role, TurnMeta)> {
+/// Every deviation is a parse error reported with the 1-based line number
+/// via [`line_error`]: a different separator (`·`, `-`, missing spaces),
+/// bold/italic markers anywhere in the metadata, a pipe inside a segment, a
+/// timestamp that is not the first segment, or a non-timestamp segment
+/// without a `key: ` prefix.
+fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
     let t = line.trim();
-    let rest = t.strip_prefix("**")?;
-    let end = rest.find("**")?;
-    let role = Role::parse(&rest[..end])?;
+    let bad_role = || {
+        line_error(
+            line_no,
+            "invalid header; expected a bold role like **User**",
+        )
+    };
+    let rest = t.strip_prefix("**").ok_or_else(bad_role)?;
+    let end = rest.find("**").ok_or_else(bad_role)?;
+    let role = Role::parse(&rest[..end]).ok_or_else(|| {
+        line_error(line_no, format!("unknown role in header: {}", &rest[..end]))
+    })?;
     let mut meta = TurnMeta::default();
-    let after = rest[end + 2..].trim_start();
-    if !after.is_empty() {
-        let after_dot = after.strip_prefix('·')?;
-        let inner = after_dot.trim_start().strip_prefix('*')?;
-        let inner = inner.trim_end().strip_suffix('*')?;
-        for part in inner.split('·').map(str::trim).filter(|s| !s.is_empty()) {
-            if meta.timestamp.is_none() && looks_like_timestamp(part) {
-                meta.timestamp = Some(part.to_string());
-            } else if let Some((k, v)) = part.split_once(':') {
-                meta.tags.push((k.trim().to_string(), v.trim().to_string()));
+    let after = &rest[end + 2..];
+    if !after.trim().is_empty() {
+        // The separator between the role and the first segment must be
+        // exactly ` | `.
+        if !after.starts_with(" | ") {
+            return Err(line_error(
+                line_no,
+                "invalid header metadata separator; expected ' | '",
+            ));
+        }
+        for seg in after[3..].trim_end().split(" | ") {
+            if seg.contains('|') {
+                return Err(line_error(
+                    line_no,
+                    "invalid header metadata separator; expected ' | '",
+                ));
+            }
+            if seg.contains('*') {
+                return Err(line_error(
+                    line_no,
+                    "header metadata must be plain text; bold/italic markers are not allowed",
+                ));
+            }
+            if looks_like_timestamp(seg) {
+                if meta.timestamp.is_some() {
+                    return Err(line_error(line_no, "duplicate timestamp in header"));
+                }
+                if !meta.tags.is_empty() {
+                    return Err(line_error(
+                        line_no,
+                        "timestamp must be the first metadata segment after the role",
+                    ));
+                }
+                meta.timestamp = Some(seg.to_string());
+            } else if let Some((k, v)) = seg.split_once(':') {
+                let k = k.trim();
+                if k.is_empty() {
+                    return Err(line_error(
+                        line_no,
+                        "invalid header metadata; 'key: value' requires a non-empty key",
+                    ));
+                }
+                meta.tags.push((k.to_string(), v.trim().to_string()));
             } else {
-                meta.tags.push((part.to_string(), String::new()));
+                return Err(line_error(
+                    line_no,
+                    "invalid header metadata; expected a timestamp or 'key: value'",
+                ));
             }
         }
     }
-    Some((role, meta))
+    Ok((role, meta))
 }
 
 /// Tracks whether the scanner is inside a fenced code block (CommonMark subset).
@@ -534,11 +599,19 @@ pub fn parse(input: &str) -> Result<Conversation> {
     }
 
     // The first section carries no leading horizontal rule of its own.
-    let (first_role, first_meta) = parse_role_line(lines[0])
-        .filter(|(r, _)| matches!(r, Role::System | Role::User))
-        .ok_or_else(|| {
-            line_error(first_line, "first section must be a **System** or **User** header")
-        })?;
+    let bad_first = || {
+        line_error(
+            first_line,
+            "first section must be a **System** or **User** header",
+        )
+    };
+    if !is_role_header_line(lines[0]) {
+        return Err(bad_first());
+    }
+    let (first_role, first_meta) = parse_header_line(lines[0], first_line)?;
+    if !matches!(first_role, Role::System | Role::User) {
+        return Err(bad_first());
+    }
 
     let mut turns: Vec<Turn> = Vec::new();
     let mut cur_role = first_role;
@@ -554,9 +627,11 @@ pub fn parse(input: &str) -> Result<Conversation> {
         let boundary = !in_fence
             && is_hr_line(lines[i])
             && i + 1 < lines.len()
-            && parse_role_line(lines[i + 1]).is_some();
+            && is_role_header_line(lines[i + 1]);
         if boundary {
-            let (role, meta) = parse_role_line(lines[i + 1]).unwrap();
+            // A line that starts a section must be a *valid* header; a
+            // malformed one is a format error, not content.
+            let (role, meta) = parse_header_line(lines[i + 1], first_line + i + 1)?;
             if role == Role::System {
                 return Err(line_error(
                     first_line + i + 1,
@@ -604,7 +679,7 @@ pub fn escape_boundaries(content: &str) -> String {
             false => (line, ""),
         };
         let in_fence = fence.next_line(text);
-        let escaped = if !in_fence && prev_hr && parse_role_line(text).is_some() {
+        let escaped = if !in_fence && prev_hr && is_role_header_line(text) {
             // Backslash before the role's first asterisk; both asterisks stay.
             let trimmed = text.trim_start();
             let prefix = &text[..text.len() - trimmed.len()];
@@ -721,7 +796,7 @@ pub fn to_markdown(conv: &Conversation) -> String {
         }
         out.push_str(&format!("**{}**", t.role.title()));
         if let Some(meta) = t.meta.render() {
-            out.push_str(&format!(" · *{meta}*"));
+            out.push_str(&format!(" | {meta}"));
         }
         out.push_str("\n\n");
         out.push_str(&escape_boundaries(t.content.trim()));

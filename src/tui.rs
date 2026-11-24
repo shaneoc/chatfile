@@ -462,7 +462,7 @@ fn push_turn(
     )];
     if let Some(m) = meta.render() {
         spans.push(Span::styled(
-            format!(" · {m}"),
+            format!(" | {m}"),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -488,7 +488,7 @@ fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
     )];
     if let Some(m) = t.meta.render() {
         spans.push(Span::styled(
-            format!(" · {m}"),
+            format!(" | {m}"),
             Style::default().add_modifier(Modifier::DIM),
         ));
     }
@@ -754,7 +754,7 @@ mod tests {
     /// A minimal app with a short conversation, no file I/O.
     fn test_app() -> App {
         let conv = parser::parse(
-            "---\nmodel: test-model\n---\n**User** · *2026-11-22 14:30*\n\nHello there!\n\n---\n**Assistant** · *2026-11-22 14:31 · model: test-model*\n\nHi, how can I help?\n",
+            "---\nmodel: test-model\n---\n**User** | 2026-11-22 14:30\n\nHello there!\n\n---\n**Assistant** | 2026-11-22 14:31 | model: test-model\n\nHi, how can I help?\n",
         )
         .unwrap();
         App {

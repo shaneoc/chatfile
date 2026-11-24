@@ -70,13 +70,27 @@ Frontmatter in the `.chat.md` file wins over environment variables; the
 ---
 model: unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF:Q8_0
 endpoint: http://localhost:9000/v1/chat/completions
-system_prompt: You are terse.
 scope: folder        # tools operate in the file's directory (default) or the vault root
 tools: true          # enable built-in tools (default true; false disables them all)
 network: false       # allow fetch_url and shared-net bash (default false)
 allow_shell: false   # allow the bash tool (default false)
 ---
 ```
+
+### Turn headers
+
+Each section starts with a bold role, optionally followed by plain metadata
+segments separated by ` | ` — a bare timestamp first, then `key: value` pairs
+(all optional):
+
+```markdown
+**Assistant** | 2026-11-23 22:42 | model: unsloth/Qwen3.8-27B-GGUF:Q8_K_XL
+```
+
+The first section of the body must be `**System**` or `**User**`; a
+`**System**` section is only valid there (its content is folded into the
+single leading system message). The parser is strict about the header format
+and reports violations with line numbers.
 
 - `scope: folder` (default) — file tools operate in the conversation file's own
   directory.

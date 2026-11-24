@@ -731,7 +731,7 @@ pub fn append_turn(path: &Path, turn: &parser::Turn) -> Result<()> {
     s.push_str("\n---\n");
     s.push_str(&format!("**{}**", turn.role.title()));
     if let Some(m) = turn.meta.render() {
-        s.push_str(&format!(" · *{m}*"));
+        s.push_str(&format!(" | {m}"));
     }
     s.push_str("\n\n");
     s.push_str(&parser::escape_boundaries(turn.content.trim()));
@@ -1394,7 +1394,7 @@ data: [DONE]\n\n";
         let path = dir.path().join("c.chat.md");
         std::fs::write(
             &path,
-            "---\nmodel: m\n---\n**User** · *2026-11-22 14:30*\n\nhello\n",
+            "---\nmodel: m\n---\n**User** | 2026-11-22 14:30\n\nhello\n",
         )
         .unwrap();
 
