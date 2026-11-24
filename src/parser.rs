@@ -5,10 +5,10 @@
 //! ---
 //! model: local-model
 //! endpoint: http://localhost:9000/v1/chat/completions
-//! system_prompt: You are terse.
 //! ---
+//! **System**
 //!
-//! Optional preamble text before the first turn boundary.
+//! You are terse.
 //!
 //! ---
 //! **User** · *2026-11-22 14:30*
@@ -21,17 +21,32 @@
 //! Hi there.
 //! ```
 //!
-//! Turns are delimited by a horizontal rule (`---`) followed on the next line
-//! by the role in bold, optionally with metadata in italics:
-//! `**<role>** · *YYYY-MM-DD HH:MM · key: value · ...*`. The metadata block
-//! and every tag inside it are optional. When serializing, any occurrence of
-//! this exact pattern in unfenced message content is escaped (a backslash is
-//! added before the role's first asterisk) so it cannot be mistaken for a
-//! real turn boundary on the next parse.
+//! Sections are introduced by the role in bold, optionally with metadata in
+//! italics: `**<role>** · *YYYY-MM-DD HH:MM · key: value · ...*`. The
+//! metadata block and every tag inside it are optional. The first section
+//! must be `**System**` or `**User**`; the frontmatter's closing fence (or
+//! the start of the file, when there is no frontmatter) serves as its
+//! leading horizontal rule, so it carries no `---` of its own. Every later
+//! section is preceded by a `---` horizontal rule. A `**System**` section is
+//! only valid as the first section: its content is combined with the
+//! hierarchical `AGENTS.md` context into the single leading system message
+//! and never appears in the conversation itself. When serializing, any
+//! occurrence of the boundary pattern in unfenced message content is escaped
+//! (a backslash is added before the role's first asterisk) so it cannot be
+//! mistaken for a real section boundary on the next parse.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+/// Build a parse error pointing at a 1-based line number in the source file.
+///
+/// Every strict format check reports its failures through this helper so the
+/// user gets an actionable, line-precise diagnostic (the file path is added
+/// by the caller's context).
+pub fn line_error(line: usize, msg: impl fmt::Display) -> anyhow::Error {
+    anyhow!("line {line}: {msg}")
+}
 
 /// Roles recognized in turn boundaries (`**User**`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -173,9 +188,6 @@ pub struct Frontmatter {
     /// The full `/v1/chat/completions` endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
-    /// Extra system-prompt text, appended after the `AGENTS.md` context.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
     /// Whether built-in tools are enabled (default `true`).
     #[serde(
         default = "default_true",
@@ -199,7 +211,6 @@ impl Default for Frontmatter {
         Self {
             model: None,
             endpoint: None,
-            system_prompt: None,
             tools: true,
             scope: Scope::Folder,
             network: false,
@@ -214,7 +225,6 @@ impl Frontmatter {
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
             && self.endpoint.is_none()
-            && self.system_prompt.is_none()
             && self.scope == Scope::Folder
             && !self.network
             && !self.allow_shell
@@ -347,9 +357,7 @@ pub struct Conversation {
     pub frontmatter: Frontmatter,
     /// Whether the source file began with a YAML frontmatter block.
     pub had_frontmatter: bool,
-    /// Body text before the first turn boundary (kept for lossless round-trips).
-    pub preamble: String,
-    /// The turns in file order.
+    /// The sections in file order; the first is always `System` or `User`.
     pub turns: Vec<Turn>,
 }
 
@@ -462,21 +470,24 @@ impl FenceTracker {
 
 /// Split off a leading `---`-fenced YAML block.
 ///
-/// Returns `(Some(yaml), body)` when the file starts with frontmatter,
-/// otherwise `(None, input)`. The closing fence may be `---` or `...`.
-/// A line that parses as a turn boundary aborts frontmatter detection, so a
-/// file that begins directly with a conversation (no frontmatter) is not
-/// misread as YAML.
-fn split_frontmatter(input: &str) -> (Option<&str>, &str) {
+/// A file has frontmatter if and only if its first line is a fence (`---` or
+/// `...`); the block ends at the next fence line, and a block that never
+/// closes is a format error. Returns `(yaml, body, body_first_line)` where
+/// `body_first_line` is the 1-based line number of the first body line.
+fn split_frontmatter(input: &str) -> Result<(Option<&str>, &str, usize)> {
     let mut offset = 0usize;
     let mut yaml_start: Option<usize> = None;
+    let mut open_line = 1usize;
+    let mut line_no = 0usize;
     for line in input.split_inclusive('\n') {
+        line_no += 1;
         let is_fence = line.trim_end() == "---" || line.trim_end() == "...";
         match yaml_start {
             None => {
                 if !is_fence {
-                    return (None, input);
+                    return Ok((None, input, 1));
                 }
+                open_line = line_no;
                 offset += line.len();
                 yaml_start = Some(offset);
             }
@@ -484,34 +495,59 @@ fn split_frontmatter(input: &str) -> (Option<&str>, &str) {
                 if is_fence {
                     let yaml = &input[start..offset].trim_end_matches('\n');
                     offset += line.len();
-                    return (Some(yaml), &input[offset..]);
-                }
-                if parse_role_line(line).is_some() {
-                    return (None, input);
+                    return Ok((Some(yaml), &input[offset..], line_no + 1));
                 }
                 offset += line.len();
             }
         }
     }
-    // Opening fence without a closing fence: not frontmatter.
-    (None, input)
+    Err(line_error(open_line, "frontmatter block is not closed with a `---` line"))
 }
 
 /// Parse conversation Markdown into a [`Conversation`].
+///
+/// The body (everything after the frontmatter, or the whole file when there
+/// is none) must begin with a `**System**` or `**User**` header line; every
+/// later section is introduced by a `---` horizontal rule. A `**System**`
+/// section is only valid as the first section. Violations are reported with
+/// a 1-based line number via [`line_error`].
 pub fn parse(input: &str) -> Result<Conversation> {
-    let (yaml, body) = split_frontmatter(input);
+    let (yaml, body, first_line) = split_frontmatter(input)?;
     let mut conv = Conversation::default();
     if let Some(yaml) = yaml {
-        conv.frontmatter =
-            serde_yaml::from_str::<Frontmatter>(yaml).context("invalid YAML frontmatter")?;
         conv.had_frontmatter = true;
+        if yaml.trim().is_empty() {
+            conv.frontmatter = Frontmatter::default();
+        } else {
+            conv.frontmatter = serde_yaml::from_str::<Frontmatter>(yaml).with_context(|| {
+                format!("invalid YAML frontmatter (lines 2..={})", first_line - 1)
+            })?;
+        }
     }
 
     let lines: Vec<&str> = body.lines().collect();
-    let mut preamble: Vec<&str> = Vec::new();
-    let mut turn: Option<(Role, TurnMeta, Vec<&str>)> = None;
+    if lines.is_empty() {
+        return Err(line_error(
+            first_line,
+            "file has no sections; expected a **System** or **User** header",
+        ));
+    }
+
+    // The first section carries no leading horizontal rule of its own.
+    let (first_role, first_meta) = parse_role_line(lines[0])
+        .filter(|(r, _)| matches!(r, Role::System | Role::User))
+        .ok_or_else(|| {
+            line_error(first_line, "first section must be a **System** or **User** header")
+        })?;
+
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut cur_role = first_role;
+    let mut cur_meta = first_meta;
+    let mut cur_lines: Vec<&str> = Vec::new();
     let mut fence = FenceTracker::default();
-    let mut i = 0usize;
+    fence.next_line(lines[0]); // keep the tracker in sync with the header line
+
+    let mut i = 1usize;
     while i < lines.len() {
         // `true` = the line is inside a fenced code block.
         let in_fence = fence.next_line(lines[i]);
@@ -521,35 +557,34 @@ pub fn parse(input: &str) -> Result<Conversation> {
             && parse_role_line(lines[i + 1]).is_some();
         if boundary {
             let (role, meta) = parse_role_line(lines[i + 1]).unwrap();
-            fence.next_line(lines[i + 1]); // keep the tracker in sync
-            match turn.take() {
-                Some((r, m, ls)) => conv.turns.push(Turn {
-                    role: r,
-                    meta: m,
-                    content: ls.join("\n").trim().to_string(),
-                }),
-                None => conv.preamble = preamble.join("\n").trim().to_string(),
+            if role == Role::System {
+                return Err(line_error(
+                    first_line + i + 1,
+                    "**System** is only allowed as the first section",
+                ));
             }
-            turn = Some((role, meta, Vec::new()));
+            fence.next_line(lines[i + 1]); // keep the tracker in sync
+            turns.push(Turn {
+                role: cur_role,
+                meta: cur_meta,
+                content: cur_lines.join("\n").trim().to_string(),
+            });
+            cur_role = role;
+            cur_meta = meta;
+            cur_lines.clear();
             i += 2;
         } else {
-            if let Some((_, _, ls)) = &mut turn {
-                ls.push(lines[i]);
-            } else {
-                preamble.push(lines[i]);
-            }
+            cur_lines.push(lines[i]);
             i += 1;
         }
     }
-    if let Some((r, m, ls)) = turn {
-        conv.turns.push(Turn {
-            role: r,
-            meta: m,
-            content: ls.join("\n").trim().to_string(),
-        });
-    } else {
-        conv.preamble = preamble.join("\n").trim().to_string();
-    }
+    turns.push(Turn {
+        role: cur_role,
+        meta: cur_meta,
+        content: cur_lines.join("\n").trim().to_string(),
+    });
+
+    conv.turns = turns;
     Ok(conv)
 }
 
@@ -633,10 +668,13 @@ pub fn with_reasoning(reasoning: Option<&str>, answer: &str) -> String {
 
 /// Serialize a [`Conversation`] back to canonical Markdown.
 ///
-/// Each turn is emitted as `---` + `**<Role>**` plus its metadata (when any),
-/// followed by the content with any colliding boundary patterns escaped (see
-/// [`escape_boundaries`]). The output always ends with a single trailing
-/// newline, and `parse(to_markdown(c)) == c` for any `c` produced by `parse`.
+/// The first section is emitted without a leading horizontal rule: the
+/// frontmatter's closing fence (or the start of the file, when there is no
+/// frontmatter) serves that visual purpose. Every later section is preceded
+/// by its own `---`. Content has any colliding boundary patterns escaped
+/// (see [`escape_boundaries`]). The output always ends with a single
+/// trailing newline, and `parse(to_markdown(c)) == c` for any `c` produced
+/// by `parse`.
 pub fn to_markdown(conv: &Conversation) -> String {
     let mut out = String::new();
 
@@ -648,12 +686,6 @@ pub fn to_markdown(conv: &Conversation) -> String {
         }
         if let Some(v) = &conv.frontmatter.endpoint {
             mapping.insert(key("endpoint"), serde_yaml::Value::String(v.clone()));
-        }
-        if let Some(v) = &conv.frontmatter.system_prompt {
-            mapping.insert(
-                key("system_prompt"),
-                serde_yaml::Value::String(v.clone()),
-            );
         }
         // Booleans/enums are written only when they differ from the
         // defaults, keeping files clean.
@@ -672,26 +704,21 @@ pub fn to_markdown(conv: &Conversation) -> String {
         if conv.frontmatter.allow_shell {
             mapping.insert(key("allow_shell"), serde_yaml::Value::Bool(true));
         }
-        let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
-            .expect("frontmatter serialization cannot fail");
-        out.push_str(yaml.trim_end());
-        out.push_str("\n---\n");
-    }
-
-    let has_preamble = !conv.preamble.trim().is_empty();
-    if has_preamble {
-        if !out.is_empty() {
-            out.push('\n');
+        if mapping.is_empty() {
+            out.push_str("---\n"); // empty frontmatter block
+        } else {
+            let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+                .expect("frontmatter serialization cannot fail");
+            out.push_str(yaml.trim_end());
+            out.push_str("\n---\n");
         }
-        out.push_str(conv.preamble.trim());
-        out.push('\n');
     }
 
     for (i, t) in conv.turns.iter().enumerate() {
-        if i > 0 || has_preamble || !out.is_empty() {
+        if i > 0 {
             out.push('\n');
+            out.push_str("---\n");
         }
-        out.push_str("---\n");
         out.push_str(&format!("**{}**", t.role.title()));
         if let Some(meta) = t.meta.render() {
             out.push_str(&format!(" · *{meta}*"));
@@ -714,20 +741,25 @@ impl Conversation {
         Ok(to_markdown(&parse(input)?))
     }
 
-    /// The turns as OpenAI wire-format messages.
+    /// The sections as OpenAI wire-format messages.
     ///
-    /// `**Tool**` turns become `role: "tool"` messages carrying the
-    /// `tool_call_id`, and the `tool_calls` (id, name, arguments) are
-    /// attached to the preceding assistant message — a message with
-    /// `content: None` is synthesized when a tool turn has no preceding
-    /// assistant turn (e.g. a hand-edited file), so reloaded histories are
-    /// always valid API payloads. Malformed tool turns are skipped.
+    /// `**System**` sections are skipped: their content is folded into the
+    /// single leading system message by the caller (see
+    /// [`crate::context::build_system_prompt`]) and never appears in the
+    /// conversation itself. `**Tool**` turns become `role: "tool"` messages
+    /// carrying the `tool_call_id`, and the `tool_calls` (id, name,
+    /// arguments) are attached to the preceding assistant message — a
+    /// message with `content: None` is synthesized when a tool turn has no
+    /// preceding assistant turn (e.g. a hand-edited file), so reloaded
+    /// histories are always valid API payloads. Malformed tool turns are
+    /// skipped.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {
         use crate::llm::{Message, ToolCall, ToolFunction};
 
         let mut messages: Vec<Message> = Vec::new();
         for turn in &self.turns {
             match turn.role {
+                Role::System => {}
                 Role::Tool => {
                     let Some(data) = parse_tool_turn(turn) else {
                         continue;

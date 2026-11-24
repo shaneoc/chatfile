@@ -5,12 +5,17 @@ conversations stored as plain Markdown files inside nested directories.
 ## Core Design Principles
 1. **Plain-Text First:** Every conversation is a standard Markdown file with
    YAML frontmatter (`model`, `endpoint`, `tools`) and explicit role markers
-   identified by markdown headers (`# User`, `# Assistant`, `# Tool`).
-   Conversation files are saved with a `.chat.md` extension.
+   in bold lines (`**User**`, `**Assistant**`, `**Tool**`). The first section
+   after the frontmatter must be `**System**` or `**User**` (the
+   frontmatter's closing fence serves as its leading horizontal rule); every
+   later section is preceded by a `---` horizontal rule. Conversation files
+   are saved with a `.chat.md` extension.
 2. **Hierarchical Context:** Before sending a prompt, walk up from the `.md`
    file's directory to the vault root and concatenate any `AGENTS.md` files
-   found into the system prompt. The vault root is identified by the existance
-   of a .chatfile file.
+   found into the system prompt. The vault root is identified by the existence
+   of a .chatfile file. Every request carries exactly one system message,
+   always first: the `AGENTS.md` context followed by the file's `**System**`
+   section content (when present).
 3. **OpenAI-Compatible Backend:** Target
    `http://localhost:9000/v1/chat/completions` (`llama.cpp`) by default,
    supporting streaming responses and multi-turn tool calling, with

@@ -54,8 +54,10 @@ pub fn collect_agents_context(start_dir: &Path) -> String {
 }
 
 /// Build the full system prompt for a conversation file: hierarchical
-/// `AGENTS.md` context plus any `system_prompt` from the file's frontmatter.
-pub fn build_system_prompt(md_file: &Path, frontmatter_prompt: Option<&str>) -> String {
+/// `AGENTS.md` context followed by the file's `**System**` section content
+/// (when present). This is the single system message sent as the first
+/// message of every request.
+pub fn build_system_prompt(md_file: &Path, system_section: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(dir) = md_file.parent() {
         let ctx = collect_agents_context(dir);
@@ -63,7 +65,7 @@ pub fn build_system_prompt(md_file: &Path, frontmatter_prompt: Option<&str>) -> 
             parts.push(ctx);
         }
     }
-    if let Some(sp) = frontmatter_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(sp) = system_section.map(str::trim).filter(|s| !s.is_empty()) {
         parts.push(sp.to_string());
     }
     parts.join("\n\n")
@@ -185,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_combines_context_and_frontmatter() {
+    fn build_system_prompt_combines_context_and_system_section() {
         let dir = tempdir("sysprompt");
         write(&dir.join(AGENTS_FILE), "Vault rules.");
         fs::write(dir.join(VAULT_MARKER), "").unwrap();

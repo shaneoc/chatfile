@@ -264,12 +264,6 @@ impl App {
     /// in-progress assistant reply while streaming.
     pub fn history_lines(&self) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        if !self.conv.preamble.trim().is_empty() {
-            for l in self.conv.preamble.lines() {
-                lines.push(Line::from(l.to_string()));
-            }
-            lines.push(Line::default());
-        }
         for t in &self.conv.turns {
             if t.role == parser::Role::Tool {
                 push_tool_turn(&mut lines, t);
@@ -673,10 +667,13 @@ async fn submit(
     tools::append_turn(&app.path, &user_turn)?;
     app.conv.turns.push(user_turn);
 
-    let system_prompt = context::build_system_prompt(
-        &app.path,
-        app.conv.frontmatter.system_prompt.as_deref(),
-    );
+    let system_section = app
+        .conv
+        .turns
+        .first()
+        .filter(|t| t.role == parser::Role::System)
+        .map(|t| t.content.as_str());
+    let system_prompt = context::build_system_prompt(&app.path, system_section);
     let mut messages: Vec<llm::Message> = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(llm::Message::system(system_prompt));
@@ -757,7 +754,7 @@ mod tests {
     /// A minimal app with a short conversation, no file I/O.
     fn test_app() -> App {
         let conv = parser::parse(
-            "---\nmodel: test-model\n---\n\n---\n**User** · *2026-11-22 14:30*\n\nHello there!\n\n---\n**Assistant** · *2026-11-22 14:31 · model: test-model*\n\nHi, how can I help?\n",
+            "---\nmodel: test-model\n---\n**User** · *2026-11-22 14:30*\n\nHello there!\n\n---\n**Assistant** · *2026-11-22 14:31 · model: test-model*\n\nHi, how can I help?\n",
         )
         .unwrap();
         App {

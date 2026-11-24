@@ -144,8 +144,15 @@ async fn run(file: &Path) -> Result<()> {
     let conv = parser::parse(&raw)
         .with_context(|| format!("failed to parse {}", file.display()))?;
 
-    let system_prompt =
-        context::build_system_prompt(file, conv.frontmatter.system_prompt.as_deref());
+    if !conv.turns.iter().any(|t| t.role == parser::Role::User) {
+        bail!("{} has no **User** section; add one before running", file.display());
+    }
+    let system_section = conv
+        .turns
+        .first()
+        .filter(|t| t.role == parser::Role::System)
+        .map(|t| t.content.as_str());
+    let system_prompt = context::build_system_prompt(file, system_section);
     let endpoint = conv
         .frontmatter
         .endpoint
@@ -169,12 +176,6 @@ async fn run(file: &Path) -> Result<()> {
     // messages and attaches their `tool_calls` to the preceding assistant
     // message, so reloaded histories are valid API payloads.
     messages.extend(conv.to_messages());
-    if messages.is_empty() {
-        bail!(
-            "{} has no turns and no system prompt; add a `**User**` turn first",
-            file.display()
-        );
-    }
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
@@ -261,7 +262,7 @@ async fn run(file: &Path) -> Result<()> {
 /// missing file).
 fn default_template() -> String {
     format!(
-        "---\nmodel: {0}\nendpoint: {1}\nsystem_prompt:\n---\n\n---\n**User**\n\nYour prompt here\n",
+        "---\nmodel: {0}\nendpoint: {1}\n---\n**User**\n\nYour prompt here\n",
         DEFAULT_MODEL,
         llm::DEFAULT_ENDPOINT
     )

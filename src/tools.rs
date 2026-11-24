@@ -1394,7 +1394,7 @@ data: [DONE]\n\n";
         let path = dir.path().join("c.chat.md");
         std::fs::write(
             &path,
-            "---\nmodel: m\n---\n\n---\n**User** · *2026-11-22 14:30*\n\nhello\n",
+            "---\nmodel: m\n---\n**User** · *2026-11-22 14:30*\n\nhello\n",
         )
         .unwrap();
 

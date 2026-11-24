@@ -8,12 +8,12 @@ fn parse_full_document() {
 ---
 model: local-model
 endpoint: http://localhost:9000/v1/chat/completions
-system_prompt: Be terse.
 tools:
   - name: shell
 ---
+**System**
 
-# My convo
+Be terse.
 
 ---
 **User** · *2026-11-22 14:30*
@@ -37,54 +37,60 @@ exit code 0
         conv.frontmatter.endpoint.as_deref(),
         Some("http://localhost:9000/v1/chat/completions")
     );
-    assert_eq!(conv.frontmatter.system_prompt.as_deref(), Some("Be terse."));
     // The legacy free-form `tools:` list is tolerated and reads as enabled.
     assert!(conv.frontmatter.tools);
-    assert_eq!(conv.preamble, "# My convo");
-    assert_eq!(conv.turns.len(), 3);
-    assert_eq!(conv.turns[0].role, Role::User);
-    assert_eq!(conv.turns[0].content, "Hello!");
+    assert_eq!(conv.turns.len(), 4);
+    assert_eq!(conv.turns[0].role, Role::System);
+    assert_eq!(conv.turns[0].content, "Be terse.");
+    assert_eq!(conv.turns[1].role, Role::User);
+    assert_eq!(conv.turns[1].content, "Hello!");
     assert_eq!(
-        conv.turns[0].meta,
+        conv.turns[1].meta,
         TurnMeta {
             timestamp: Some("2026-11-22 14:30".into()),
             tags: vec![],
         }
     );
-    assert_eq!(conv.turns[1].role, Role::Assistant);
-    assert_eq!(conv.turns[1].content, "Hi there.");
+    assert_eq!(conv.turns[2].role, Role::Assistant);
+    assert_eq!(conv.turns[2].content, "Hi there.");
     assert_eq!(
-        conv.turns[1].meta,
+        conv.turns[2].meta,
         TurnMeta {
             timestamp: Some("2026-11-22 14:31".into()),
             tags: vec![("model".into(), "local-model".into())],
         }
     );
-    assert_eq!(conv.turns[2].role, Role::Tool);
-    assert_eq!(conv.turns[2].content, "exit code 0");
+    assert_eq!(conv.turns[3].role, Role::Tool);
+    assert_eq!(conv.turns[3].content, "exit code 0");
 }
 
 #[test]
-fn parse_no_frontmatter_and_preamble_only() {
-    let conv = parse("Just some notes.\n").unwrap();
-    assert!(!conv.had_frontmatter);
-    assert!(conv.frontmatter.is_empty());
-    assert_eq!(conv.preamble, "Just some notes.");
-    assert!(conv.turns.is_empty());
+fn parse_first_line_must_be_system_or_user() {
+    // No frontmatter: plain text is not a valid first section.
+    let err = parse("Just some notes.\n").unwrap_err();
+    assert!(err.to_string().contains("line 1"), "{err}");
+    assert!(err.to_string().contains("first section"), "{err}");
+
+    // With frontmatter: the error points at the first body line.
+    let err = parse("---\nmodel: m\n---\nJust some notes.\n").unwrap_err();
+    assert!(err.to_string().contains("line 4"), "{err}");
+
+    // An empty file has no sections at all.
+    assert!(parse("").unwrap_err().to_string().contains("line 1"));
 }
 
 #[test]
-fn parse_empty_file() {
-    let conv = parse("").unwrap();
-    assert!(!conv.had_frontmatter);
-    assert_eq!(conv.preamble, "");
-    assert!(conv.turns.is_empty());
+fn parse_system_only_allowed_as_first_section() {
+    // Lines: 1 **User**, 2 blank, 3 hi, 4 ---, 5 **System**.
+    let err = parse("**User**\n\nhi\n---\n**System**\n\nlate\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 5"), "{msg}");
+    assert!(msg.contains("**System**"), "{msg}");
 }
 
 #[test]
 fn parse_multiline_content_preserved() {
     let input = "\
----
 **User**
 
 line one
@@ -99,7 +105,7 @@ line two
 
 #[test]
 fn parse_boundary_whitespace_tolerant() {
-    let input = "---\n  ** USER **  \n\ntext\n";
+    let input = "  ** USER **  \n\ntext\n";
     let conv = parse(input).unwrap();
     assert_eq!(conv.turns[0].role, Role::User);
     assert_eq!(conv.turns[0].content, "text");
@@ -107,19 +113,19 @@ fn parse_boundary_whitespace_tolerant() {
 
 #[test]
 fn parse_role_line_case_insensitive() {
-    let conv = parse("---\n**assistant**\n\nhi\n").unwrap();
-    assert_eq!(conv.turns.len(), 1);
-    assert_eq!(conv.turns[0].role, Role::Assistant);
+    let conv = parse("**User**\n\nhello\n---\n**assistant**\n\nhi\n").unwrap();
+    assert_eq!(conv.turns.len(), 2);
+    assert_eq!(conv.turns[1].role, Role::Assistant);
 }
 
 #[test]
 fn parse_metadata_optional_variants() {
     // No metadata at all.
-    let conv = parse("---\n**User**\n\nhi\n").unwrap();
+    let conv = parse("**User**\n\nhi\n").unwrap();
     assert_eq!(conv.turns[0].meta, TurnMeta::default());
 
     // Timestamp only (model tag missing).
-    let conv = parse("---\n**User** · *2026-11-22 14:30*\n\nhi\n").unwrap();
+    let conv = parse("**User** · *2026-11-22 14:30*\n\nhi\n").unwrap();
     assert_eq!(
         conv.turns[0].meta,
         TurnMeta {
@@ -129,7 +135,7 @@ fn parse_metadata_optional_variants() {
     );
 
     // Tags only (no timestamp).
-    let conv = parse("---\n**User** · *model: m1 · endpoint: local*\n\nhi\n").unwrap();
+    let conv = parse("**User** · *model: m1 · endpoint: local*\n\nhi\n").unwrap();
     assert_eq!(
         conv.turns[0].meta,
         TurnMeta {
@@ -140,11 +146,11 @@ fn parse_metadata_optional_variants() {
 
     // Timestamp plus several tags; tag values may contain colons.
     let conv = parse(
-        "---\n**Assistant** · *2026-11-22 14:31 · model: unsloth/Qwen:Q8 · note: a: b*\n\nhi\n",
+        "**User**\n\nhello\n---\n**Assistant** · *2026-11-22 14:31 · model: unsloth/Qwen:Q8 · note: a: b*\n\nhi\n",
     )
     .unwrap();
     assert_eq!(
-        conv.turns[0].meta,
+        conv.turns[1].meta,
         TurnMeta {
             timestamp: Some("2026-11-22 14:31".into()),
             tags: vec![
@@ -157,7 +163,7 @@ fn parse_metadata_optional_variants() {
 
 #[test]
 fn parse_hr_without_role_line_is_content() {
-    let input = "---\n**User**\n\nbefore\n---\nafter\n";
+    let input = "**User**\n\nbefore\n---\nafter\n";
     let conv = parse(input).unwrap();
     assert_eq!(conv.turns.len(), 1);
     assert_eq!(conv.turns[0].content, "before\n---\nafter");
@@ -165,16 +171,17 @@ fn parse_hr_without_role_line_is_content() {
 
 #[test]
 fn parse_role_line_without_hr_is_content() {
-    let input = "**User** · *2026-11-22 14:30*\n\nnot a turn\n";
+    // A role line without a preceding hr (and not the file's first line) is
+    // just content.
+    let input = "**User**\n\nbefore\n**Assistant**\n\nnot a section\n";
     let conv = parse(input).unwrap();
-    assert!(conv.turns.is_empty());
-    assert_eq!(conv.preamble, "**User** · *2026-11-22 14:30*\n\nnot a turn");
+    assert_eq!(conv.turns.len(), 1);
+    assert_eq!(conv.turns[0].content, "before\n**Assistant**\n\nnot a section");
 }
 
 #[test]
 fn parse_boundary_inside_code_block_ignored() {
     let input = "\
----
 **User**
 
 ```markdown
@@ -196,27 +203,33 @@ still user content
 }
 
 #[test]
-fn parse_file_starting_with_boundary_is_not_frontmatter() {
-    let input = "---\n**User** · *2026-11-22 14:30*\n\nHello\n";
-    let conv = parse(input).unwrap();
-    assert!(!conv.had_frontmatter);
-    assert!(conv.turns.len() == 1);
-    assert_eq!(conv.turns[0].role, Role::User);
-    assert_eq!(conv.turns[0].content, "Hello");
+fn parse_opening_fence_requires_closing_fence() {
+    // A file that starts with `---` claims to have frontmatter; without a
+    // closing fence that is a format error pointing at the opening line.
+    let err = parse("---\n**User** · *2026-11-22 14:30*\n\nHello\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 1"), "{msg}");
+    assert!(msg.contains("not closed"), "{msg}");
+
+    let err = parse("---\nmodel: x\nno closing fence\n").unwrap_err();
+    assert!(err.to_string().contains("line 1"));
 }
 
 #[test]
-fn parse_unterminated_frontmatter_is_preamble() {
-    let input = "---\nmodel: x\nno closing fence\n";
+fn parse_empty_frontmatter_block_is_defaults() {
+    let input = "---\n---\n**User**\n\nhi\n";
     let conv = parse(input).unwrap();
-    assert!(!conv.had_frontmatter);
-    assert_eq!(conv.preamble, "---\nmodel: x\nno closing fence");
+    assert!(conv.had_frontmatter);
+    assert!(conv.frontmatter.is_empty());
+    assert_eq!(conv.turns.len(), 1);
+    // Round-trips exactly.
+    assert_eq!(to_markdown(&conv), input);
 }
 
 #[test]
 fn parse_invalid_frontmatter_fails() {
-    let input = "---\nmodel: [unclosed\n---\ntext\n";
-    assert!(parse(input).is_err());
+    let err = parse("---\nmodel: [unclosed\n---\ntext\n").unwrap_err();
+    assert!(err.to_string().contains("invalid YAML frontmatter"));
 }
 
 #[test]
@@ -224,8 +237,10 @@ fn serialize_round_trip_is_idempotent() {
     let input = "\
 ---
 model: local-model
-system_prompt: Be terse.
 ---
+**System**
+
+Be terse.
 
 ---
 **User** · *2026-11-22 14:30*
@@ -238,6 +253,7 @@ Hello!
 Hi there.
 ";
     let once = to_markdown(&parse(input).unwrap());
+    assert_eq!(once, input); // already canonical
     let twice = to_markdown(&parse(&once).unwrap());
     assert_eq!(once, twice);
 }
@@ -247,24 +263,29 @@ fn serialize_canonical_form() {
     let conv = Conversation {
         frontmatter: Frontmatter {
             model: Some("m".into()),
-            system_prompt: Some("Be terse.".into()),
             ..Default::default()
         },
         had_frontmatter: true,
-        preamble: String::new(),
-        turns: vec![Turn {
-            role: Role::User,
-            content: "Hello!".into(),
-            meta: TurnMeta {
-                timestamp: Some("2026-11-22 14:30".into()),
-                tags: vec![],
+        turns: vec![
+            Turn {
+                role: Role::System,
+                content: "Be terse.".into(),
+                meta: TurnMeta::default(),
             },
-        }],
+            Turn {
+                role: Role::User,
+                content: "Hello!".into(),
+                meta: TurnMeta {
+                    timestamp: Some("2026-11-22 14:30".into()),
+                    tags: vec![],
+                },
+            },
+        ],
     };
     let md = to_markdown(&conv);
     assert_eq!(
         md,
-        "---\nmodel: m\nsystem_prompt: Be terse.\n---\n\n---\n**User** · *2026-11-22 14:30*\n\nHello!\n"
+        "---\nmodel: m\n---\n**System**\n\nBe terse.\n\n---\n**User** · *2026-11-22 14:30*\n\nHello!\n"
     );
 }
 
@@ -278,32 +299,37 @@ fn serialize_omits_missing_metadata() {
         }],
         ..Default::default()
     };
-    assert_eq!(to_markdown(&conv), "---\n**Assistant**\n\nHi\n");
+    assert_eq!(to_markdown(&conv), "**Assistant**\n\nHi\n");
 }
 
 #[test]
-fn serialize_empty_conversation() {
-    assert_eq!(to_markdown(&Conversation::default()), "");
-}
-
-#[test]
-fn serialize_multiline_system_prompt_quotes() {
+fn serialize_system_section_round_trips() {
     let conv = Conversation {
-        frontmatter: Frontmatter {
-            system_prompt: Some("line1\nline2".into()),
-            ..Default::default()
-        },
         had_frontmatter: true,
+        turns: vec![
+            Turn {
+                role: Role::System,
+                content: "line1\nline2".into(),
+                meta: TurnMeta::default(),
+            },
+            Turn {
+                role: Role::User,
+                content: "hi".into(),
+                meta: TurnMeta::default(),
+            },
+        ],
         ..Default::default()
     };
     let md = to_markdown(&conv);
-    // Must round-trip through YAML.
     let back = parse(&md).unwrap();
-    assert_eq!(back.frontmatter.system_prompt.as_deref(), Some("line1\nline2"));
+    assert_eq!(back.turns[0].role, Role::System);
+    assert_eq!(back.turns[0].content, "line1\nline2");
+    assert_eq!(to_markdown(&back), md);
 }
 
 #[test]
 fn role_parse_case_insensitive() {
+    assert_eq!(Role::parse("System"), Some(Role::System));
     assert_eq!(Role::parse("Assistant"), Some(Role::Assistant));
     assert_eq!(Role::parse(" tool "), Some(Role::Tool));
     assert_eq!(Role::parse("narrator"), None);
@@ -509,13 +535,20 @@ fn tool_turn_output_with_details_and_backticks_round_trips() {
     // fence; the tilde fence must outlast both.
     let output = "look:\n```\n---\n**User** · *2026-11-22 14:30*\n```\nand </details> inside";
     let conv = Conversation {
-        turns: vec![tool_turn_fixture("bash", "call_9", r#"{"command": "ls"}"#, output)],
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "run it".into(),
+                meta: TurnMeta::default(),
+            },
+            tool_turn_fixture("bash", "call_9", r#"{"command": "ls"}"#, output),
+        ],
         ..Default::default()
     };
     let once = to_markdown(&conv);
     let back = parse(&once).unwrap();
-    assert_eq!(back.turns.len(), 1);
-    let data = parse_tool_turn(&back.turns[0]).expect("well-formed tool turn");
+    assert_eq!(back.turns.len(), 2);
+    let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
     assert_eq!(data.output, output);
     assert_eq!(to_markdown(&back), once);
 }
@@ -525,13 +558,20 @@ fn tool_turn_output_with_long_tilde_run_round_trips() {
     // A five-tilde run in the output forces a six-tilde fence.
     let output = "line one\n~~~~~\nline two";
     let conv = Conversation {
-        turns: vec![tool_turn_fixture("read_file", "c1", r#"{"path": "a.md"}"#, output)],
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "read it".into(),
+                meta: TurnMeta::default(),
+            },
+            tool_turn_fixture("read_file", "c1", r#"{"path": "a.md"}"#, output),
+        ],
         ..Default::default()
     };
     let once = to_markdown(&conv);
     assert!(once.contains("~~~~~~text"), "fence must exceed the embedded run:\n{once}");
     let back = parse(&once).unwrap();
-    let data = parse_tool_turn(&back.turns[0]).expect("well-formed tool turn");
+    let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
     assert_eq!(data.output, output);
 }
 
@@ -606,6 +646,37 @@ fn to_messages_folds_tool_turns_into_assistant_and_tool() {
 }
 
 #[test]
+fn to_messages_skips_system_sections() {
+    // The system text never appears in the wire messages; it is folded into
+    // the single leading system message by the caller.
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::System,
+                content: "Be terse.".into(),
+                meta: TurnMeta::default(),
+            },
+            Turn {
+                role: Role::User,
+                content: "hi".into(),
+                meta: TurnMeta::default(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "hello".into(),
+                meta: TurnMeta::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let messages = conv.to_messages();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(!messages.iter().any(|m| m.role == "system"));
+}
+
+#[test]
 fn to_messages_synthesizes_assistant_when_tool_turn_leads() {
     // A file that starts with a tool turn (hand-edited) must still yield a
     // valid payload: an assistant message with content None carries the call.
@@ -656,7 +727,11 @@ fn frontmatter_tool_fields_round_trip() {
             ..Default::default()
         },
         had_frontmatter: true,
-        ..Default::default()
+        turns: vec![Turn {
+            role: Role::User,
+            content: "hi".into(),
+            meta: TurnMeta::default(),
+        }],
     };
     let md = to_markdown(&conv);
     assert!(md.contains("tools: false"), "{md}");
@@ -669,10 +744,18 @@ fn frontmatter_tool_fields_round_trip() {
 
 #[test]
 fn frontmatter_defaults_are_omitted() {
-    let md = to_markdown(&Conversation {
+    let conv = Conversation {
         had_frontmatter: true,
+        turns: vec![Turn {
+            role: Role::User,
+            content: "hi".into(),
+            meta: TurnMeta::default(),
+        }],
         ..Default::default()
-    });
+    };
+    let md = to_markdown(&conv);
+    // An all-default frontmatter serializes as an empty block.
+    assert!(md.starts_with("---\n---\n"), "{md}");
     assert!(!md.contains("tools:"), "{md}");
     assert!(!md.contains("scope:"), "{md}");
     assert!(!md.contains("network:"), "{md}");
@@ -683,7 +766,7 @@ fn frontmatter_defaults_are_omitted() {
 
 #[test]
 fn frontmatter_legacy_tools_list_reads_as_enabled() {
-    let md = "---\ntools:\n  - name: shell\n---\n";
+    let md = "---\ntools:\n  - name: shell\n---\n**User**\n\nhi\n";
     let conv = parse(md).unwrap();
     assert!(conv.frontmatter.tools);
 }
