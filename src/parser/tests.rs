@@ -38,7 +38,8 @@ exit code 0
         Some("http://localhost:9000/v1/chat/completions")
     );
     assert_eq!(conv.frontmatter.system_prompt.as_deref(), Some("Be terse."));
-    assert!(conv.frontmatter.tools.is_some());
+    // The legacy free-form `tools:` list is tolerated and reads as enabled.
+    assert!(conv.frontmatter.tools);
     assert_eq!(conv.preamble, "# My convo");
     assert_eq!(conv.turns.len(), 3);
     assert_eq!(conv.turns[0].role, Role::User);
@@ -246,9 +247,8 @@ fn serialize_canonical_form() {
     let conv = Conversation {
         frontmatter: Frontmatter {
             model: Some("m".into()),
-            endpoint: None,
             system_prompt: Some("Be terse.".into()),
-            tools: None,
+            ..Default::default()
         },
         had_frontmatter: true,
         preamble: String::new(),
@@ -453,4 +453,237 @@ fn with_reasoning_round_trips_through_split() {
 fn with_reasoning_empty_reasoning_is_plain_answer() {
     assert_eq!(with_reasoning(Some("   "), "hi"), "hi");
     assert_eq!(with_reasoning(None, "  hi  "), "hi");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 2: tool turns and message assembly
+// ---------------------------------------------------------------------------
+
+fn tool_turn_fixture(name: &str, id: &str, arguments: &str, output: &str) -> Turn {
+    Turn {
+        role: Role::Tool,
+        content: tool_turn_body(name, arguments, output),
+        meta: TurnMeta {
+            timestamp: Some("2026-11-22 14:31".into()),
+            tags: vec![
+                ("tool".into(), name.into()),
+                ("id".into(), id.into()),
+            ],
+        },
+    }
+}
+
+#[test]
+fn tool_turn_round_trips() {
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "List the files.".into(),
+                meta: TurnMeta::default(),
+            },
+            tool_turn_fixture(
+                "list_files",
+                "call_1",
+                r#"{"subdir": "."}"#,
+                "notes.md  120\nsrc/main.rs  4567",
+            ),
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 2);
+    let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
+    assert_eq!(data.name, "list_files");
+    assert_eq!(data.id, "call_1");
+    assert_eq!(data.arguments, r#"{"subdir": "."}"#);
+    assert_eq!(data.output, "notes.md  120\nsrc/main.rs  4567");
+    // Stable under re-serialization.
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn tool_turn_output_with_details_and_backticks_round_trips() {
+    // The output contains a literal `</details>` and a triple-backtick
+    // fence; the tilde fence must outlast both.
+    let output = "look:\n```\n---\n**User** · *2026-11-22 14:30*\n```\nand </details> inside";
+    let conv = Conversation {
+        turns: vec![tool_turn_fixture("bash", "call_9", r#"{"command": "ls"}"#, output)],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 1);
+    let data = parse_tool_turn(&back.turns[0]).expect("well-formed tool turn");
+    assert_eq!(data.output, output);
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn tool_turn_output_with_long_tilde_run_round_trips() {
+    // A five-tilde run in the output forces a six-tilde fence.
+    let output = "line one\n~~~~~\nline two";
+    let conv = Conversation {
+        turns: vec![tool_turn_fixture("read_file", "c1", r#"{"path": "a.md"}"#, output)],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(once.contains("~~~~~~text"), "fence must exceed the embedded run:\n{once}");
+    let back = parse(&once).unwrap();
+    let data = parse_tool_turn(&back.turns[0]).expect("well-formed tool turn");
+    assert_eq!(data.output, output);
+}
+
+#[test]
+fn parse_tool_turn_rejects_malformed() {
+    // Missing the `id:` tag.
+    let no_id = Turn {
+        role: Role::Tool,
+        content: tool_turn_body("bash", "{}", "out"),
+        meta: TurnMeta {
+            timestamp: None,
+            tags: vec![("tool".into(), "bash".into())],
+        },
+    };
+    assert!(parse_tool_turn(&no_id).is_none());
+    // Not a tool role.
+    let user = Turn {
+        role: Role::User,
+        content: tool_turn_body("bash", "{}", "out"),
+        meta: TurnMeta::default(),
+    };
+    assert!(parse_tool_turn(&user).is_none());
+    // Body without a summary line or fence.
+    let no_body = Turn {
+        role: Role::Tool,
+        content: "just some text".into(),
+        meta: TurnMeta {
+            timestamp: None,
+            tags: vec![
+                ("tool".into(), "bash".into()),
+                ("id".into(), "c1".into()),
+            ],
+        },
+    };
+    assert!(parse_tool_turn(&no_body).is_none());
+}
+
+#[test]
+fn to_messages_folds_tool_turns_into_assistant_and_tool() {
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "List the files.".into(),
+                meta: TurnMeta::default(),
+            },
+            Turn {
+                role: Role::Assistant,
+                content: "Let me check.".into(),
+                meta: TurnMeta::default(),
+            },
+            tool_turn_fixture("list_files", "call_1", r#"{"subdir": "."}"#, "a.md  10"),
+        ],
+        ..Default::default()
+    };
+    let messages = conv.to_messages();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content.as_deref(), Some("List the files."));
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content.as_deref(), Some("Let me check."));
+    assert_eq!(messages[1].tool_calls.len(), 1);
+    assert_eq!(messages[1].tool_calls[0].id, "call_1");
+    assert_eq!(messages[1].tool_calls[0].function.name, "list_files");
+    assert_eq!(
+        messages[1].tool_calls[0].function.arguments,
+        r#"{"subdir": "."}"#
+    );
+    assert_eq!(messages[2].role, "tool");
+    assert_eq!(messages[2].content.as_deref(), Some("a.md  10"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+}
+
+#[test]
+fn to_messages_synthesizes_assistant_when_tool_turn_leads() {
+    // A file that starts with a tool turn (hand-edited) must still yield a
+    // valid payload: an assistant message with content None carries the call.
+    let conv = Conversation {
+        turns: vec![tool_turn_fixture("read_file", "c7", r#"{"path": "x"}"#, "data")],
+        ..Default::default()
+    };
+    let messages = conv.to_messages();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[0].content, None);
+    assert_eq!(messages[0].tool_calls.len(), 1);
+    assert_eq!(messages[0].tool_calls[0].id, "c7");
+    assert_eq!(messages[1].role, "tool");
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("c7"));
+}
+
+#[test]
+fn to_messages_skips_malformed_tool_turns() {
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "hi".into(),
+                meta: TurnMeta::default(),
+            },
+            Turn {
+                role: Role::Tool,
+                content: "not a tool turn".into(),
+                meta: TurnMeta::default(),
+            },
+        ],
+        ..Default::default()
+    };
+    let messages = conv.to_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+}
+
+#[test]
+fn frontmatter_tool_fields_round_trip() {
+    let conv = Conversation {
+        frontmatter: Frontmatter {
+            tools: false,
+            scope: Scope::Vault,
+            network: true,
+            allow_shell: true,
+            ..Default::default()
+        },
+        had_frontmatter: true,
+        ..Default::default()
+    };
+    let md = to_markdown(&conv);
+    assert!(md.contains("tools: false"), "{md}");
+    assert!(md.contains("scope: vault"), "{md}");
+    assert!(md.contains("network: true"), "{md}");
+    assert!(md.contains("allow_shell: true"), "{md}");
+    let back = parse(&md).unwrap();
+    assert_eq!(back.frontmatter, conv.frontmatter);
+}
+
+#[test]
+fn frontmatter_defaults_are_omitted() {
+    let md = to_markdown(&Conversation {
+        had_frontmatter: true,
+        ..Default::default()
+    });
+    assert!(!md.contains("tools:"), "{md}");
+    assert!(!md.contains("scope:"), "{md}");
+    assert!(!md.contains("network:"), "{md}");
+    assert!(!md.contains("allow_shell:"), "{md}");
+    let back = parse(&md).unwrap();
+    assert_eq!(back.frontmatter, Frontmatter::default());
+}
+
+#[test]
+fn frontmatter_legacy_tools_list_reads_as_enabled() {
+    let md = "---\ntools:\n  - name: shell\n---\n";
+    let conv = parse(md).unwrap();
+    assert!(conv.frontmatter.tools);
 }

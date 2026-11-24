@@ -10,7 +10,7 @@
 //! cancels an active stream, and `PageUp`/`PageDown` (or `Ctrl+U`/`Ctrl+D`)
 //! scroll the history at any time.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -29,7 +29,7 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use crate::{context, llm, parser};
+use crate::{context, llm, parser, tools};
 
 /// Environment variable overrides (frontmatter wins over these).
 const ENV_ENDPOINT: &str = "MDCHAT_ENDPOINT";
@@ -40,13 +40,25 @@ const DEFAULT_MODEL: &str = "local-model";
 /// Scroll step for PageUp/PageDown/Ctrl+U/Ctrl+D, in lines.
 const SCROLL_STEP: usize = 10;
 
-/// Events produced by the background streaming task.
+/// Events produced by the background streaming task (one user turn, which
+/// may span several LLM round-trips when tools are called).
 enum StreamEvent {
     /// A streamed delta: reasoning (thinking) text or answer content.
     Delta(llm::StreamDelta),
-    /// The stream finished successfully.
+    /// The current assistant response has ended (before tool execution, or
+    /// as the final response of the turn).
+    ResponseEnd,
+    /// A tool call has been executed; the fields describe the persisted
+    /// result.
+    ToolResult {
+        id: String,
+        name: String,
+        arguments: String,
+        output: String,
+    },
+    /// The whole turn finished successfully.
     Done,
-    /// The stream failed with an error message.
+    /// The turn failed with an error message.
     Failed(String),
 }
 
@@ -79,6 +91,9 @@ pub struct App {
     pub reason_buf: String,
     /// In-progress assistant reply text.
     pub stream_buf: String,
+    /// Whether the active turn has persisted anything yet (an assistant
+    /// response or a tool result); decides the "no reply produced" status.
+    pub got_reply: bool,
     /// User message queued by [`App::handle_key`] for the event loop to send.
     pub pending_send: Option<String>,
     /// Set by Ctrl+C while streaming; the event loop aborts the task.
@@ -125,6 +140,7 @@ impl App {
             streaming: false,
             reason_buf: String::new(),
             stream_buf: String::new(),
+            got_reply: false,
             pending_send: None,
             cancel_requested: false,
             quit: false,
@@ -250,8 +266,12 @@ impl App {
             lines.push(Line::default());
         }
         for t in &self.conv.turns {
-            let (reason, answer) = parser::split_reasoning(&t.content);
-            push_turn(&mut lines, t.role, &t.meta, reason.as_deref(), &answer);
+            if t.role == parser::Role::Tool {
+                push_tool_turn(&mut lines, t);
+            } else {
+                let (reason, answer) = parser::split_reasoning(&t.content);
+                push_turn(&mut lines, t.role, &t.meta, reason.as_deref(), &answer);
+            }
             lines.push(Line::default());
         }
         if self.streaming {
@@ -391,11 +411,16 @@ impl App {
                         "thinking… ({} chars)",
                         self.reason_buf.chars().count()
                     )
-                } else {
+                } else if !self.stream_buf.is_empty() {
                     format!(
                         "streaming… ({} chars)",
                         self.stream_buf.chars().count()
                     )
+                } else if !self.status.is_empty() {
+                    // Between responses (e.g. a tool just ran).
+                    self.status.clone()
+                } else {
+                    "waiting…".to_string()
                 }
             } else if self.status.is_empty() {
                 "ready".to_string()
@@ -451,6 +476,40 @@ fn push_turn(
     }
     for l in content.lines() {
         lines.push(Line::from(l.to_string()));
+    }
+}
+
+/// Push a persisted `**Tool**` turn into `lines`: the role line, the call
+/// (`name(args)`) dimmed, then the output indented. Falls back to the raw
+/// content when the turn is not a well-formed tool turn.
+fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
+    let mut spans = vec![Span::styled(
+        t.role.title().to_string(),
+        role_style(t.role).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(m) = t.meta.render() {
+        spans.push(Span::styled(
+            format!(" · {m}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    lines.push(Line::from(spans));
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    match parser::parse_tool_turn(t) {
+        Some(data) => {
+            lines.push(Line::from(Span::styled(
+                format!("{}({})", data.name, data.arguments),
+                dim,
+            )));
+            for l in data.output.lines() {
+                lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
+            }
+        }
+        None => {
+            for l in t.content.lines() {
+                lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
+            }
+        }
     }
 }
 
@@ -518,6 +577,7 @@ async fn event_loop(
             app.streaming = false;
             app.reason_buf.clear();
             app.stream_buf.clear();
+            app.got_reply = false;
             app.status = "stream cancelled".into();
         }
 
@@ -542,11 +602,35 @@ async fn event_loop(
                     Some(StreamEvent::Delta(llm::StreamDelta::Content(s))) => {
                         app.stream_buf.push_str(&s);
                     }
+                    // Tool-call fragments and finish markers are consumed by
+                    // the loop itself; they never reach the UI.
+                    Some(StreamEvent::Delta(_)) => {}
+                    Some(StreamEvent::ResponseEnd) => {
+                        finalize_response(app)?;
+                    }
+                    Some(StreamEvent::ToolResult {
+                        id,
+                        name,
+                        arguments,
+                        output,
+                    }) => {
+                        let turn = tools::tool_turn(&name, &id, &arguments, &output);
+                        tools::append_turn(&app.path, &turn)?;
+                        app.conv.turns.push(turn);
+                        app.got_reply = true;
+                        app.status = format!("tool: {name}");
+                    }
                     Some(StreamEvent::Done) => {
                         if let Some(h) = stream_task.take() {
                             let _ = h.await;
                         }
-                        finish_stream(app)?;
+                        app.streaming = false;
+                        if !app.got_reply {
+                            app.status = "no reply produced".into();
+                        } else {
+                            app.status.clear();
+                        }
+                        app.got_reply = false;
                     }
                     Some(StreamEvent::Failed(e)) => {
                         if let Some(h) = stream_task.take() {
@@ -555,6 +639,7 @@ async fn event_loop(
                         app.streaming = false;
                         app.reason_buf.clear();
                         app.stream_buf.clear();
+                        app.got_reply = false;
                         app.status = format!("error: {e}");
                     }
                     None => {} // sender dropped (task aborted or finished)
@@ -580,7 +665,7 @@ async fn submit(
             tags: vec![],
         },
     };
-    append_turn_to_file(&app.path, &user_turn)?;
+    tools::append_turn(&app.path, &user_turn)?;
     app.conv.turns.push(user_turn);
 
     let system_prompt = context::build_system_prompt(
@@ -591,100 +676,67 @@ async fn submit(
     if !system_prompt.is_empty() {
         messages.push(llm::Message::system(system_prompt));
     }
-    for t in &app.conv.turns {
-        messages.push(llm::Message::new(t.role.as_str(), t.content.clone()));
-    }
+    // `to_messages` folds persisted `**Tool**` turns into `role: "tool"`
+    // messages and attaches their `tool_calls` to the preceding assistant
+    // message, so reloaded histories are valid API payloads.
+    messages.extend(app.conv.to_messages());
 
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
+    let tool_config = tools::ToolConfig::for_file(&app.conv.frontmatter, &app.path);
     let tx = tx.clone();
     let task = tokio::spawn(async move {
-        let mut stream = match client.stream_chat(&messages).await {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(StreamEvent::Failed(e.to_string()));
-                return;
-            }
-        };
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(delta) => {
-                    if tx.send(StreamEvent::Delta(delta)).is_err() {
-                        break;
+        // The whole (possibly multi-round) turn runs here; each event is
+        // forwarded to the UI over the channel.
+        let res = tools::run_turn(&client, messages, &tool_config, |ev| {
+            let ev = match ev {
+                tools::LoopEvent::Reasoning(s) => StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone())),
+                tools::LoopEvent::Content(s) => StreamEvent::Delta(llm::StreamDelta::Content(s.clone())),
+                tools::LoopEvent::ResponseEnd => StreamEvent::ResponseEnd,
+                tools::LoopEvent::ToolResult { id, name, arguments, output } => {
+                    StreamEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        output: output.clone(),
                     }
                 }
-                Err(e) => {
-                    let _ = tx.send(StreamEvent::Failed(e.to_string()));
-                    return;
-                }
+            };
+            tx.send(ev).is_ok()
+        })
+        .await;
+        match res {
+            Ok(()) => {
+                let _ = tx.send(StreamEvent::Done);
+            }
+            Err(e) => {
+                let _ = tx.send(StreamEvent::Failed(e.to_string()));
             }
         }
-        let _ = tx.send(StreamEvent::Done);
     });
     app.streaming = true;
     app.reason_buf.clear();
     app.stream_buf.clear();
+    app.got_reply = false;
     Ok(task)
 }
 
-/// Persist the completed assistant reply (header with timestamp and model
-/// tag, then the response) and push it into the in-memory conversation.
-/// Any reasoning captured during the stream is persisted between
-/// `think` / `endthink` tags ahead of the answer.
-fn finish_stream(app: &mut App) -> Result<()> {
+/// Persist the assistant response that just ended (reasoning between
+/// `think` / `endthink` tags ahead of the answer) and push it into the
+/// in-memory conversation. A response with neither text nor reasoning — a
+/// pure tool-call response — is skipped: the parser synthesizes the missing
+/// assistant message when the file is reloaded.
+fn finalize_response(app: &mut App) -> Result<()> {
     let reply = app.stream_buf.trim_end().to_string();
     let reasoning = app.reason_buf.trim_end().to_string();
-    app.streaming = false;
-    if reply.is_empty() {
-        app.reason_buf.clear();
-        app.stream_buf.clear();
-        app.status = "no reply produced".into();
-        return Ok(());
-    }
-    let content = parser::with_reasoning(
-        (!reasoning.is_empty()).then_some(reasoning.as_str()),
-        &reply,
-    );
-    let ts = parser::now_timestamp();
-    let turn = parser::Turn {
-        role: parser::Role::Assistant,
-        content,
-        meta: parser::TurnMeta {
-            timestamp: Some(ts),
-            tags: vec![("model".into(), app.model.clone())],
-        },
-    };
-    append_turn_to_file(&app.path, &turn)?;
-    app.conv.turns.push(turn);
     app.reason_buf.clear();
     app.stream_buf.clear();
-    app.status.clear();
-    Ok(())
-}
-
-/// Append one formatted turn boundary plus content to the conversation file.
-fn append_turn_to_file(path: &Path, turn: &parser::Turn) -> Result<()> {
-    let needs_newline = std::fs::read_to_string(path)
-        .map(|c| !c.ends_with('\n'))
-        .unwrap_or(false);
-    let mut s = String::new();
-    if needs_newline {
-        s.push('\n');
+    if reply.is_empty() && reasoning.is_empty() {
+        return Ok(());
     }
-    s.push_str("\n---\n");
-    s.push_str(&format!("**{}**", turn.role.title()));
-    if let Some(m) = turn.meta.render() {
-        s.push_str(&format!(" · *{m}*"));
-    }
-    s.push_str("\n\n");
-    s.push_str(&parser::escape_boundaries(turn.content.trim_end()));
-    s.push('\n');
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open {} for appending", path.display()))?;
-    use std::io::Write;
-    f.write_all(s.as_bytes()).context("failed to write turn")?;
+    let turn = tools::assistant_turn(&app.model, &reasoning, &reply);
+    tools::append_turn(&app.path, &turn)?;
+    app.conv.turns.push(turn);
+    app.got_reply = true;
     Ok(())
 }
 
@@ -716,6 +768,7 @@ mod tests {
             streaming: false,
             reason_buf: String::new(),
             stream_buf: String::new(),
+            got_reply: false,
             pending_send: None,
             cancel_requested: false,
             quit: false,

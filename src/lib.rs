@@ -8,4 +8,5 @@ pub mod context;
 pub mod llm;
 pub mod parser;
 pub mod sandbox;
+pub mod tools;
 pub mod tui;

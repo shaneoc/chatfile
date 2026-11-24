@@ -113,8 +113,54 @@ impl TurnMeta {
     }
 }
 
+/// Which directory built-in tools operate in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Scope {
+    /// The conversation file's own directory (default).
+    #[default]
+    Folder,
+    /// The vault root (nearest ancestor with a `.mdchat` marker or `.git`).
+    Vault,
+}
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Scope::Folder => "folder",
+            Scope::Vault => "vault",
+        })
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+fn is_false(b: &bool) -> bool {
+    !b
+}
+fn is_folder(s: &Scope) -> bool {
+    matches!(s, Scope::Folder)
+}
+
+/// Deserialize a boolean that tolerates legacy frontmatter values: any
+/// non-boolean YAML value (e.g. the old free-form `tools:` list) reads as
+/// `true`, so pre-tool-calling files keep parsing.
+fn lenient_bool<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::Bool(b) => b,
+        _ => true,
+    })
+}
+
 /// YAML frontmatter fields. Unknown keys are ignored on parse.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frontmatter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -122,18 +168,48 @@ pub struct Frontmatter {
     pub endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    /// Free-form tool configuration, reserved for the tool-calling milestone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<serde_yaml::Value>,
+    /// Whether built-in tools are enabled (default `true`).
+    #[serde(
+        default = "default_true",
+        deserialize_with = "lenient_bool",
+        skip_serializing_if = "is_true"
+    )]
+    pub tools: bool,
+    /// Which directory built-in tools operate in (default `folder`).
+    #[serde(default, skip_serializing_if = "is_folder")]
+    pub scope: Scope,
+    /// Allow network access (`fetch_url`; sandboxed bash with shared net).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub network: bool,
+    /// Allow the `bash` tool (default `false`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_shell: bool,
+}
+
+impl Default for Frontmatter {
+    fn default() -> Self {
+        Self {
+            model: None,
+            endpoint: None,
+            system_prompt: None,
+            tools: true,
+            scope: Scope::Folder,
+            network: false,
+            allow_shell: false,
+        }
+    }
 }
 
 impl Frontmatter {
-    /// True when no field is set.
+    /// True when no field is set (tools defaults to enabled and is not
+    /// counted).
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
             && self.endpoint.is_none()
             && self.system_prompt.is_none()
-            && self.tools.is_none()
+            && self.scope == Scope::Folder
+            && !self.network
+            && !self.allow_shell
     }
 }
 
@@ -143,6 +219,114 @@ pub struct Turn {
     pub role: Role,
     pub content: String,
     pub meta: TurnMeta,
+}
+
+/// Structured data of a persisted `**Tool**` turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolTurnData {
+    /// The tool name (from the `tool:` meta tag).
+    pub name: String,
+    /// The tool call id (from the `id:` meta tag).
+    pub id: String,
+    /// The JSON arguments exactly as the model sent them (from the summary
+    /// line), or an empty string when the summary is missing/malformed.
+    pub arguments: String,
+    /// The unwrapped tool output (the fence content).
+    pub output: String,
+}
+
+/// Parse a `Role::Tool` turn's persisted `<details>` body into structured
+/// data. Returns `None` when the turn is not a well-formed tool turn (the
+/// name and id meta tags are required; the body must carry a summary line
+/// and a tilde-fenced output block).
+pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
+    if turn.role != Role::Tool {
+        return None;
+    }
+    let name = turn.meta.tags.iter().find(|(k, _)| k == "tool")?.1.clone();
+    let id = turn.meta.tags.iter().find(|(k, _)| k == "id")?.1.clone();
+
+    // Summary line: `<summary><code>name(args)</code></summary>`
+    let mut arguments = String::new();
+    for line in turn.content.lines() {
+        let line = line.trim();
+        let Some(inner) = line
+            .strip_prefix("<summary><code>")
+            .and_then(|s| s.strip_suffix("</code></summary>"))
+        else {
+            continue;
+        };
+        if let Some(open) = inner.find('(') {
+            let name_part = &inner[..open];
+            if !name_part.is_empty() && !name_part.chars().any(|c| c.is_whitespace()) {
+                // The arguments run to the final closing paren.
+                if let Some(close) = inner.rfind(')') {
+                    if close > open {
+                        arguments = inner[open + 1..close].to_string();
+                    }
+                }
+            }
+        }
+        break; // only the first summary line is considered
+    }
+
+    // Output block: a tilde fence (info `text`) opened after the summary,
+    // closed by a bare tilde run at least as long.
+    let lines: Vec<&str> = turn.content.lines().collect();
+    let mut open_at: Option<usize> = None;
+    let mut open_len = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let run = t.chars().take_while(|&c| c == '~').count();
+        if run >= 3 && (t[run..].trim() == "text" || t[run..].trim().is_empty()) {
+            open_at = Some(i);
+            open_len = run;
+            break;
+        }
+    }
+    let open_at = open_at?;
+    let mut close_at: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate().skip(open_at + 1) {
+        let t = line.trim();
+        let run = t.chars().take_while(|&c| c == '~').count();
+        if run >= open_len && t.len() == run {
+            close_at = Some(i);
+            break;
+        }
+    }
+    let close_at = close_at?;
+    let output = lines[open_at + 1..close_at].join("\n").trim().to_string();
+
+    Some(ToolTurnData {
+        name,
+        id,
+        arguments,
+        output,
+    })
+}
+
+/// Serialize a tool result into the canonical persisted body: a
+/// `<details>` block whose summary shows the call and whose output sits in
+/// a tilde fence. The fence is at least four tildes long and strictly
+/// longer than any tilde run inside the output, so embedded ` ``` ` (or
+/// shorter `~~~`) cannot terminate it early.
+pub fn tool_turn_body(name: &str, arguments: &str, output: &str) -> String {
+    let fence = "~".repeat(fence_len(output));
+    format!(
+        "<details>\n<summary><code>{name}({arguments})</code></summary>\n\n{fence}text\n{output}\n{fence}\n\n</details>"
+    )
+}
+
+/// The tilde fence length for a tool output: `max(4, longest run + 1)`.
+fn fence_len(output: &str) -> usize {
+    let mut longest = 0usize;
+    for line in output.lines() {
+        let t = line.trim_start();
+        if t.starts_with('~') {
+            longest = longest.max(t.chars().take_while(|&c| c == '~').count());
+        }
+    }
+    longest.saturating_add(1).max(4)
 }
 
 /// A parsed conversation file.
@@ -458,8 +642,22 @@ pub fn to_markdown(conv: &Conversation) -> String {
                 serde_yaml::Value::String(v.clone()),
             );
         }
-        if let Some(v) = &conv.frontmatter.tools {
-            mapping.insert(key("tools"), v.clone());
+        // Booleans/enums are written only when they differ from the
+        // defaults, keeping files clean.
+        if !conv.frontmatter.tools {
+            mapping.insert(key("tools"), serde_yaml::Value::Bool(false));
+        }
+        if conv.frontmatter.scope != Scope::Folder {
+            mapping.insert(
+                key("scope"),
+                serde_yaml::Value::String(conv.frontmatter.scope.to_string()),
+            );
+        }
+        if conv.frontmatter.network {
+            mapping.insert(key("network"), serde_yaml::Value::Bool(true));
+        }
+        if conv.frontmatter.allow_shell {
+            mapping.insert(key("allow_shell"), serde_yaml::Value::Bool(true));
         }
         let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
             .expect("frontmatter serialization cannot fail");
@@ -501,6 +699,63 @@ impl Conversation {
     /// Parse then re-serialize (canonical form).
     pub fn canonicalize(input: &str) -> Result<String> {
         Ok(to_markdown(&parse(input)?))
+    }
+
+    /// The turns as OpenAI wire-format messages.
+    ///
+    /// `**Tool**` turns become `role: "tool"` messages carrying the
+    /// `tool_call_id`, and the `tool_calls` (id, name, arguments) are
+    /// attached to the preceding assistant message — a message with
+    /// `content: None` is synthesized when a tool turn has no preceding
+    /// assistant turn (e.g. a hand-edited file), so reloaded histories are
+    /// always valid API payloads. Malformed tool turns are skipped.
+    pub fn to_messages(&self) -> Vec<crate::llm::Message> {
+        use crate::llm::{Message, ToolCall, ToolFunction};
+
+        let mut messages: Vec<Message> = Vec::new();
+        for turn in &self.turns {
+            match turn.role {
+                Role::Tool => {
+                    let Some(data) = parse_tool_turn(turn) else {
+                        continue;
+                    };
+                    let call = ToolCall {
+                        id: data.id.clone(),
+                        call_type: "function".into(),
+                        function: ToolFunction {
+                            name: data.name.clone(),
+                            arguments: data.arguments.clone(),
+                        },
+                    };
+                    match messages.last_mut() {
+                        Some(last) if last.role == "assistant" => last.tool_calls.push(call),
+                        _ => {
+                            let mut m = Message::new("assistant", None);
+                            m.tool_calls.push(call);
+                            messages.push(m);
+                        }
+                    }
+                    messages.push(Message {
+                        role: "tool".into(),
+                        content: Some(data.output.clone()),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some(data.id.clone()),
+                    });
+                }
+                other => {
+                    // Only assistant messages may omit `content` (they
+                    // carried tool calls instead); other roles always send
+                    // a string, even when empty.
+                    let content = if other == Role::Assistant && turn.content.trim().is_empty() {
+                        None
+                    } else {
+                        Some(turn.content.clone())
+                    };
+                    messages.push(Message::new(other.as_str(), content));
+                }
+            }
+        }
+        messages
     }
 }
 

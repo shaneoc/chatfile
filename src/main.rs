@@ -13,8 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
-use mdchat::{context, llm, parser, tui};
+use mdchat::{context, llm, parser, tools, tui};
 
 /// Environment variable overrides (frontmatter wins over these).
 const ENV_ENDPOINT: &str = "MDCHAT_ENDPOINT";
@@ -95,15 +94,6 @@ fn with_conversation_ext(path: &Path) -> PathBuf {
     out
 }
 
-/// The metadata portion of a boundary line (` · *...*`), or empty when the
-/// metadata is absent.
-fn meta_boundary_suffix(meta: &parser::TurnMeta) -> String {
-    match meta.render() {
-        Some(r) => format!(" · *{r}*"),
-        None => String::new(),
-    }
-}
-
 /// Reject paths that do not carry the `.chat.md` extension.
 fn require_conversation_ext(path: &Path) -> Result<()> {
     if !has_conversation_ext(path) {
@@ -170,12 +160,10 @@ async fn run(file: &Path) -> Result<()> {
     if !system_prompt.is_empty() {
         messages.push(llm::Message::system(system_prompt));
     }
-    for turn in &conv.turns {
-        // Roles pass through verbatim; llama.cpp accepts `tool`. Strict
-        // OpenAI requires tool_call_id wiring, which lands with the
-        // tool-calling milestone.
-        messages.push(llm::Message::new(turn.role.as_str(), turn.content.clone()));
-    }
+    // `to_messages` folds persisted `**Tool**` turns into `role: "tool"`
+    // messages and attaches their `tool_calls` to the preceding assistant
+    // message, so reloaded histories are valid API payloads.
+    messages.extend(conv.to_messages());
     if messages.is_empty() {
         bail!(
             "{} has no turns and no system prompt; add a `**User**` turn first",
@@ -185,78 +173,82 @@ async fn run(file: &Path) -> Result<()> {
 
     eprintln!("[mdchat] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
-    let mut stream = client.stream_chat(&messages).await?;
+    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file);
 
-    // Stream the reply to stdout while accumulating it. Reasoning deltas
-    // (thinking models) are collected but not printed, so stdout stays a
-    // clean stream of just the answer.
+    // Run the (possibly multi-turn) assistant reply. stdout stays a clean
+    // stream of answer text: reasoning and tool results are only persisted
+    // to the file, with progress notes on stderr.
     let mut reply = String::new();
     let mut reasoning = String::new();
+    let mut final_reply = String::new();
+    let mut reasoning_chars = 0usize;
+    let mut appended = 0usize;
     let stdout = std::io::stdout();
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("\n[mdchat] interrupted");
-                break;
+    tools::run_turn(&client, messages, &tool_config, |ev| {
+        use tools::LoopEvent::*;
+        match ev {
+            Reasoning(chunk) => {
+                reasoning.push_str(chunk);
+                true
             }
-            next = stream.next() => match next {
-                Some(Ok(llm::StreamDelta::Reasoning(chunk))) => {
-                    reasoning.push_str(&chunk);
+            Content(chunk) => {
+                reply.push_str(chunk);
+                let mut out = stdout.lock();
+                let _ = out.write_all(chunk.as_bytes());
+                let _ = out.flush();
+                true
+            }
+            ResponseEnd => {
+                // Persist the response just finished (skipped when it had no
+                // text and no reasoning, i.e. a pure tool-call response).
+                if !(reply.trim().is_empty() && reasoning.trim().is_empty()) {
+                    let turn = tools::assistant_turn(&model, &reasoning, &reply);
+                    if tools::append_turn(file, &turn).is_ok() {
+                        appended += 1;
+                    }
+                    eprintln!(
+                        "[mdchat] appended assistant turn ({} chars)",
+                        reply.trim().chars().count()
+                    );
                 }
-                Some(Ok(llm::StreamDelta::Content(chunk))) => {
-                    reply.push_str(&chunk);
-                    let mut out = stdout.lock();
-                    let _ = out.write_all(chunk.as_bytes());
-                    let _ = out.flush();
+                reasoning_chars += reasoning.trim().chars().count();
+                final_reply = std::mem::take(&mut reply);
+                reasoning.clear();
+                true
+            }
+            ToolResult {
+                id,
+                name,
+                arguments,
+                output,
+            } => {
+                let turn = tools::tool_turn(name, id, arguments, output);
+                if tools::append_turn(file, &turn).is_ok() {
+                    appended += 1;
                 }
-                Some(Err(e)) => bail!("stream error: {e}"),
-                None => break,
-            },
+                eprintln!(
+                    "[mdchat] tool {name}: {} chars of output",
+                    output.trim().chars().count()
+                );
+                true
+            }
         }
-    }
-    if !reply.is_empty() && !reply.ends_with('\n') {
+    })
+    .await?;
+    if !final_reply.is_empty() && !final_reply.ends_with('\n') {
         let mut out = stdout.lock();
         let _ = out.write_all(b"\n");
         let _ = out.flush();
     }
 
-    // Append the assistant turn to the conversation file.
-    if reply.trim().is_empty() {
+    if appended == 0 {
         eprintln!("[mdchat] no reply produced; file unchanged");
         return Ok(());
     }
-    if !reasoning.trim().is_empty() {
-        eprintln!(
-            "[mdchat] captured {} chars of reasoning",
-            reasoning.trim().chars().count()
-        );
+    if reasoning_chars > 0 {
+        eprintln!("[mdchat] captured {reasoning_chars} chars of reasoning");
     }
-    let mut appendage = String::new();
-    if !raw.ends_with('\n') {
-        appendage.push('\n');
-    }
-    // Persist reasoning (between think/endthink tags) plus the answer,
-    // escaping any boundary pattern so it can't be mistaken for a real turn
-    // marker, and stamp the turn with time and model metadata.
-    let ts = parser::now_timestamp();
-    let meta = parser::TurnMeta {
-        timestamp: Some(ts),
-        tags: vec![("model".into(), model.clone())],
-    };
-    let content = parser::with_reasoning(
-        (!reasoning.trim().is_empty()).then_some(reasoning.trim()),
-        reply.trim_end(),
-    );
-    let content = parser::escape_boundaries(&content);
-    appendage.push_str(&format!("\n---\n**Assistant**{}\n\n{}\n", meta_boundary_suffix(&meta), content));
-
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(file)
-        .with_context(|| format!("failed to open {} for appending", file.display()))?;
-    f.write_all(appendage.as_bytes()).context("failed to write assistant turn")?;
-    eprintln!("[mdchat] appended assistant turn to {}", file.display());
+    eprintln!("[mdchat] appended {appended} turns to {}", file.display());
     Ok(())
 }
 
