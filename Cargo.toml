@@ -2,7 +2,7 @@
 name = "chatfile"
 version = "0.1.0"
 edition = "2024"
-description = "Manage LLM conversations as plain Markdown files"
+description = "Manage LLM conversations as plain Markdown files, with a terminal UI and sandboxed tools for local and OpenAI-compatible LLMs"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shaneoc/chatfile"
 readme = "README.md"
