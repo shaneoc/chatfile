@@ -11,12 +11,12 @@ use std::path::{Path, PathBuf};
 pub const AGENTS_FILE: &str = "AGENTS.md";
 
 /// Marker file that designates a non-git vault root.
-const VAULT_MARKER: &str = ".mdchat";
+const VAULT_MARKER: &str = ".chatfile";
 
 /// Directories from `start_dir` up to (and including) the boundary.
 ///
 /// The walk stops at the first directory containing a `.git` entry or a
-/// `.mdchat` marker file, or at the filesystem root. Order: start dir first.
+/// `.chatfile` marker file, or at the filesystem root. Order: start dir first.
 pub fn agent_chain(start_dir: &Path) -> Vec<PathBuf> {
     let mut chain: Vec<PathBuf> = Vec::new();
     let mut dir: Option<&Path> = Some(start_dir);
@@ -80,7 +80,7 @@ mod tests {
     /// Create a unique temp directory for a test.
     fn tempdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "mdchat-test-{}-{}-{}",
+            "chatfile-test-{}-{}-{}",
             tag,
             std::process::id(),
             TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -130,7 +130,7 @@ mod tests {
         let base = tempdir("unbounded");
         let leaf = base.join("a").join("b");
         fs::create_dir_all(&leaf).unwrap();
-        // No .git / .mdchat anywhere below: the chain must end at "/".
+        // No .git / .chatfile anywhere below: the chain must end at "/".
         let chain = agent_chain(&leaf);
         assert_eq!(chain[0], leaf);
         assert_eq!(chain.last().map(|p| p.as_path()), Some(Path::new("/")));

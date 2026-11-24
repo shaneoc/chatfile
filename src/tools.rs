@@ -119,7 +119,7 @@ pub struct ToolConfig {
 impl ToolConfig {
     /// Build the config for a conversation file: `scope: folder` selects the
     /// file's own directory, `scope: vault` the nearest ancestor carrying a
-    /// `.mdchat` marker or `.git` entry (falling back to the file's dir).
+    /// `.chatfile` marker or `.git` entry (falling back to the file's dir).
     pub fn for_file(fm: &parser::Frontmatter, file: &Path) -> Self {
         let file_dir = file
             .parent()
@@ -299,9 +299,8 @@ fn schema(
 /// Execute one tool call by name with its JSON arguments.
 ///
 /// The result is always returned as text suitable to feed back to the model:
-/// failures are reported as `Error: ...` lines (truncated to
-/// [`MAX_TOOL_OUTPUT`]) rather than panics, so the model can see and react to
-/// them.
+/// failures are reported as `Error: ...` lines (truncated to a fixed byte
+/// cap) rather than panics, so the model can see and react to them.
 pub async fn execute(name: &str, arguments: &str, config: &ToolConfig) -> String {
     let args: Json = match serde_json::from_str(arguments) {
         Ok(v) => v,
@@ -764,9 +763,13 @@ pub enum LoopEvent {
     /// A tool call has been executed; the fields describe the persisted
     /// result.
     ToolResult {
+        /// The tool call id.
         id: String,
+        /// The tool name.
         name: String,
+        /// The JSON arguments exactly as the model sent them.
         arguments: String,
+        /// The tool's output (or `Error: ...` text on failure).
         output: String,
     },
 }

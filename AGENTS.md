@@ -1,4 +1,4 @@
-# Project Specification: mdchat
+# Project Specification: chatfile
 Build a fast, single-binary Rust CLI and web server for managing LLM
 conversations stored as plain Markdown files inside nested directories.
 
@@ -10,18 +10,33 @@ conversations stored as plain Markdown files inside nested directories.
 2. **Hierarchical Context:** Before sending a prompt, walk up from the `.md`
    file's directory to the vault root and concatenate any `AGENTS.md` files
    found into the system prompt. The vault root is identified by the existance
-   of a .mdchat file.
+   of a .chatfile file.
 3. **OpenAI-Compatible Backend:** Target
    `http://localhost:9000/v1/chat/completions` (`llama.cpp`) by default,
    supporting streaming responses and multi-turn tool calling, with
    configurable cloud endpoints/API keys via environment variables.
-4. **Thin Interfaces:**
-   - `mdchat run <file.md>`: Reads the file, executes the next assistant turn
-     (including any tool calls), streams/appends the output directly back to
-     `<file.md>`, and exits. (Designed to be called from Neovim or CLI).
-   - `mdchat serve --root <dir> --port 4096`: Serves an Axum + HTMX web UI for
-     browsing folders, viewing PDFs/images inline, and chatting from desktop or
-     Android browsers.
+
+## Source Layout
+- `src/lib.rs` — crate root; exposes the public modules so docs.rs renders
+  complete documentation.
+- `src/main.rs` — thin CLI entrypoint (`chatfile <file>`, `run`, `new`).
+- `src/parser.rs` — parse/serialize `.chat.md` files: frontmatter, turn
+  boundaries, persisted tool turns, reasoning tags; `to_messages` folds the
+  file into OpenAI wire-format messages.
+- `src/context.rs` — hierarchical `AGENTS.md` walk to the vault root (`.git`
+  or `.chatfile` marker) and system-prompt assembly.
+- `src/llm.rs` — OpenAI-compatible streaming client (SSE deltas, reasoning,
+  streamed tool-call fragments).
+- `src/tools.rs` — built-in tools (`list_files`, `read_file`, `write_file`,
+  `edit_file`, `search_files`, `fetch_url`, `bash`) with path-containment
+  safety (`resolve_safe_path`), and the multi-turn tool-calling loop
+  (`run_turn`) that executes calls against the conversation's working
+  directory and persists `**Tool**` turns.
+- `src/sandbox.rs` — config-driven rootless bubblewrap sandbox
+  (`/etc/chatfile/config.yaml`, `~/.config/chatfile/config.yaml`) used by the
+  `bash` tool: fresh mount/network namespaces, the work dir as the only
+  writable location, timeouts and output truncation.
+- `src/tui.rs` — the `ratatui` interactive UI (streaming, cancel, scrolling).
 
 ## Build & Verification Rules
 - Use `cargo check` and `cargo test` after every module change.

@@ -37,13 +37,18 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
+    /// A `**System**` turn.
     System,
+    /// A `**User**` turn.
     User,
+    /// An `**Assistant**` turn.
     Assistant,
+    /// A `**Tool**` turn (a persisted tool result).
     Tool,
 }
 
 impl Role {
+    /// The lowercase wire form (`"user"`, ...), as sent to the LLM API.
     pub fn as_str(self) -> &'static str {
         match self {
             Role::System => "system",
@@ -120,7 +125,7 @@ pub enum Scope {
     /// The conversation file's own directory (default).
     #[default]
     Folder,
-    /// The vault root (nearest ancestor with a `.mdchat` marker or `.git`).
+    /// The vault root (nearest ancestor with a `.chatfile` marker or `.git`).
     Vault,
 }
 
@@ -162,10 +167,13 @@ where
 /// YAML frontmatter fields. Unknown keys are ignored on parse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frontmatter {
+    /// The model name to request (e.g. `local-model`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The full `/v1/chat/completions` endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Extra system-prompt text, appended after the `AGENTS.md` context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     /// Whether built-in tools are enabled (default `true`).
@@ -216,8 +224,11 @@ impl Frontmatter {
 /// A single conversation turn: a boundary line plus its content.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Turn {
+    /// The turn's role.
     pub role: Role,
+    /// The turn body (for assistant turns, reasoning tags included).
     pub content: String,
+    /// Optional timestamp and `key: value` tags from the boundary line.
     pub meta: TurnMeta,
 }
 
@@ -332,11 +343,13 @@ fn fence_len(output: &str) -> usize {
 /// A parsed conversation file.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Conversation {
+    /// The parsed YAML frontmatter (defaults when absent).
     pub frontmatter: Frontmatter,
     /// Whether the source file began with a YAML frontmatter block.
     pub had_frontmatter: bool,
     /// Body text before the first turn boundary (kept for lossless round-trips).
     pub preamble: String,
+    /// The turns in file order.
     pub turns: Vec<Turn>,
 }
 

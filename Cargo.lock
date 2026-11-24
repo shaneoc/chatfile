@@ -144,6 +144,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "Could not get crate checksum"
 
 [[package]]
+name = "chatfile"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "futures",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -590,26 +610,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "Could not get crate checksum"
 dependencies = [
  "hashbrown",
-]
-
-[[package]]
-name = "mdchat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "futures",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "unicode-width 0.1.14",
 ]
 
 [[package]]

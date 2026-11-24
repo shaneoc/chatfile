@@ -16,6 +16,7 @@ use std::task::{Context as TaskContext, Poll};
 /// A chat message in OpenAI wire format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    /// The wire role: `"system"`, `"user"`, `"assistant"`, or `"tool"`.
     pub role: String,
     /// `None` for assistant messages that issued tool calls without text.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,9 +32,12 @@ pub struct Message {
 /// One tool call in OpenAI wire format (`type` is always `"function"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
+    /// The unique id the server assigned to this call.
     pub id: String,
+    /// Always `"function"` on the OpenAI wire format.
     #[serde(rename = "type", default = "default_call_type")]
     pub call_type: String,
+    /// The function being called (name plus JSON arguments).
     pub function: ToolFunction,
 }
 
@@ -45,11 +49,14 @@ fn default_call_type() -> String {
 /// argument object (a string on the wire).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolFunction {
+    /// The name of the tool to call.
     pub name: String,
+    /// The JSON-encoded argument object (a string on the wire).
     pub arguments: String,
 }
 
 impl Message {
+    /// A message with an explicit role and optional content.
     pub fn new(role: impl Into<String>, content: Option<String>) -> Self {
         Self {
             role: role.into(),
@@ -59,14 +66,17 @@ impl Message {
         }
     }
 
+    /// A `role: "system"` message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::new("system", Some(content.into()))
     }
 
+    /// A `role: "user"` message.
     pub fn user(content: impl Into<String>) -> Self {
         Self::new("user", Some(content.into()))
     }
 
+    /// A `role: "assistant"` message.
     pub fn assistant(content: impl Into<String>) -> Self {
         Self::new("assistant", Some(content.into()))
     }
@@ -95,6 +105,9 @@ pub struct Client {
 }
 
 impl Client {
+    /// Create a client for `endpoint` (a full
+    /// `/v1/chat/completions` URL) with the given `model`. When `api_key`
+    /// is `Some`, it is sent as a bearer token.
     pub fn new(
         endpoint: impl Into<String>,
         model: impl Into<String>,
@@ -108,10 +121,12 @@ impl Client {
         }
     }
 
+    /// The endpoint URL this client posts to.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
+    /// The model name sent in every request.
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -291,7 +306,9 @@ pub struct AssistantTurn {
 /// A fully assembled tool call from a streamed response.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletedToolCall {
+    /// The call id (empty if the server never sent one).
     pub id: String,
+    /// The function name (empty if the server never sent one).
     pub name: String,
     /// The concatenated JSON arguments.
     pub arguments: String,

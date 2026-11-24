@@ -32,9 +32,13 @@ use tokio::sync::mpsc;
 use crate::{context, llm, parser, tools};
 
 /// Environment variable overrides (frontmatter wins over these).
-const ENV_ENDPOINT: &str = "MDCHAT_ENDPOINT";
-const ENV_MODEL: &str = "MDCHAT_MODEL";
-const ENV_API_KEY: &str = "MDCHAT_API_KEY";
+const ENV_ENDPOINT: &str = "CHATFILE_ENDPOINT";
+const ENV_MODEL: &str = "CHATFILE_MODEL";
+const ENV_API_KEY: &str = "CHATFILE_API_KEY";
+/// Standard OpenAI-compatible variables, honored as a fallback when the
+/// `CHATFILE_*` equivalents are unset.
+const ENV_OPENAI_BASE: &str = "OPENAI_API_BASE";
+const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
 const DEFAULT_MODEL: &str = "local-model";
 
 /// Scroll step for PageUp/PageDown/Ctrl+U/Ctrl+D, in lines.
@@ -120,6 +124,7 @@ impl App {
             .endpoint
             .clone()
             .or_else(|| env(ENV_ENDPOINT))
+            .or_else(|| env(ENV_OPENAI_BASE))
             .unwrap_or_else(|| llm::DEFAULT_ENDPOINT.to_string());
         let model = conv
             .frontmatter
@@ -132,7 +137,7 @@ impl App {
             conv,
             endpoint,
             model,
-            api_key: env(ENV_API_KEY),
+            api_key: env(ENV_API_KEY).or_else(|| env(ENV_OPENAI_KEY)),
             input: String::new(),
             cursor: 0,
             scroll: 0,

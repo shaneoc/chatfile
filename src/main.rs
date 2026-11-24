@@ -1,31 +1,35 @@
-//! mdchat — manage LLM conversations as plain Markdown files.
+//! chatfile — manage LLM conversations as plain Markdown files.
 //!
-//!   - `mdchat <file>`         open the interactive TUI on a conversation
+//!   - `chatfile <file>`         open the interactive TUI on a conversation
 //!                             (`.chat.md` is appended when no extension is
 //!                             given; the file is created with default YAML
 //!                             frontmatter if it does not exist yet)
-//!   - `mdchat run <file>`     stream the next assistant turn into stdout
+//!   - `chatfile run <file>`     stream the next assistant turn into stdout
 //!                             and append it to the file
-//!   - `mdchat new <file>`     create a starter conversation template
+//!   - `chatfile new <file>`     create a starter conversation template
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use mdchat::{context, llm, parser, tools, tui};
+use chatfile::{context, llm, parser, tools, tui};
 
 /// Environment variable overrides (frontmatter wins over these).
-const ENV_ENDPOINT: &str = "MDCHAT_ENDPOINT";
-const ENV_MODEL: &str = "MDCHAT_MODEL";
-const ENV_API_KEY: &str = "MDCHAT_API_KEY";
+const ENV_ENDPOINT: &str = "CHATFILE_ENDPOINT";
+const ENV_MODEL: &str = "CHATFILE_MODEL";
+const ENV_API_KEY: &str = "CHATFILE_API_KEY";
+/// Standard OpenAI-compatible variables, honored as a fallback when the
+/// `CHATFILE_*` equivalents are unset.
+const ENV_OPENAI_BASE: &str = "OPENAI_API_BASE";
+const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
 const DEFAULT_MODEL: &str = "local-model";
 
 /// The only file extension accepted for conversation files.
 const CONVERSATION_EXT: &str = "chat.md";
 
 #[derive(Parser)]
-#[command(name = "mdchat", version, about = "Manage LLM conversations as plain Markdown files")]
+#[command(name = "chatfile", version, about = "Manage LLM conversations as plain Markdown files")]
 struct Cli {
     /// Conversation file to open in the interactive TUI.
     #[arg(value_name = "FILE")]
@@ -60,7 +64,7 @@ async fn main() -> Result<()> {
         Some(Command::New { file }) => new(&file),
         None => match cli.file {
             Some(file) => open_tui(file).await,
-            None => bail!("missing conversation file; try `mdchat --help`"),
+            None => bail!("missing conversation file; try `chatfile --help`"),
         },
     }
 }
@@ -105,7 +109,7 @@ fn require_conversation_ext(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `mdchat <file>` — open the interactive TUI.
+/// `chatfile <file>` — open the interactive TUI.
 async fn open_tui(path: PathBuf) -> Result<()> {
     // Append the extension when none was given; otherwise require it.
     let path = if path.extension().is_none() {
@@ -123,7 +127,7 @@ async fn open_tui(path: PathBuf) -> Result<()> {
         }
         std::fs::write(&path, default_template())
             .with_context(|| format!("failed to create {}", path.display()))?;
-        eprintln!("[mdchat] created {} with default frontmatter", path.display());
+        eprintln!("[chatfile] created {} with default frontmatter", path.display());
     }
     tui::run_tui(path).await
 }
@@ -132,7 +136,7 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// `mdchat run <file.chat.md>`
+/// `chatfile run <file.chat.md>`
 async fn run(file: &Path) -> Result<()> {
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
@@ -147,6 +151,7 @@ async fn run(file: &Path) -> Result<()> {
         .endpoint
         .clone()
         .or_else(|| env(ENV_ENDPOINT))
+        .or_else(|| env(ENV_OPENAI_BASE))
         .unwrap_or_else(|| llm::DEFAULT_ENDPOINT.to_string());
     let model = conv
         .frontmatter
@@ -154,7 +159,7 @@ async fn run(file: &Path) -> Result<()> {
         .clone()
         .or_else(|| env(ENV_MODEL))
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let api_key = env(ENV_API_KEY);
+    let api_key = env(ENV_API_KEY).or_else(|| env(ENV_OPENAI_KEY));
 
     let mut messages: Vec<llm::Message> = Vec::new();
     if !system_prompt.is_empty() {
@@ -171,7 +176,7 @@ async fn run(file: &Path) -> Result<()> {
         );
     }
 
-    eprintln!("[mdchat] model={} endpoint={}", model, endpoint);
+    eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
     let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file);
 
@@ -207,7 +212,7 @@ async fn run(file: &Path) -> Result<()> {
                         appended += 1;
                     }
                     eprintln!(
-                        "[mdchat] appended assistant turn ({} chars)",
+                        "[chatfile] appended assistant turn ({} chars)",
                         reply.trim().chars().count()
                     );
                 }
@@ -227,7 +232,7 @@ async fn run(file: &Path) -> Result<()> {
                     appended += 1;
                 }
                 eprintln!(
-                    "[mdchat] tool {name}: {} chars of output",
+                    "[chatfile] tool {name}: {} chars of output",
                     output.trim().chars().count()
                 );
                 true
@@ -242,13 +247,13 @@ async fn run(file: &Path) -> Result<()> {
     }
 
     if appended == 0 {
-        eprintln!("[mdchat] no reply produced; file unchanged");
+        eprintln!("[chatfile] no reply produced; file unchanged");
         return Ok(());
     }
     if reasoning_chars > 0 {
-        eprintln!("[mdchat] captured {reasoning_chars} chars of reasoning");
+        eprintln!("[chatfile] captured {reasoning_chars} chars of reasoning");
     }
-    eprintln!("[mdchat] appended {appended} turns to {}", file.display());
+    eprintln!("[chatfile] appended {appended} turns to {}", file.display());
     Ok(())
 }
 
@@ -262,7 +267,7 @@ fn default_template() -> String {
     )
 }
 
-/// `mdchat new <file>`
+/// `chatfile new <file>`
 fn new(file: &Path) -> Result<()> {
     let file = with_conversation_ext(file);
     if file.exists() {
@@ -275,7 +280,7 @@ fn new(file: &Path) -> Result<()> {
         }
     }
     std::fs::write(&file, default_template()).with_context(|| format!("failed to write {}", file.display()))?;
-    eprintln!("[mdchat] created {}", file.display());
+    eprintln!("[chatfile] created {}", file.display());
     Ok(())
 }
 
@@ -285,7 +290,7 @@ mod tests {
 
     #[test]
     fn new_creates_template_and_refuses_overwrite() {
-        let dir = std::env::temp_dir().join(format!("mdchat-new-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatfile-new-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("a").join("b").join("conv.md");
 
@@ -313,7 +318,7 @@ mod tests {
 
     #[test]
     fn new_appends_default_extension() {
-        let dir = std::env::temp_dir().join(format!("mdchat-newext-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatfile-newext-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let file = dir.join("notes");
 
@@ -330,7 +335,7 @@ mod tests {
 
     #[test]
     fn run_rejects_wrong_extension() {
-        let dir = std::env::temp_dir().join(format!("mdchat-runext-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatfile-runext-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("conv.md");

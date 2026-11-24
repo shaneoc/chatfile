@@ -3,7 +3,7 @@
 //! host filesystem or network access.
 //!
 //! The policy is loaded from optional YAML config files —
-//! `/etc/mdchat/config.yaml` (system) and `~/.config/mdchat/config.yaml`
+//! `/etc/chatfile/config.yaml` (system) and `~/.config/chatfile/config.yaml`
 //! (user, overrides system) — falling back to built-in distro-agnostic
 //! defaults when neither exists. A config file may name any subset of the
 //! fields; unnamed fields keep the value from the layer below.
@@ -24,15 +24,15 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 /// System-wide sandbox config location.
-pub const SYSTEM_CONFIG_PATH: &str = "/etc/mdchat/config.yaml";
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/chatfile/config.yaml";
 
-/// User-level sandbox config location (`$HOME/.config/mdchat/config.yaml`),
+/// User-level sandbox config location (`$HOME/.config/chatfile/config.yaml`),
 /// or `None` when `$HOME` is unset.
 pub fn user_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| {
         Path::new(&home)
             .join(".config")
-            .join("mdchat")
+            .join("chatfile")
             .join("config.yaml")
     })
 }
@@ -135,9 +135,9 @@ impl PolicyOverrides {
 }
 
 impl<'de> Deserialize<'de> for SandboxPolicy {
-    /// A `SandboxPolicy` deserializes from the same partial YAML as
-    /// [`PolicyOverrides`], with missing keys filled in from the built-in
-    /// defaults (an empty document yields pure defaults).
+    /// A `SandboxPolicy` deserializes from the same partial YAML as a config
+    /// file, with missing keys filled in from the built-in defaults (an empty
+    /// document yields pure defaults).
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -153,8 +153,8 @@ impl<'de> Deserialize<'de> for SandboxPolicy {
 
 impl SandboxPolicy {
     /// Load the effective policy: built-in defaults, overridden by
-    /// `/etc/mdchat/config.yaml` when present, then by
-    /// `~/.config/mdchat/config.yaml` when present.
+    /// `/etc/chatfile/config.yaml` when present, then by
+    /// `~/.config/chatfile/config.yaml` when present.
     pub fn load() -> Result<Self> {
         let mut paths = vec![PathBuf::from(SYSTEM_CONFIG_PATH)];
         if let Some(user) = user_config_path() {
