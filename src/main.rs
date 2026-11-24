@@ -1,12 +1,12 @@
 //! chatfile — manage LLM conversations as plain Markdown files.
 //!
-//!   - `chatfile <file>`         open the interactive TUI on a conversation
+//!   - `chatfile <file>`       open the interactive TUI on a conversation
 //!                             (`.chat.md` is appended when no extension is
 //!                             given; the file is created with default YAML
 //!                             frontmatter if it does not exist yet)
-//!   - `chatfile run <file>`     stream the next assistant turn into stdout
+//!   - `chatfile run <file>`   stream the next assistant turn into stdout
 //!                             and append it to the file
-//!   - `chatfile new <file>`     create a starter conversation template
+//!   - `chatfile new <file>`   create a starter conversation template
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
