@@ -1,8 +1,8 @@
 # chatfile
 
-Plain-text LLM conversations as Markdown files, with an interactive terminal
-UI and a bubblewrap-sandboxed tool-calling agent — for local models (llama.cpp
-and friends) and any OpenAI-compatible endpoint.
+Plain-text LLM conversations as Markdown files, with an interactive terminal UI
+and a bubblewrap-sandboxed tool-calling agent — for local models (llama.cpp and
+friends) and any OpenAI-compatible endpoint.
 
 Every conversation is a single `.chat.md` file: YAML frontmatter plus turns
 delimited by `---` boundaries (`**User**`, `**Assistant**`, `**Tool**`).
@@ -18,23 +18,22 @@ editable by hand, and portable between tools.
 ## Features
 
 - **Plain-file conversations** — one `.chat.md` per conversation; reasoning
-  (from thinking models) is persisted inline between `think` / `endthink`
-  tags.
+  (from thinking models) is persisted inline between `think` / `endthink` tags.
 - **Hierarchical context** — before each turn, chatfile walks up from the
-  file's directory to the vault root (the nearest ancestor containing a
-  `.git` entry or a `.chatfile` marker file) and concatenates every
-  `AGENTS.md` found along the way into the system prompt, most general first.
-- **Interactive TUI** — a `ratatui` terminal UI with per-role styling,
-  live streaming, cancel (Ctrl+C), and scrolling; `run` mode streams the next
+  file's directory to the vault root (the nearest ancestor containing a `.git`
+  entry or a `.chatfile` marker file) and concatenates every `AGENTS.md` found
+  along the way into the system prompt, most general first.
+- **Interactive TUI** — a `ratatui` terminal UI with per-role styling, live
+  streaming, cancel (Ctrl+C), and scrolling; `run` mode streams the next
   assistant turn to stdout for scripting (e.g. from Neovim).
-- **Sandboxed agent tools** — built-in `list_files`, `read_file`,
-  `write_file`, `edit_file`, `search_files`, `fetch_url`, and a `bash` tool
-  executed inside a rootless [`bubblewrap`](https://github.com/containers/bubblewrap)
-  sandbox: the model can only see its working directory, and nothing else —
-  no host filesystem, no network (unless you opt in per conversation).
+- **Sandboxed agent tools** — built-in `list_files`, `read_file`, `write_file`,
+  `edit_file`, `search_files`, `fetch_url`, and a `bash` tool executed inside a
+  rootless [`bubblewrap`](https://github.com/containers/bubblewrap) sandbox:
+  the model can only see its working directory, and nothing else — no host
+  filesystem, no network (unless you opt in per conversation).
 - **Multi-turn tool loop** — tool calls are streamed, executed against the
-  conversation's working directory, persisted as `**Tool**` turns, and fed
-  back to the model until it produces a final answer.
+  conversation's working directory, persisted as `**Tool**` turns, and fed back
+  to the model until it produces a final answer.
 
 ## Quickstart
 
@@ -79,16 +78,16 @@ allow_shell: false   # allow the bash tool (default false)
 ---
 ```
 
-- `scope: folder` (default) — file tools operate in the conversation file's
-  own directory.
-- `scope: vault` — file tools operate in the vault root (nearest ancestor
-  with a `.git` entry or `.chatfile` marker). The `AGENTS.md` context walk
-  always goes to the vault root regardless of scope.
+- `scope: folder` (default) — file tools operate in the conversation file's own
+  directory.
+- `scope: vault` — file tools operate in the vault root (nearest ancestor with
+  a `.git` entry or `.chatfile` marker). The `AGENTS.md` context walk always
+  goes to the vault root regardless of scope.
 
 ## Sandbox configuration
 
-The `bash` tool runs through bubblewrap with a policy loaded from optional
-YAML config files — `/etc/chatfile/config.yaml` (system) and
+The `bash` tool runs through bubblewrap with a policy loaded from optional YAML
+config files — `/etc/chatfile/config.yaml` (system) and
 `~/.config/chatfile/config.yaml` (user, overrides system) — falling back to
 built-in distro-agnostic defaults when neither exists. A config file may name
 any subset of the fields; unnamed fields keep the value from the layer below:
@@ -106,22 +105,21 @@ extra_args: []               # raw bwrap flags appended last
 ```
 
 Inside the sandbox, the conversation's working directory is the only writable
-location and becomes the child's cwd; `/proc`, `/dev`, and a private `/tmp`
-are provided by bubblewrap. The network namespace is unshared unless
-`network: true` is set in the conversation's frontmatter (loopback works
-either way). Commands are killed after a timeout and their combined output is
-truncated before being fed back to the model.
+location and becomes the child's cwd; `/proc`, `/dev`, and a private `/tmp` are
+provided by bubblewrap. The network namespace is unshared unless `network:
+true` is set in the conversation's frontmatter (loopback works either way).
+Commands are killed after a timeout and their combined output is truncated
+before being fed back to the model.
 
 ## Development notes
 
-This project was developed iteratively via
-[OpenCode](https://opencode.ai): the code was generated by a local LLM —
-[unsloth/Qwen3.8-27B-GGUF:Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) —
-which wrote, tested, and reviewed its own output as it went, with a single
-human steering the milestones; some advice was provided by
-[Google Search](https://www.google.com/search) AI Mode. External pull requests
-are not accepted, but bug reports and feature ideas in GitHub Issues are very
-welcome.
+This project was developed iteratively via [OpenCode](https://opencode.ai): the
+code was generated by a local LLM —
+[unsloth/Qwen3.8-27B-GGUF:Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
+— which wrote, tested, and reviewed its own output as it went, with a single
+human steering the milestones; some advice was provided by [Google
+Search](https://www.google.com/search) AI Mode. External pull requests are not
+accepted, but bug reports and feature ideas in GitHub Issues are very welcome.
 
 ## License
 
