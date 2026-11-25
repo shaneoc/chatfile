@@ -32,10 +32,12 @@
 //! section is preceded by a `---` horizontal rule. A `**System**` section is
 //! only valid as the first section: its content is combined with the
 //! hierarchical `AGENTS.md` context into the single leading system message
-//! and never appears in the conversation itself. When serializing, any
-//! occurrence of the boundary pattern in unfenced message content is escaped
-//! (a backslash is added before the role's first asterisk) so it cannot be
-//! mistaken for a real section boundary on the next parse.
+//! and never appears in the conversation itself. When serializing, colliding
+//! lines in unfenced message content — a `---` line directly before a line
+//! starting with `**`, backslash-prefixed code-fence lines, and unclosed
+//! opening fences — are escaped with the bijective `N -> 2N + 1` odd-backslash
+//! rule so the round trip is lossless (see [`escape_boundaries`] and
+//! `docs/format.md`).
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -367,9 +369,49 @@ pub fn now_timestamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
 }
 
-/// True for a horizontal-rule line: exactly `---` (whitespace tolerated).
-fn is_hr_line(line: &str) -> bool {
-    line.trim() == "---"
+/// If `line` consists of `N` leading backslashes followed by `---` and
+/// optional trailing whitespace, return `N`. Such a line directly before a
+/// line starting with `**` collides with the turn-boundary pattern and is
+/// handled with the bijective `N -> 2N + 1` odd-backslash escape.
+fn hr_backslashes(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut n = 0;
+    while n < b.len() && b[n] == b'\\' {
+        n += 1;
+    }
+    match line[n..].strip_prefix("---") {
+        Some(tail) if tail.chars().all(|c| c.is_whitespace()) => Some(n),
+        _ => None,
+    }
+}
+
+/// If `line` starts with `N >= 1` backslashes immediately followed by three
+/// or more backticks or tildes, return `(N, fence char)`. Such a line
+/// collides with the code-fence pattern and is handled with the bijective
+/// `N -> 2N + 1` odd-backslash escape.
+fn fence_backslashes(line: &str) -> Option<(usize, char)> {
+    let b = line.as_bytes();
+    let mut n = 0;
+    while n < b.len() && b[n] == b'\\' {
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let rest = &line[n..];
+    let c = *rest.as_bytes().first()?;
+    if !matches!(c, b'`' | b'~') {
+        return None;
+    }
+    let run = rest.bytes().take_while(|&x| x == c).count();
+    (run >= 3).then_some((n, c as char))
+}
+
+/// Replace the first `k` leading backslashes of `line` with `(k - 1) / 2` —
+/// the inverse of the `N -> 2N + 1` escape for odd `k` (`1 -> 0`, `3 -> 1`,
+/// `5 -> 2`).
+fn restore_backslashes(line: &str, k: usize) -> String {
+    format!("{}{}", "\\".repeat((k - 1) / 2), &line[k..])
 }
 
 /// True when `s` looks like a `YYYY-MM-DD HH:MM` timestamp.
@@ -616,42 +658,80 @@ pub fn parse(input: &str) -> Result<Conversation> {
     let mut turns: Vec<Turn> = Vec::new();
     let mut cur_role = first_role;
     let mut cur_meta = first_meta;
-    let mut cur_lines: Vec<&str> = Vec::new();
+    let mut cur_lines: Vec<String> = Vec::new();
     let mut fence = FenceTracker::default();
     fence.next_line(lines[0]); // keep the tracker in sync with the header line
 
     let mut i = 1usize;
     while i < lines.len() {
-        // `true` = the line is inside a fenced code block.
+        // `true` = the line is inside a fenced code block. Lines inside a
+        // fence are content, never boundaries or escape candidates.
         let in_fence = fence.next_line(lines[i]);
-        let boundary = !in_fence
-            && is_hr_line(lines[i])
-            && i + 1 < lines.len()
-            && is_role_header_line(lines[i + 1]);
-        if boundary {
-            // A line that starts a section must be a *valid* header; a
-            // malformed one is a format error, not content.
-            let (role, meta) = parse_header_line(lines[i + 1], first_line + i + 1)?;
-            if role == Role::System {
+        if in_fence {
+            cur_lines.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        // A `---` line (with backslash escapes) directly before a line that
+        // starts with `**`: k == 0 is a boundary, odd k is escaped content
+        // (restored), even k is a format error.
+        if let Some(k) = hr_backslashes(lines[i]) {
+            if i + 1 < lines.len() && lines[i + 1].starts_with("**") {
+                if k > 0 && k % 2 == 0 {
+                    return Err(line_error(
+                        first_line + i,
+                        "even number of backslashes before '---'; expected an odd count",
+                    ));
+                }
+                if k > 0 {
+                    cur_lines.push(restore_backslashes(lines[i], k));
+                    i += 1;
+                    continue;
+                }
+                // k == 0: a real boundary only when the next line is a
+                // recognized role header; anything else is content. A line
+                // that starts a section must be a *valid* header; a
+                // malformed one is a format error, not content.
+                if is_role_header_line(lines[i + 1]) {
+                    let (role, meta) = parse_header_line(lines[i + 1], first_line + i + 1)?;
+                    if role == Role::System {
+                        return Err(line_error(
+                            first_line + i + 1,
+                            "**System** is only allowed as the first section",
+                        ));
+                    }
+                    fence.next_line(lines[i + 1]); // keep the tracker in sync
+                    turns.push(Turn {
+                        role: cur_role,
+                        meta: cur_meta,
+                        content: cur_lines.join("\n").trim().to_string(),
+                    });
+                    cur_role = role;
+                    cur_meta = meta;
+                    cur_lines.clear();
+                    i += 2;
+                    continue;
+                }
+            }
+            cur_lines.push(lines[i].to_string());
+            i += 1;
+            continue;
+        }
+        // A backslash-escaped code-fence line outside a fence: odd k is
+        // restored content, even k is a format error.
+        if let Some((k, _)) = fence_backslashes(lines[i]) {
+            if k % 2 == 0 {
                 return Err(line_error(
-                    first_line + i + 1,
-                    "**System** is only allowed as the first section",
+                    first_line + i,
+                    "even number of backslashes before a code fence; expected an odd count",
                 ));
             }
-            fence.next_line(lines[i + 1]); // keep the tracker in sync
-            turns.push(Turn {
-                role: cur_role,
-                meta: cur_meta,
-                content: cur_lines.join("\n").trim().to_string(),
-            });
-            cur_role = role;
-            cur_meta = meta;
-            cur_lines.clear();
-            i += 2;
-        } else {
-            cur_lines.push(lines[i]);
+            cur_lines.push(restore_backslashes(lines[i], k));
             i += 1;
+            continue;
         }
+        cur_lines.push(lines[i].to_string());
+        i += 1;
     }
     turns.push(Turn {
         role: cur_role,
@@ -663,35 +743,73 @@ pub fn parse(input: &str) -> Result<Conversation> {
     Ok(conv)
 }
 
-/// Escape any turn-boundary pattern in `content` that would be parsed as a
-/// real boundary later: for every unfenced `---` line directly followed by a
-/// role line, a backslash is inserted before the role's first asterisk
-/// (`\**User**`). In rendered Markdown the backslash shows as a literal `*`,
-/// and on the next parse the line no longer matches the boundary pattern.
-/// Lines inside fenced code blocks are left untouched.
+/// Escape turn-boundary and code-fence collisions in `content` so the next
+/// parse reads every line back as content, using the bijective `N -> 2N + 1`
+/// odd-backslash rule (parse restores `(k - 1) / 2` for odd `k`):
+///
+/// - Any unfenced line consisting of `N` leading backslashes followed by
+///   `---` (and optional trailing whitespace) directly before a line that
+///   starts with `**` is rewritten with `2N + 1` leading backslashes
+///   (`0 -> 1`, `1 -> 3`, `2 -> 5`).
+/// - Any unfenced line starting with `N >= 1` backslashes immediately
+///   followed by three or more backticks or tildes is rewritten with
+///   `2N + 1` leading backslashes.
+/// - An opening code fence that is never closed before the end of the body
+///   gets one backslash prepended to its opener (`0 -> 1`); no synthetic
+///   closing fence is added.
+///
+/// Lines inside a fenced code block are left untouched, and for every input
+/// `c` the round trip is lossless: parsing the escaped form restores `c`.
 pub fn escape_boundaries(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
+    let raw: Vec<&str> = content.split_inclusive('\n').collect();
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
     let mut fence = FenceTracker::default();
-    let mut prev_hr = false;
-    for line in content.split_inclusive('\n') {
+    let mut open_fence_at: Option<usize> = None;
+    for (idx, &line) in raw.iter().enumerate() {
         let (text, nl) = match line.ends_with('\n') {
             true => (&line[..line.len() - 1], "\n"),
             false => (line, ""),
         };
+        let was_open = fence.char.is_some();
         let in_fence = fence.next_line(text);
-        let escaped = if !in_fence && prev_hr && is_role_header_line(text) {
-            // Backslash before the role's first asterisk; both asterisks stay.
-            let trimmed = text.trim_start();
-            let prefix = &text[..text.len() - trimmed.len()];
-            format!("{prefix}\\{trimmed}")
-        } else {
-            text.to_string()
-        };
-        out.push_str(&escaped);
-        out.push_str(nl);
-        prev_hr = !in_fence && is_hr_line(text);
+        let now_open = fence.char.is_some();
+        if in_fence {
+            // Content inside a fenced code block: untouched.
+            out.push(line.to_string());
+            continue;
+        }
+        if !was_open && now_open {
+            // This line opens a fence; remember it in case it is never
+            // closed (the opener is escaped at the end).
+            open_fence_at = Some(out.len());
+            out.push(line.to_string());
+            continue;
+        }
+        if was_open && !now_open {
+            // This line closes the fence.
+            open_fence_at = None;
+            out.push(line.to_string());
+            continue;
+        }
+        // A plain line outside any fence: apply the escape rules.
+        let mut t = text.to_string();
+        if let Some(k) = hr_backslashes(text) {
+            let next_role = idx + 1 < raw.len() && raw[idx + 1].starts_with("**");
+            if next_role {
+                t = format!("{}{}", "\\".repeat(2 * k + 1), &text[k..]);
+            }
+        } else if let Some((k, _)) = fence_backslashes(text) {
+            t = format!("{}{}", "\\".repeat(2 * k + 1), &text[k..]);
+        }
+        out.push(format!("{t}{nl}"));
     }
-    out
+    if let Some(at) = open_fence_at {
+        // Unclosed opening fence: prepend one backslash (`0 -> 1`).
+        let mut s = out[at].clone();
+        s.insert_str(0, "\\");
+        out[at] = s;
+    }
+    out.concat()
 }
 
 /// The opening tag of a persisted reasoning block (line-anchored).

@@ -426,34 +426,36 @@ fn role_titles() {
 
 #[test]
 fn escape_boundaries_escapes_unfenced_collision() {
-    let content = "look at this:\n---\n**User** | 2026-11-22 14:30\n\nand more";
+    // `N -> 2N + 1` leading backslashes before the hr line (`0 -> 1`,
+    // `1 -> 3`, `2 -> 5`).
+    let b = |n: usize| "\\".repeat(n);
     assert_eq!(
-        escape_boundaries(content),
-        "look at this:\n---\n\\**User** | 2026-11-22 14:30\n\nand more"
+        escape_boundaries("look at this:\n---\n**User** | 2026-11-22 14:30\n\nand more"),
+        "look at this:\n\\---\n**User** | 2026-11-22 14:30\n\nand more"
     );
-    // A would-be header with *invalid* metadata is escaped too: on the next
-    // parse it would be a format error, not content.
-    let content = "note:\n---\n**User** · *2026-11-22 14:30*\n\nmore";
     assert_eq!(
-        escape_boundaries(content),
-        "note:\n---\n\\**User** · *2026-11-22 14:30*\n\nmore"
+        escape_boundaries(&format!("note:\n{}---\n**User**", b(1))),
+        format!("note:\n{}---\n**User**", b(3))
+    );
+    assert_eq!(
+        escape_boundaries(&format!("note:\n{}---\n**User**", b(2))),
+        format!("note:\n{}---\n**User**", b(5))
     );
 }
 
 #[test]
 fn escape_boundaries_leaves_non_collisions_alone() {
-    // No role line after the hr.
+    // No `**` line after the hr.
     assert_eq!(escape_boundaries("---\nplain text"), "---\nplain text");
     // Role line without a preceding hr.
     assert_eq!(
         escape_boundaries("**User** | 2026-11-22 14:30"),
         "**User** | 2026-11-22 14:30"
     );
-    // Unknown role.
-    assert_eq!(escape_boundaries("---\n**Narrator**"), "---\n**Narrator**");
-    // Already escaped (stable on re-serialization).
-    let once = escape_boundaries("---\n**User**");
-    assert_eq!(escape_boundaries(&once), once);
+    // The hr is the last line: nothing follows it.
+    assert_eq!(escape_boundaries("text\n---"), "text\n---");
+    // An unknown role still collides (the rule keys off `**`, not the role).
+    assert_eq!(escape_boundaries("---\n**Narrator**"), "\\---\n**Narrator**");
 }
 
 #[test]
@@ -463,15 +465,49 @@ fn escape_boundaries_skips_fenced_content() {
 }
 
 #[test]
-fn escape_boundaries_preserves_indent_of_role_line() {
+fn escape_boundaries_ignores_indented_role_line() {
+    // The collision rule requires the following line to *begin* with `**`;
+    // an indented role line is plain content and needs no escaping.
     let content = "---\n  **User**";
-    assert_eq!(escape_boundaries(content), "---\n  \\**User**");
+    assert_eq!(escape_boundaries(content), content);
+}
+
+#[test]
+fn escape_boundaries_escapes_backslashed_fence_lines() {
+    // `N -> 2N + 1` for backslash-prefixed fence lines outside a fence.
+    let b = |n: usize| "\\".repeat(n);
+    assert_eq!(
+        escape_boundaries(&format!("{}```rust", b(1))),
+        format!("{}```rust", b(3))
+    );
+    assert_eq!(
+        escape_boundaries(&format!("{}~~~x", b(2))),
+        format!("{}~~~x", b(5))
+    );
+}
+
+#[test]
+fn escape_boundaries_escapes_unclosed_fence_opener() {
+    // An opening fence that never closes gets one backslash prepended
+    // (`0 -> 1`); no synthetic closing fence is added.
+    let b = |n: usize| "\\".repeat(n);
+    assert_eq!(
+        escape_boundaries("```rust\nfn main() {"),
+        format!("{}```rust\nfn main() {{", b(1))
+    );
+    // An already-backslashed opener is a fence line with N >= 1 backslashes:
+    // `N -> 2N + 1`, not the unclosed-fence rule.
+    assert_eq!(
+        escape_boundaries(&format!("{}```rust", b(1))),
+        format!("{}```rust", b(3))
+    );
 }
 
 #[test]
 fn escaped_collision_round_trips_as_content() {
     // A message containing the raw boundary pattern must survive a round
-    // trip: serialized escaped, parsed back as content, stable thereafter.
+    // trip byte-exactly: serialized with the `N -> 2N + 1` escape, parsed
+    // back to the original content, stable thereafter.
     let conv = Conversation {
         turns: vec![Turn {
             role: Role::User,
@@ -481,12 +517,129 @@ fn escaped_collision_round_trips_as_content() {
         ..Default::default()
     };
     let once = to_markdown(&conv);
-    assert!(once.contains("\\**Assistant**"));
+    assert!(once.contains("\\---\n**Assistant**"));
     let back = parse(&once).unwrap();
     assert_eq!(back.turns.len(), 1);
     assert_eq!(back.turns[0].role, Role::User);
-    assert_eq!(back.turns[0].content, "---\n\\**Assistant** | 2026-11-22 14:31");
+    assert_eq!(back.turns[0].content, "---\n**Assistant** | 2026-11-22 14:31");
     assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn boundary_collision_round_trips_losslessly() {
+    // parse(serialize(msg)) == msg for every backslash count N (0..=4)
+    // before a `---` line directly above a `**` line.
+    let b = |n: usize| "\\".repeat(n);
+    for n in 0..=4usize {
+        let content = format!("{}---\n**User**", b(n));
+        let conv = Conversation {
+            turns: vec![Turn {
+                role: Role::User,
+                content: content.clone(),
+                meta: TurnMeta::default(),
+            }],
+            ..Default::default()
+        };
+        let once = to_markdown(&conv);
+        let back = parse(&once).unwrap();
+        assert_eq!(back.turns.len(), 1, "n={n}");
+        assert_eq!(back.turns[0].content, content, "n={n}");
+        assert_eq!(to_markdown(&back), once, "n={n}");
+    }
+}
+
+#[test]
+fn closed_fence_with_boundary_collision_round_trips() {
+    // A valid closed fenced code block containing the raw boundary pattern
+    // is left untouched by serialization and parses back byte-exactly.
+    let content = "```\n---\n**User** | 2026-11-22 14:30\n```\nreal text";
+    let conv = Conversation {
+        turns: vec![Turn {
+            role: Role::User,
+            content: content.to_string(),
+            meta: TurnMeta::default(),
+        }],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 1);
+    assert_eq!(back.turns[0].content, content);
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn unclosed_fence_at_end_of_message_round_trips() {
+    // An unclosed opening fence at the end of a message body (plain or
+    // already backslashed) survives a round trip with another turn after it.
+    for opener in ["```rust", "\\```rust"] {
+        let content = format!("{opener}\nfn main() {{");
+        let conv = Conversation {
+            turns: vec![
+                Turn {
+                    role: Role::User,
+                    content: content.clone(),
+                    meta: TurnMeta::default(),
+                },
+                Turn {
+                    role: Role::Assistant,
+                    content: "done".into(),
+                    meta: TurnMeta::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let once = to_markdown(&conv);
+        let back = parse(&once).unwrap();
+        assert_eq!(back.turns.len(), 2, "opener={opener}");
+        assert_eq!(back.turns[0].content, content, "opener={opener}");
+        assert_eq!(back.turns[1].content, "done", "opener={opener}");
+        assert_eq!(to_markdown(&back), once, "opener={opener}");
+    }
+}
+
+#[test]
+fn parse_restores_odd_backslash_escapes() {
+    // Odd k before `---` above a `**` line: restore (k - 1) / 2 backslashes.
+    let b = |n: usize| "\\".repeat(n);
+    for (k, restored) in [(1usize, 0usize), (3, 1), (5, 2)] {
+        let input = format!("**User**\n\n{}---\n**Assistant**\n\nhi\n", b(k));
+        let conv = parse(&input).unwrap();
+        assert_eq!(conv.turns.len(), 1, "k={k}");
+        assert_eq!(
+            conv.turns[0].content,
+            format!("{}---\n**Assistant**\n\nhi", b(restored)),
+            "k={k}"
+        );
+    }
+    // Same for backslash-prefixed fence lines.
+    for (k, restored) in [(1usize, 0usize), (3, 1), (5, 2)] {
+        let input = format!("**User**\n\n{}```rust\nfn main() {{\n", b(k));
+        let conv = parse(&input).unwrap();
+        assert_eq!(conv.turns.len(), 1, "k={k}");
+        assert_eq!(
+            conv.turns[0].content,
+            format!("{}```rust\nfn main() {{", b(restored)),
+            "k={k}"
+        );
+    }
+}
+
+#[test]
+fn parse_rejects_even_backslash_counts() {
+    // Even k before `---` directly above a `**` line.
+    let input = format!("**User**\n\n{}---\n**Assistant**\n", "\\".repeat(2));
+    let err = parse(&input).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 3"), "{msg}");
+    assert!(msg.contains("even number of backslashes before '---'"), "{msg}");
+
+    // Even k before a code fence.
+    let input = format!("**User**\n\n{}```rust\nfn main() {{\n", "\\".repeat(2));
+    let err = parse(&input).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 3"), "{msg}");
+    assert!(msg.contains("even number of backslashes before a code fence"), "{msg}");
 }
 
 #[test]

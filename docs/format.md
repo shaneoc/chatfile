@@ -198,6 +198,8 @@ fence tracker implements a CommonMark subset:
 - The fence stays open until a **closing** fence: same character, a run at
   least as long as the opener, and nothing but whitespace after it.
 - Lines indented by more than 3 spaces are never fence delimiters.
+- A line whose first non-space character is a backslash is never a fence
+  delimiter; such lines are escape artifacts of §3.2 and parse as content.
 - While inside a fence, every line — including `---` lines and lines that look
   like headers — is plain content.
 
@@ -217,26 +219,45 @@ this is just text in a fence
 ```
 ```
 
-### 3.2 Boundary detection and escaping
+### 3.2 Boundary detection and lossless escaping
 
 A **boundary** is a `---` horizontal-rule line (exactly `---`, surrounding
 whitespace tolerated) that is outside any fence and immediately followed by a
-line that begins with a bold recognized role. Two consequences:
+line that *begins* with `**`. The following line must start with the two
+asterisks at column 0 — an indented role-looking line does not form a
+boundary. Two consequences:
 
-- A `---` line whose next line is not a role header is ordinary content (a
+- A `---` line whose next line does not begin with `**` is ordinary content (a
   Markdown horizontal rule inside the message).
-- A `---` on the very last line of a section has no following header, so it is
+- A `---` on the very last line of a section has no following line, so it is
   content too.
 
-Because of this, message content that itself contains an unfenced `---` line
-followed by something starting with a bold role would be misread on the next
-parse. The serializer therefore **escapes** such lines: a backslash is inserted
-before the role's first asterisk (`\**User** | …`). In rendered Markdown the
-backslash escapes that first asterisk (which shows as a literal `*`), and on
-re-parse the line no longer matches the header pattern, so it stays content. Lines inside fenced code blocks are
-never escaped. Escaping is idempotent: a file produced by the serializer
-round-trips byte-for-byte (`parse(to_markdown(c)) == c` for every `c` produced
-by `parse`).
+Because of this, message content that itself contains such a pattern would be
+misread on the next parse. The serializer therefore **escapes** colliding
+lines with a bijective odd-backslash rule, and the parser inverts it exactly:
+
+- **Turn-boundary collisions.** An unfenced line consisting of `N >= 0`
+  leading backslashes followed by `---` (and optional trailing whitespace),
+  directly before a line that begins with `**`, is rewritten on serialize
+  with `2 * N + 1` leading backslashes: `0 -> 1` (`\---`), `1 -> 3`
+  (`\\\---`), `2 -> 5` (`\\\\\---`). On parse, such a line must carry an
+  **odd** count `k >= 1` of leading backslashes; the parser restores
+  `(k - 1) / 2` backslashes (`1 -> 0`, `3 -> 1`, `5 -> 2`) and treats the
+  line as content. An even count is a format error (§4.2).
+- **Code-fence collisions.** An unfenced line starting with `N >= 1`
+  backslashes immediately followed by three or more `` ` `` or `~` characters
+  is rewritten on serialize with `2 * N + 1` leading backslashes (the same
+  mapping). On parse, an odd count is restored as above; an even count is a
+  format error (§4.2).
+- **Unclosed opening fences.** If an opening fence reaches the end of a
+  message body without a matching closing fence, the serializer prepends one
+  backslash to the opener (```` ```rust ```` becomes ```` \```rust ````) and
+  appends **no** synthetic closing fence. On parse the backslashed opener is
+  not a fence delimiter, so it and everything after it are plain content.
+
+Lines inside a fenced code block are never inspected or escaped. The rules
+are bijective: for every message body `c`, parsing the serialized form
+restores `c` byte-for-byte (`parse(to_markdown(conv)) == conv`).
 
 ### 3.3 Tool turns (`**Tool**`)
 
@@ -332,6 +353,8 @@ Caused by:
 | `line N: file has no sections; expected a **System** or **User** header` | The body is empty — an empty file, or frontmatter with nothing after it. | `` (empty file) |
 | `line N: first section must be a **System** or **User** header` | The first body line is not a role header at all (plain text, an unknown bold role, …), **or** it is a valid header for a role other than System/User (`**Assistant**`, `**Tool**`). | `Just some notes.` / `**Assistant**\n\nhi` |
 | `line N: **System** is only allowed as the first section` | A `---` boundary introduces a `**System**` header in any later section. N points at the `**System**` line (one below the rule). | `**User**\n\nhi\n---\n**System**\n\nlate` |
+| `line N: even number of backslashes before '---'; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes followed by `---`, directly before a line that begins with `**`. Odd counts are valid escapes (§3.2) that restore `(k - 1) / 2` backslashes. | `**User**\n\n\\---\n**Assistant**` |
+| `line N: even number of backslashes before a code fence; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes immediately followed by three or more `` ` `` or `~`. Odd counts are valid escapes (§3.2). | `**User**\n\n\\~~~x` |
 
 ### 4.3 Header-format errors
 
@@ -354,9 +377,11 @@ content and never triggers them.
 ### 4.4 What is *not* an error
 
 - **Unknown frontmatter keys** — ignored on parse.
-- **A `---` whose next line is not a role header** — plain content (a Markdown horizontal rule inside the message).
-- **A `---` as the last line of a section** — no following header, so content.
-- **Role-looking lines without a preceding rule** (and not the first body line) — content; the serializer escapes them only when they actually follow an unfenced `---`.
+- **A `---` whose next line does not begin with `**`** — plain content (a Markdown horizontal rule inside the message).
+- **A `---` as the last line of a section** — no following line, so content.
+- **A `---` followed by an *indented* role-looking line** — not a boundary (the following line must begin with `**` at column 0); both lines are content.
+- **Role-looking lines without a preceding rule** (and not the first body line) — plain content.
+- **Escaped collision lines** — odd-backslash `\---`-style lines and backslashed fence lines are content; the parser restores the original backslashes (§3.2).
 - **Malformed tool turns** (missing `tool:`/`id:` tags, or a missing output fence) — the file still parses; the turn is skipped when building API messages (§3.3).
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
 - **Trailing whitespace** on header lines, and CRLF line endings in general.
