@@ -77,6 +77,12 @@ allow_shell: false   # allow the bash tool (default false)
 ---
 ```
 
+- `scope: folder` (default) — file tools operate in the conversation file's own
+  directory.
+- `scope: vault` — file tools operate in the vault root (nearest ancestor with
+  a `.git` entry or `.chatfile` marker). The `AGENTS.md` context walk always
+  goes to the vault root regardless of scope.
+
 ### Turn headers
 
 Each section starts with a bold role, optionally followed by plain metadata
@@ -95,12 +101,6 @@ and reports violations with line numbers.
 The complete specification — file structure, header grammar, fenced blocks,
 tool turns, and the full error catalog — lives in
 [FORMAT.md](FORMAT.md).
-
-- `scope: folder` (default) — file tools operate in the conversation file's own
-  directory.
-- `scope: vault` — file tools operate in the vault root (nearest ancestor with
-  a `.git` entry or `.chatfile` marker). The `AGENTS.md` context walk always
-  goes to the vault root regardless of scope.
 
 ## Sandbox configuration
 
