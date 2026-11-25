@@ -1,8 +1,8 @@
 # `.chat.md` File Format
 
 This is the authoritative specification of the `.chat.md` conversation file
-format, generated from the current implementation in `src/parser.rs`. It is
-written for both human readers and LLM agents that create or edit these files.
+format. It is written for both human readers and LLM agents that create or edit
+these files.
 
 **Canonical example:**
 
@@ -572,5 +572,3 @@ All of these apply to a `**Assistant**` section whose header carries
 - **`<details>` blocks in an assistant body whose header lacks `tool_calls:`** — verbatim content; no Tool Call extraction happens and no §3.3.1 error fires (the same applies to a literal example block ahead of the real trailing ones, §3.3.1).
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
 - **Trailing whitespace** on header lines, and CRLF line endings in general.
-
-
