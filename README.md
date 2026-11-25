@@ -92,6 +92,10 @@ The first section of the body must be `**System**` or `**User**`; a
 single leading system message). The parser is strict about the header format
 and reports violations with line numbers.
 
+The complete specification — file structure, header grammar, fenced blocks,
+tool turns, and the full error catalog — lives in
+[FORMAT.md](FORMAT.md).
+
 - `scope: folder` (default) — file tools operate in the conversation file's own
   directory.
 - `scope: vault` — file tools operate in the vault root (nearest ancestor with

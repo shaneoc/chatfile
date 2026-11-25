@@ -23,6 +23,16 @@ conversations stored as plain Markdown files inside nested directories.
    supporting streaming responses and multi-turn tool calling, with
    configurable cloud endpoints/API keys via environment variables.
 
+## File Format Spec
+- `FORMAT.md` (repo root) is the authoritative specification of the `.chat.md`
+  file format: frontmatter fields, header grammar, fenced blocks, tool turns,
+  and the complete error catalog.
+- Before modifying `.chat.md` parsing, serialization, or turn validation
+  (`src/parser.rs`, `append_turn` in `src/tools.rs`, turn rendering in
+  `src/tui.rs`), read `FORMAT.md` first.
+- Keep `FORMAT.md` in sync with the implementation: every format change must
+  update the spec and the unit tests in `src/parser/tests.rs` together.
+
 ## Source Layout
 - `src/lib.rs` — crate root; exposes the public modules so docs.rs renders
   complete documentation.
