@@ -100,7 +100,7 @@ and reports violations with line numbers.
 
 The complete specification — file structure, header grammar, fenced blocks,
 tool turns, and the full error catalog — lives in
-[FORMAT.md](FORMAT.md).
+[docs/format.md](docs/format.md).
 
 ## Sandbox configuration
 
