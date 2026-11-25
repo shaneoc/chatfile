@@ -104,7 +104,7 @@ serializes as an empty `---\n---\n`.
 | ----------- | -------------------------------------------------------------- |
 | `System`    | Per-file system instructions; first section only; folded into the single leading system message, never sent as conversation content. |
 | `User`      | A user prompt.                                                 |
-| `Assistant` | A model reply (reasoning is persisted in a collapsible block, see §3.4). |
+| `Assistant` | A model reply (reasoning in a collapsible block, §3.4; issued tool calls in trailing blocks, §3.3). |
 | `Tool`      | A persisted tool result (§3.3).                                |
 
 Role names in headers are matched case-insensitively and tolerate surrounding
@@ -154,9 +154,10 @@ Each non-timestamp segment is `key: value`:
   empty value).
 - Tag order is preserved. Well-known tags: `model` (which model produced the
   turn), `thinking` (assistant-only switch for the collapsible reasoning
-  block — see below and §3.4), and, on `**Tool**` turns, `tool` (the tool
-  name) and `id` (the tool call id — required for the turn to be well-formed,
-  §3.3).
+  block — see below and §3.4), `tool_calls` (assistant-only count of the
+  trailing Tool Call blocks — see below and §3.3), and, on `**Tool**` turns,
+  `tool` (the tool name) and `id` (the tool call id — required for the turn
+  to be well-formed, §3.3).
 
 The `thinking` tag is special:
 
@@ -166,6 +167,17 @@ The `thinking` tag is special:
   (`false`, `True`, empty, …) is a header-format error (§4.3).
 - When present, the turn's body must carry the collapsible reasoning block of
   §3.4; when absent, the whole body is verbatim content (no reasoning).
+
+The `tool_calls` tag is special:
+
+- It is **only allowed on `**Assistant**` headers**; on any other role it is a
+  header-format error (§4.3).
+- Its value must be a **positive integer**; `0`, negatives, decimals, and
+  non-integers (`true`, `1.5`, empty, …) are header-format errors (§4.3).
+- When present with value `N ≥ 1`, the turn's body must end with exactly `N`
+  well-formed Tool Call blocks (§3.3); otherwise a line-numbered error (§4.2).
+- The tag is emitted only when the turn carries at least one tool call; the
+  canonical tag order is `model`, then `thinking`, then `tool_calls`.
 
 ### 2.3 Whitespace handling
 
@@ -184,6 +196,7 @@ The `thinking` tag is special:
 **User** | 2026-11-23 22:42                           ← valid (timestamp only)
 **User** | model: m1                                  ← valid (tags, no timestamp)
 **Assistant** | 2026-11-23 22:42 | model: local-model ← valid (canonical form)
+**Assistant** | model: m1 | thinking: true | tool_calls: 2 ← valid
 **Tool** | 2026-11-23 22:42 | tool: bash | id: call_1 ← valid
 
 **User** · *2026-11-23 22:42*                         ← INVALID: '·' separator
@@ -283,16 +296,98 @@ Lines inside a fenced code block are never inspected or escaped. The rules
 are bijective: for every message body `c`, parsing the serialized form
 restores `c` byte-for-byte (`parse(to_markdown(conv)) == conv`).
 
-### 3.3 Tool turns (`**Tool**`)
+### 3.3 Tool calls and tool turns
+
+A model's tool calls are persisted **on the issuing `**Assistant**` turn**;
+each executed result is a separate `**Tool**` section (§3.3.2).
+
+#### 3.3.1 Tool Call blocks (assistant turns)
+
+An assistant turn that issued tool calls carries the header tag
+`tool_calls: <N>` (§2.2) and ends its body with exactly `N` well-formed
+**Tool Call blocks**, one per call, in the order the model issued them.
+Canonical form — reasoning block first (when present), then the visible
+answer, then the blocks; adjacent pieces separated by a single blank line:
+
+```markdown
+**Assistant** | 2026-11-23 22:42 | model: local-model | thinking: true | tool_calls: 2
+
+<details>
+<summary>Thinking</summary>
+
+{reasoning}
+
+</details>
+
+{answer}
+
+<details>
+<summary>Tool Call: <code>read_file</code> (<code>call_1</code>)</summary>
+
+~~~~json
+{"path": "a.md"}
+~~~~
+
+</details>
+
+<details>
+<summary>Tool Call: <code>bash</code> (<code>call_2</code>)</summary>
+
+~~~~json
+{"command": "ls"}
+~~~~
+
+</details>
+```
+
+- The summary line is exactly
+  `<summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>`;
+  `name` and `id` are non-empty and contain no whitespace.
+- The arguments sit in a **tilde fence** whose info string is `json` (or
+  empty), exactly as the model sent them. The serializer picks a fence run of
+  `max(4, longest embedded tilde run + 1)`, so embedded tildes cannot
+  terminate it early; the parser accepts any opening run of at least three
+  tildes and closes on a bare tilde run at least as long.
+- The blocks are emitted **verbatim** (no boundary escaping): their fences
+  are self-contained, so a `---` inside the arguments is protected from
+  section-boundary detection by the fence (§3.1).
+
+**Parsing** (only for `**Assistant**` sections carrying `tool_calls: N`, and
+only after the reasoning block of §3.4 has been stripped): extraction walks
+**backward from the end of the section**, peeling off one well-formed block
+per iteration, `N` times:
+
+- The last non-blank line must be a bare `</details>`; otherwise a
+  line-numbered error (§4.2).
+- Above it (skipping blank lines) comes the closing tilde fence — a bare run
+  of at least three tildes.
+- Walking further up, the nearest line that parses as a Tool Call summary is
+  the block's summary; below the summary, the first tilde fence (info string
+  `json` or empty) opens the arguments and must not be longer than the
+  closing fence.
+- The first non-blank line above the summary must be a bare `<details>`.
+- The arguments are the lines between the two fences, joined and trimmed.
+
+Each extracted block is removed from the region before the next iteration, so
+**literal examples of Tool Call blocks inside the visible content are left
+untouched** — only the trailing `N` blocks count (extra well-formed blocks
+beyond `N` remain part of the content). If fewer than `N` well-formed blocks
+can be extracted, parsing fails with a line-numbered error (§4.2). The
+remaining lines, trimmed, are the turn's visible content. Without the
+`tool_calls` tag, no details parsing happens at all: `<details>` blocks in an
+assistant body are verbatim content.
+
+#### 3.3.2 Tool turns (`**Tool**`)
 
 A persisted tool result is a `**Tool**` section whose header carries the
-required `tool:` and `id:` tags, and whose body has this exact shape:
+required `tool:` and `id:` tags — the call's name and id, which live **only**
+in the header, never in the body — and whose body has this exact shape:
 
 ```markdown
 **Tool** | 2026-11-23 22:42 | tool: bash | id: call_42
 
 <details>
-<summary><code>bash({"command": "ls"})</code></summary>
+<summary>Output</summary>
 
 ~~~~text
 exit code: 0
@@ -302,27 +397,27 @@ a b
 </details>
 ```
 
-- The summary line is `<summary><code>NAME(args)</code></summary>` where
-  `NAME` contains no whitespace and `args` is the JSON argument string exactly
-  as the model sent it, running to the final closing paren.
-- The output sits in a **tilde fence** whose info string is `text` (or empty).
-  The serializer picks a fence run of `max(4, longest embedded tilde run + 1)`,
-  so embedded tildes cannot terminate it early; the parser accepts any opening
-  run of at least three tildes and closes on a bare tilde run at least as long.
-- A turn is *well-formed* (`parse_tool_turn` returns data) when it carries the
-  `tool` and `id` header tags and a matching output fence pair. The summary
-  line is **optional**: if it is missing or malformed, the arguments are read
-  as an empty string. Anything else makes the turn *malformed*.
+- The output sits in a **tilde fence** whose info string is `text` (or
+  empty), with the same fence sizing rule as Tool Call blocks.
+- A turn is *well-formed* (`parse_tool_turn` returns data) when it carries
+  the `tool` and `id` header tags and a matching output fence pair. Anything
+  else makes the turn *malformed*.
 
 **Wire-format pairing and recovery** (`to_messages`): each well-formed tool
-turn becomes a `role: "tool"` message carrying `tool_call_id`, and its call
-(id, name, arguments) is attached as a `tool_calls` entry on the **preceding
-assistant message**. If there is no preceding assistant turn (e.g. a
-hand-edited file that starts with a tool turn), an assistant message with
-`content: null` is synthesized to carry the call, so reloaded histories are
-always valid API payloads. **Malformed tool turns are skipped entirely** —
-they produce neither a tool message nor a tool call, and the conversation
-remains usable.
+turn becomes a `role: "tool"` message carrying `tool_call_id` (the `id:`
+tag); the call itself (id, name, arguments) comes from the **issuing
+assistant turn's** parsed Tool Call blocks. **Malformed tool turns are
+skipped entirely** — they produce neither a tool message nor a tool call, and
+the conversation remains usable.
+
+`to_messages` is a **pure projection**: it never synthesizes messages. When
+an assistant turn carries more tool calls than there are following `**Tool**`
+turns answering them (e.g. execution was cancelled mid-way), the dangling
+calls simply stay unanswered in the projected list. The request-prep layer
+(`crate::llm::complete_tool_calls`, run by the CLI and TUI before every
+request) closes the gap: for every `tool_call_id` without a matching tool
+message it appends a synthetic `role: "tool"` message with content
+`Tool execution cancelled or interrupted`.
 
 ### 3.4 Reasoning blocks (`thinking: true`)
 
@@ -422,6 +517,11 @@ Caused by:
 | `line N: turn separator '---' must be preceded by a blank line` | An unfenced `---` line directly above a line that begins with `**` whose preceding line is not blank (or whitespace-only). Escaped lines (odd leading backslashes, §3.2) are content and exempt. N points at the `---` line. | `**User**\n\nhi\n---\n**Assistant**\n\nhello` |
 | `line N: even number of backslashes before '---'; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes followed by `---`, directly before a line that begins with `**`. Odd counts are valid escapes (§3.2) that restore `(k - 1) / 2` backslashes. | `**User**\n\n\\---\n**Assistant**` |
 | `line N: even number of backslashes before a code fence; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes immediately followed by three or more `` ` `` or `~`. Odd counts are valid escapes (§3.2). | `**User**\n\n\\~~~x` |
+| `line N: expected <n> tool call blocks at the end of the section; found fewer` | An assistant section with `tool_calls: <n>` runs out of body lines before `<n>` trailing Tool Call blocks are extracted (§3.3.1). N points at the section's last line. | `**User**\n\nq\n\n---\n**Assistant** \| tool_calls: 1\n\n` (empty body) |
+| `line N: expected a closing '</details>' line to end the tool call block` | While extracting a trailing Tool Call block, the region's last non-blank line is not a bare `</details>`. | `**Assistant** \| tool_calls: 1\n\n<details>\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\n~~~~json\n{}\n~~~~` (no closer) |
+| `line N: malformed tool call block; expected a tilde-fenced arguments block` | The extracted block has no valid fence pair: no closing fence above the closer, no opening fence below the summary, or the opening fence is longer than the closing one. | `**Assistant** \| tool_calls: 1\n\n<details>\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\nnot a fence\n\n</details>` |
+| `line N: malformed tool call block; expected a Tool Call summary line` | No line above the closing fence parses as `<summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>` with non-empty, whitespace-free `name` and `id`. | `**Assistant** \| tool_calls: 1\n\n<details>\n\n~~~~json\n{}\n~~~~\n\n</details>` (no summary) |
+| `line N: malformed tool call block; expected an opening '<details>' line` | The first non-blank line above the summary is not a bare `<details>`. | `**Assistant** \| tool_calls: 1\n\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\n~~~~json\n{}\n~~~~\n\n</details>` (no opener) |
 
 ### 4.3 Header-format errors
 
@@ -442,6 +542,8 @@ content and never triggers them.
 | `line N: unknown role in header: <text>` | Defensive: the bolded text is not one of System/User/Assistant/Tool. (Same reachability note.) | — |
 | `line N: 'thinking' metadata is only allowed on **Assistant** headers` | A `thinking:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| thinking: true` |
 | `line N: 'thinking' metadata must be the literal value 'true'` | The `thinking` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| thinking: false` |
+| `line N: 'tool_calls' metadata is only allowed on **Assistant** headers` | A `tool_calls:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tool_calls: 1` |
+| `line N: 'tool_calls' metadata must be a positive integer` | The `tool_calls` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tool_calls: 0` |
 
 ### 4.4 Reasoning-block errors
 
@@ -467,6 +569,7 @@ All of these apply to a `**Assistant**` section whose header carries
 - **Escaped collision lines** — odd-backslash `\---`-style lines and backslashed fence lines are content; the parser restores the original backslashes (§3.2).
 - **Malformed tool turns** (missing `tool:`/`id:` tags, or a missing output fence) — the file still parses; the turn is skipped when building API messages (§3.3).
 - **An assistant body that looks like a Thinking wrapper but whose header lacks `thinking: true`** — the whole body is verbatim content; no reasoning is extracted and no §4.4 error fires.
+- **`<details>` blocks in an assistant body whose header lacks `tool_calls:`** — verbatim content; no Tool Call extraction happens and no §3.3.1 error fires (the same applies to a literal example block ahead of the real trailing ones, §3.3.1).
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
 - **Trailing whitespace** on header lines, and CRLF line endings in general.
 

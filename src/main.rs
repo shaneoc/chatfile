@@ -172,10 +172,13 @@ async fn run(file: &Path) -> Result<()> {
     if !system_prompt.is_empty() {
         messages.push(llm::Message::system(system_prompt));
     }
-    // `to_messages` folds persisted `**Tool**` turns into `role: "tool"`
-    // messages and attaches their `tool_calls` to the preceding assistant
-    // message, so reloaded histories are valid API payloads.
+    // `to_messages` projects persisted turns (assistant tool calls ride on
+    // the assistant message; `**Tool**` turns become `role: "tool"`
+    // messages). `complete_tool_calls` answers any call left dangling by a
+    // cancelled or interrupted execution, so reloaded histories are valid
+    // API payloads.
     messages.extend(conv.to_messages());
+    llm::complete_tool_calls(&mut messages);
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
@@ -204,11 +207,16 @@ async fn run(file: &Path) -> Result<()> {
                 let _ = out.flush();
                 true
             }
-            ResponseEnd => {
+            ResponseEnd { tool_calls } => {
                 // Persist the response just finished (skipped when it had no
-                // text and no reasoning, i.e. a pure tool-call response).
-                if !(reply.trim().is_empty() && reasoning.trim().is_empty()) {
-                    let turn = tools::assistant_turn(&model, &reasoning, &reply);
+                // text, no reasoning, and no tool calls).
+                if !(reply
+                    .trim()
+                    .is_empty()
+                    && reasoning.trim().is_empty()
+                    && tool_calls.is_empty())
+                {
+                    let turn = tools::assistant_turn(&model, &reasoning, &reply, &tool_calls);
                     if tools::append_turn(file, &turn).is_ok() {
                         appended += 1;
                     }
@@ -225,10 +233,10 @@ async fn run(file: &Path) -> Result<()> {
             ToolResult {
                 id,
                 name,
-                arguments,
+                arguments: _,
                 output,
             } => {
-                let turn = tools::tool_turn(name, id, arguments, output);
+                let turn = tools::tool_turn(name, id, output);
                 if tools::append_turn(file, &turn).is_ok() {
                     appended += 1;
                 }

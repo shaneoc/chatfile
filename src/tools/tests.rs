@@ -495,7 +495,7 @@ async fn run_turn_stops_when_callback_returns_false() {
 
 #[test]
 fn tool_turn_helper_builds_persistable_turn() {
-    let turn = tool_turn("bash", "call_42", r#"{"command": "ls"}"#, "exit code: 0\na b");
+    let turn = tool_turn("bash", "call_42", "exit code: 0\na b");
     assert_eq!(turn.role, parser::Role::Tool);
     assert_eq!(
         turn.meta.tags,
@@ -507,13 +507,12 @@ fn tool_turn_helper_builds_persistable_turn() {
     let data = parser::parse_tool_turn(&turn).expect("well-formed");
     assert_eq!(data.name, "bash");
     assert_eq!(data.id, "call_42");
-    assert_eq!(data.arguments, r#"{"command": "ls"}"#);
     assert_eq!(data.output, "exit code: 0\na b");
 }
 
 #[test]
 fn assistant_turn_helper_sets_reasoning_field() {
-    let turn = assistant_turn("m1", "thinking hard", "the answer");
+    let turn = assistant_turn("m1", "thinking hard", "the answer", &[]);
     assert_eq!(turn.role, parser::Role::Assistant);
     assert_eq!(turn.content, "the answer");
     assert_eq!(turn.reasoning.as_deref(), Some("thinking hard"));
@@ -523,10 +522,39 @@ fn assistant_turn_helper_sets_reasoning_field() {
         .iter()
         .any(|(k, v)| k == "thinking" && v == "true"));
     // Empty reasoning is omitted (no tag, no field).
-    let turn = assistant_turn("m1", "  ", "just");
+    let turn = assistant_turn("m1", "  ", "just", &[]);
     assert_eq!(turn.content, "just");
     assert_eq!(turn.reasoning, None);
     assert!(!turn.meta.tags.iter().any(|(k, _)| k == "thinking"));
+}
+
+#[test]
+fn assistant_turn_helper_carries_tool_calls() {
+    let calls = vec![
+        CompletedToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": "a.md"}"#.into(),
+        },
+        CompletedToolCall {
+            id: "call_2".into(),
+            name: "bash".into(),
+            arguments: r#"{"command": "ls"}"#.into(),
+        },
+    ];
+    let turn = assistant_turn("m1", "", "checking", &calls);
+    assert_eq!(turn.tool_calls.len(), 2);
+    assert_eq!(
+        turn.meta.tags,
+        vec![
+            ("model".to_string(), "m1".to_string()),
+            ("tool_calls".to_string(), "2".to_string()),
+        ]
+    );
+    // No calls: no tag, no field.
+    let turn = assistant_turn("m1", "", "plain", &[]);
+    assert!(!turn.meta.tags.iter().any(|(k, _)| k == "tool_calls"));
+    assert!(turn.tool_calls.is_empty());
 }
 
 #[test]
@@ -539,9 +567,9 @@ fn append_turn_appends_and_round_trips() {
     )
     .unwrap();
 
-    let a = assistant_turn("m", "", "hi there");
+    let a = assistant_turn("m", "", "hi there", &[]);
     append_turn(&path, &a).unwrap();
-    let t = tool_turn("list_files", "c1", r#"{"subdir": "."}"#, "x.md  1");
+    let t = tool_turn("list_files", "c1", "x.md  1");
     append_turn(&path, &t).unwrap();
 
     let conv = parser::parse(&std::fs::read_to_string(path).unwrap()).unwrap();

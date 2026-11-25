@@ -50,14 +50,15 @@ enum StreamEvent {
     /// A streamed delta: reasoning (thinking) text or answer content.
     Delta(llm::StreamDelta),
     /// The current assistant response has ended (before tool execution, or
-    /// as the final response of the turn).
-    ResponseEnd,
+    /// as the final response of the turn), with the calls it issued.
+    ResponseEnd {
+        tool_calls: Vec<crate::llm::CompletedToolCall>,
+    },
     /// A tool call has been executed; the fields describe the persisted
-    /// result.
+    /// result (the call's arguments live on the issuing assistant turn).
     ToolResult {
         id: String,
         name: String,
-        arguments: String,
         output: String,
     },
     /// The whole turn finished successfully.
@@ -483,9 +484,9 @@ fn push_turn(
     }
 }
 
-/// Push a persisted `**Tool**` turn into `lines`: the role line, the call
-/// (`name(args)`) dimmed, then the output indented. Falls back to the raw
-/// content when the turn is not a well-formed tool turn.
+/// Push a persisted `**Tool**` turn into `lines`: the role line, the tool
+/// name dimmed, then the output indented. Falls back to the raw content
+/// when the turn is not a well-formed tool turn.
 fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
     let mut spans = vec![Span::styled(
         t.role.title().to_string(),
@@ -502,7 +503,7 @@ fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
     match parser::parse_tool_turn(t) {
         Some(data) => {
             lines.push(Line::from(Span::styled(
-                format!("{}({})", data.name, data.arguments),
+                format!("{} ({})", data.name, data.id),
                 dim,
             )));
             for l in data.output.lines() {
@@ -609,16 +610,15 @@ async fn event_loop(
                     // Tool-call fragments and finish markers are consumed by
                     // the loop itself; they never reach the UI.
                     Some(StreamEvent::Delta(_)) => {}
-                    Some(StreamEvent::ResponseEnd) => {
-                        finalize_response(app)?;
+                    Some(StreamEvent::ResponseEnd { tool_calls }) => {
+                        finalize_response(app, &tool_calls)?;
                     }
                     Some(StreamEvent::ToolResult {
                         id,
                         name,
-                        arguments,
                         output,
                     }) => {
-                        let turn = tools::tool_turn(&name, &id, &arguments, &output);
+                        let turn = tools::tool_turn(&name, &id, &output);
                         tools::append_turn(&app.path, &turn)?;
                         app.conv.turns.push(turn);
                         app.got_reply = true;
@@ -669,6 +669,7 @@ async fn submit(
             tags: vec![],
         },
         reasoning: None,
+        tool_calls: Vec::new(),
     };
     tools::append_turn(&app.path, &user_turn)?;
     app.conv.turns.push(user_turn);
@@ -684,10 +685,13 @@ async fn submit(
     if !system_prompt.is_empty() {
         messages.push(llm::Message::system(system_prompt));
     }
-    // `to_messages` folds persisted `**Tool**` turns into `role: "tool"`
-    // messages and attaches their `tool_calls` to the preceding assistant
-    // message, so reloaded histories are valid API payloads.
+    // `to_messages` projects persisted turns (assistant tool calls ride on
+    // the assistant message; `**Tool**` turns become `role: "tool"`
+    // messages). `complete_tool_calls` answers any call left dangling by a
+    // cancelled or interrupted execution, so reloaded histories are valid
+    // API payloads.
     messages.extend(app.conv.to_messages());
+    llm::complete_tool_calls(&mut messages);
 
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
     let tool_config = tools::ToolConfig::for_file(&app.conv.frontmatter, &app.path);
@@ -699,15 +703,21 @@ async fn submit(
             let ev = match ev {
                 tools::LoopEvent::Reasoning(s) => StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone())),
                 tools::LoopEvent::Content(s) => StreamEvent::Delta(llm::StreamDelta::Content(s.clone())),
-                tools::LoopEvent::ResponseEnd => StreamEvent::ResponseEnd,
-                tools::LoopEvent::ToolResult { id, name, arguments, output } => {
-                    StreamEvent::ToolResult {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments: arguments.clone(),
-                        output: output.clone(),
+                tools::LoopEvent::ResponseEnd { tool_calls } => {
+                    StreamEvent::ResponseEnd {
+                        tool_calls: tool_calls.clone(),
                     }
                 }
+                tools::LoopEvent::ToolResult {
+                    id,
+                    name,
+                    arguments: _,
+                    output,
+                } => StreamEvent::ToolResult {
+                    id: id.clone(),
+                    name: name.clone(),
+                    output: output.clone(),
+                },
             };
             tx.send(ev).is_ok()
         })
@@ -728,20 +738,19 @@ async fn submit(
     Ok(task)
 }
 
-/// Persist the assistant response that just ended (reasoning between
-/// `think` / `endthink` tags ahead of the answer) and push it into the
-/// in-memory conversation. A response with neither text nor reasoning — a
-/// pure tool-call response — is skipped: the parser synthesizes the missing
-/// assistant message when the file is reloaded.
-fn finalize_response(app: &mut App) -> Result<()> {
+/// Persist the assistant response that just ended (reasoning in a
+/// collapsible Thinking block ahead of the answer, tool calls as trailing
+/// blocks) and push it into the in-memory conversation. A response with
+/// neither text, reasoning, nor tool calls is skipped.
+fn finalize_response(app: &mut App, tool_calls: &[crate::llm::CompletedToolCall]) -> Result<()> {
     let reply = app.stream_buf.trim_end().to_string();
     let reasoning = app.reason_buf.trim_end().to_string();
     app.reason_buf.clear();
     app.stream_buf.clear();
-    if reply.is_empty() && reasoning.is_empty() {
+    if reply.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
         return Ok(());
     }
-    let turn = tools::assistant_turn(&app.model, &reasoning, &reply);
+    let turn = tools::assistant_turn(&app.model, &reasoning, &reply, tool_calls);
     tools::append_turn(&app.path, &turn)?;
     app.conv.turns.push(turn);
     app.got_reply = true;

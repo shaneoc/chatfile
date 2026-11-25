@@ -103,6 +103,7 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
             tags: vec![("thinking".into(), "true".into())],
         },
         reasoning: Some("because 6*9".into()),
+        tool_calls: Vec::new(),
     });
     let screen = render(&app, 80, 24).join("\n");
     assert!(screen.contains("because 6*9"));

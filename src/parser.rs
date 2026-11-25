@@ -250,6 +250,37 @@ pub struct Turn {
     /// header tag `thinking: true`. `None` for every other turn, and for
     /// assistant turns without the tag (whose body is verbatim content).
     pub reasoning: Option<String>,
+    /// Assistant turns only: the tool calls issued with this reply, parsed
+    /// from the trailing Tool Call blocks (see [`Turn::tool_call_count`]).
+    /// Empty for every other turn and for assistant turns without the
+    /// `tool_calls:` header tag.
+    pub tool_calls: Vec<AssistantToolCall>,
+}
+
+/// One tool call persisted on an `**Assistant**` turn (a trailing
+/// `<details>` block after the visible content).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssistantToolCall {
+    /// The tool call id (as the server assigned it).
+    pub id: String,
+    /// The tool name.
+    pub name: String,
+    /// The JSON arguments exactly as the model sent them.
+    pub arguments: String,
+}
+
+impl Turn {
+    /// The `tool_calls: <N>` header tag value, or `0` when the tag is
+    /// absent (the parser enforces that the tag and [`Turn::tool_calls`]
+    /// agree).
+    pub fn tool_call_count(&self) -> usize {
+        self.meta
+            .tags
+            .iter()
+            .find(|(k, _)| k == "tool_calls")
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Structured data of a persisted `**Tool**` turn.
@@ -259,47 +290,21 @@ pub struct ToolTurnData {
     pub name: String,
     /// The tool call id (from the `id:` meta tag).
     pub id: String,
-    /// The JSON arguments exactly as the model sent them (from the summary
-    /// line), or an empty string when the summary is missing/malformed.
-    pub arguments: String,
     /// The unwrapped tool output (the fence content).
     pub output: String,
 }
 
 /// Parse a `Role::Tool` turn's persisted `<details>` body into structured
 /// data. Returns `None` when the turn is not a well-formed tool turn (the
-/// name and id meta tags are required; the body must carry a summary line
-/// and a tilde-fenced output block).
+/// name and id meta tags are required; the body must carry a tilde-fenced
+/// output block). The arguments live on the issuing assistant turn, not
+/// here.
 pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
     if turn.role != Role::Tool {
         return None;
     }
     let name = turn.meta.tags.iter().find(|(k, _)| k == "tool")?.1.clone();
     let id = turn.meta.tags.iter().find(|(k, _)| k == "id")?.1.clone();
-
-    // Summary line: `<summary><code>name(args)</code></summary>`
-    let mut arguments = String::new();
-    for line in turn.content.lines() {
-        let line = line.trim();
-        let Some(inner) = line
-            .strip_prefix("<summary><code>")
-            .and_then(|s| s.strip_suffix("</code></summary>"))
-        else {
-            continue;
-        };
-        if let Some(open) = inner.find('(') {
-            let name_part = &inner[..open];
-            if !name_part.is_empty() && !name_part.chars().any(|c| c.is_whitespace()) {
-                // The arguments run to the final closing paren.
-                if let Some(close) = inner.rfind(')') {
-                    if close > open {
-                        arguments = inner[open + 1..close].to_string();
-                    }
-                }
-            }
-        }
-        break; // only the first summary line is considered
-    }
 
     // Output block: a tilde fence (info `text`) opened after the summary,
     // closed by a bare tilde run at least as long.
@@ -331,33 +336,69 @@ pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
     Some(ToolTurnData {
         name,
         id,
-        arguments,
         output,
     })
 }
 
 /// Serialize a tool result into the canonical persisted body: a
-/// `<details>` block whose summary shows the call and whose output sits in
-/// a tilde fence. The fence is at least four tildes long and strictly
-/// longer than any tilde run inside the output, so embedded ` ``` ` (or
-/// shorter `~~~`) cannot terminate it early.
-pub fn tool_turn_body(name: &str, arguments: &str, output: &str) -> String {
+/// `<details>` block whose summary is `Output` and whose output sits in a
+/// tilde fence. The fence is at least four tildes long and strictly longer
+/// than any tilde run inside the output, so embedded tildes cannot
+/// terminate it early.
+pub fn tool_turn_body(output: &str) -> String {
     let fence = "~".repeat(fence_len(output));
     format!(
-        "<details>\n<summary><code>{name}({arguments})</code></summary>\n\n{fence}text\n{output}\n{fence}\n\n</details>"
+        "<details>\n<summary>Output</summary>\n\n{fence}text\n{output}\n{fence}\n\n</details>"
     )
 }
 
-/// The tilde fence length for a tool output: `max(4, longest run + 1)`.
-fn fence_len(output: &str) -> usize {
+/// The tilde fence length for tool arguments or output:
+/// `max(4, longest run + 1)`.
+fn fence_len(text: &str) -> usize {
     let mut longest = 0usize;
-    for line in output.lines() {
+    for line in text.lines() {
         let t = line.trim_start();
         if t.starts_with('~') {
             longest = longest.max(t.chars().take_while(|&c| c == '~').count());
         }
     }
     longest.saturating_add(1).max(4)
+}
+
+/// Serialize one tool call into its canonical trailing block: a
+/// `<details>` wrapper whose summary names the call and whose arguments sit
+/// in a tilde fence (see [`fence_len`]).
+pub fn tool_call_block(call: &AssistantToolCall) -> String {
+    let fence = "~".repeat(fence_len(&call.arguments));
+    format!(
+        "<details>\n<summary>Tool Call: <code>{}</code> (<code>{}</code>)</summary>\n\n{fence}json\n{}\n{fence}\n\n</details>",
+        call.name, call.id, call.arguments
+    )
+}
+
+/// Parse the `<summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>`
+/// line into `(name, id)`. Both must be non-empty and contain no
+/// whitespace.
+fn parse_tool_call_summary(line: &str) -> Option<(String, String)> {
+    // After stripping the fixed prefix and suffix the line is
+    // `{name}</code> (<code>{id}</code>`.
+    let inner = line
+        .trim()
+        .strip_prefix("<summary>Tool Call: <code>")?
+        .strip_suffix(")</summary>")?;
+    let close_code = inner.find("</code>")?;
+    let name = inner[..close_code].to_string();
+    if name.is_empty() || name.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    let id = inner[close_code + "</code>".len()..]
+        .strip_prefix(" (<code>")?
+        .strip_suffix("</code>")?
+        .to_string();
+    if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((name, id))
 }
 
 /// A parsed conversation file.
@@ -538,6 +579,24 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                 return Err(line_error(
                     line_no,
                     "'thinking' metadata must be the literal value 'true'",
+                ));
+            }
+        }
+    }
+    // The `tool_calls` tag is an assistant-only positive integer counting
+    // the trailing Tool Call blocks in the body.
+    for (k, v) in &meta.tags {
+        if k == "tool_calls" {
+            if role != Role::Assistant {
+                return Err(line_error(
+                    line_no,
+                    "'tool_calls' metadata is only allowed on **Assistant** headers",
+                ));
+            }
+            if v.parse::<usize>().map_or(true, |n| n == 0) {
+                return Err(line_error(
+                    line_no,
+                    "'tool_calls' metadata must be a positive integer",
                 ));
             }
         }
@@ -772,28 +831,44 @@ pub fn parse(input: &str) -> Result<Conversation> {
     }
     raw_turns.push((cur_role, cur_meta, cur_lines, cur_start));
 
-    // Finalize each section: restore boundary escapes, and for assistant
-    // turns carrying `thinking: true` split off the reasoning block (from
-    // the raw lines, before restoration).
+    // Finalize each section: for assistant turns carrying `thinking: true`
+    // split off the reasoning block, then — for assistant turns carrying
+    // `tool_calls: N` — extract the trailing tool call blocks. Both run on
+    // the raw lines, before boundary escapes are restored.
     let mut turns: Vec<Turn> = Vec::new();
     for (role, meta, raw_lines, start) in raw_turns {
         let first = first_line + start;
+        let mut reasoning = None;
+        let mut body_lines = raw_lines;
+        let mut body_first = first;
         if role == Role::Assistant && meta.tags.iter().any(|(k, _)| k == "thinking") {
-            let (reasoning, content) = finalize_thinking_turn(&raw_lines, first)?;
-            turns.push(Turn {
-                role,
-                content,
-                meta,
-                reasoning: Some(reasoning),
-            });
-        } else {
-            turns.push(Turn {
-                role,
-                content: restore_boundaries(&raw_lines, first)?,
-                meta,
-                reasoning: None,
-            });
+            let (r, lines, f) = finalize_thinking_turn(&body_lines, body_first)?;
+            reasoning = Some(r);
+            body_lines = lines;
+            body_first = f;
         }
+        let mut content_lines = body_lines;
+        let mut tool_calls: Vec<AssistantToolCall> = Vec::new();
+        if role == Role::Assistant {
+            if let Some(n) = meta
+                .tags
+                .iter()
+                .find(|(k, _)| k == "tool_calls")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+            {
+                let (calls, rest) = extract_tool_calls(&content_lines, body_first, n)?;
+                tool_calls = calls;
+                content_lines = rest;
+            }
+        }
+        turns.push(Turn {
+            role,
+            content: restore_boundaries(&content_lines, body_first)?,
+            meta,
+            reasoning,
+            tool_calls,
+        });
     }
 
     conv.turns = turns;
@@ -1076,8 +1151,9 @@ fn backslash_run(line: &str, pos: usize) -> usize {
 }
 
 /// Finalize an assistant section whose header carries `thinking: true`:
-/// split the raw body lines into the reasoning block and the visible
-/// content, restoring boundary escapes in each piece.
+/// split the raw body lines into the reasoning block (restored) and the
+/// visible answer (raw lines, still carrying boundary escapes), together
+/// with the 1-based file line of the first answer line.
 ///
 /// The trimmed body must begin with a bare `<details>` line immediately
 /// followed by a bare `<summary>Thinking</summary>` line. The scan then
@@ -1087,7 +1163,10 @@ fn backslash_run(line: &str, pos: usize) -> usize {
 /// which must be a bare `</details>` line. Backslashes immediately before
 /// a details tag must come in odd counts (the inverse of the `N -> 2N + 1`
 /// escape applied by [`escape_details_tags`]); `(k - 1) / 2` are restored.
-fn finalize_thinking_turn(raw_lines: &[String], first_line: usize) -> Result<(String, String)> {
+fn finalize_thinking_turn(
+    raw_lines: &[String],
+    first_line: usize,
+) -> Result<(String, Vec<String>, usize)> {
     // The first non-blank line must be the bare opening tag.
     let mut s = 0usize;
     while s < raw_lines.len() && raw_lines[s].trim().is_empty() {
@@ -1171,11 +1250,147 @@ fn finalize_thinking_turn(raw_lines: &[String], first_line: usize) -> Result<(St
         ));
     };
 
-    // Each piece is restored independently: the wrapper lines separate the
-    // pieces, so no boundary collision can straddle them.
+    // The reasoning piece is restored here (the wrapper lines separate the
+    // pieces, so no boundary collision can straddle them); the answer piece
+    // is returned as raw lines — tool-call extraction runs before boundary
+    // restoration. `first_line + close_at + 1` is the 1-based file line of
+    // the first answer line.
     let reasoning = restore_boundaries(&reason_lines, first_line + s + 2)?;
-    let content = restore_boundaries(&raw_lines[close_at + 1..], first_line + close_at + 1)?;
-    Ok((reasoning, content))
+    Ok((reasoning, raw_lines[close_at + 1..].to_vec(), first_line + close_at + 1))
+}
+
+/// Extract the trailing `n` tool call blocks from the raw body lines of an
+/// assistant turn whose header carries `tool_calls: {n}`. Returns the calls
+/// in file order and the remaining lines (the visible content, still
+/// carrying boundary escapes).
+///
+/// Extraction walks backward from the end of the section, so literal
+/// examples of tool call blocks inside the visible content are left
+/// untouched.
+fn extract_tool_calls(
+    lines: &[String],
+    first_line: usize,
+    n: usize,
+) -> Result<(Vec<AssistantToolCall>, Vec<String>)> {
+    let mut calls: Vec<AssistantToolCall> = Vec::new();
+    let mut end = lines.len();
+    for _ in 0..n {
+        while end > 0 && lines[end - 1].trim().is_empty() {
+            end -= 1;
+        }
+        if end == 0 {
+            return Err(line_error(
+                first_line + lines.len().saturating_sub(1),
+                format!("expected {n} tool call blocks at the end of the section; found fewer"),
+            ));
+        }
+        let (call, new_end) = extract_one_tool_call_block(&lines[..end], first_line)?;
+        calls.push(call);
+        end = new_end;
+    }
+    calls.reverse();
+    Ok((calls, lines[..end].to_vec()))
+}
+
+/// Extract one well-formed tool call block ending at the last line of
+/// `lines`. Returns the call and the index of the block's opening
+/// `<details>` line (the remainder runs up to it).
+fn extract_one_tool_call_block(
+    lines: &[String],
+    first_line: usize,
+) -> Result<(AssistantToolCall, usize)> {
+    let e = lines.len() - 1;
+    if lines[e].trim() != "</details>" {
+        return Err(line_error(
+            first_line + e,
+            "expected a closing '</details>' line to end the tool call block",
+        ));
+    }
+    // Closing fence: the first non-blank line above the closer.
+    let mut c = e;
+    while c > 0 && lines[c - 1].trim().is_empty() {
+        c -= 1;
+    }
+    if c == 0 {
+        return Err(line_error(
+            first_line + e,
+            "malformed tool call block; expected a tilde-fenced arguments block",
+        ));
+    }
+    c -= 1;
+    let close = lines[c].trim();
+    let close_len = close.chars().take_while(|&ch| ch == '~').count();
+    if close_len < 3 || close.len() != close_len {
+        return Err(line_error(
+            first_line + e,
+            "malformed tool call block; expected a tilde-fenced arguments block",
+        ));
+    }
+    // Summary line: the first line above the closing fence (walking back)
+    // that parses as a Tool Call summary.
+    let mut s: Option<usize> = None;
+    for i in (0..c).rev() {
+        if parse_tool_call_summary(&lines[i]).is_some() {
+            s = Some(i);
+            break;
+        }
+    }
+    let Some(s) = s else {
+        return Err(line_error(
+            first_line + e,
+            "malformed tool call block; expected a Tool Call summary line",
+        ));
+    };
+    let (name, id) = parse_tool_call_summary(&lines[s]).unwrap();
+    // Opening fence: the first tilde fence below the summary. The
+    // serializer makes it strictly longer than any embedded tilde run, so
+    // an embedded fence line cannot be mistaken for it.
+    let mut o: Option<usize> = None;
+    for (i, line) in lines[s + 1..c].iter().enumerate() {
+        let t = line.trim();
+        let run = t.chars().take_while(|&ch| ch == '~').count();
+        if run >= 3 && (t[run..].trim() == "json" || t[run..].trim().is_empty()) {
+            o = Some(s + 1 + i);
+            break;
+        }
+    }
+    let Some(o) = o else {
+        return Err(line_error(
+            first_line + s,
+            "malformed tool call block; expected a tilde-fenced arguments block",
+        ));
+    };
+    let open_len = lines[o]
+        .trim()
+        .chars()
+        .take_while(|&ch| ch == '~')
+        .count();
+    if open_len > close_len {
+        return Err(line_error(
+            first_line + c,
+            "malformed tool call block; expected a tilde-fenced arguments block",
+        ));
+    }
+    // Opening tag: the first non-blank line above the summary.
+    let mut d = s;
+    while d > 0 && lines[d - 1].trim().is_empty() {
+        d -= 1;
+    }
+    if d == 0 || lines[d - 1].trim() != "<details>" {
+        return Err(line_error(
+            first_line + s,
+            "malformed tool call block; expected an opening '<details>' line",
+        ));
+    }
+    let arguments = lines[o + 1..c].join("\n").trim().to_string();
+    Ok((
+        AssistantToolCall {
+            id,
+            name,
+            arguments,
+        },
+        d - 1,
+    ))
 }
 
 /// Serialize a [`Conversation`] back to canonical Markdown.
@@ -1246,7 +1461,8 @@ pub fn to_markdown(conv: &Conversation) -> String {
 
 /// The persisted body of a turn: the visible content, or — for an
 /// assistant turn with non-empty reasoning — the collapsible Thinking
-/// block ahead of it:
+/// block ahead of it, and — for an assistant turn with tool calls — one
+/// trailing Tool Call block per call (see [`tool_call_block`]):
 ///
 /// ```markdown
 /// <details>
@@ -1258,28 +1474,37 @@ pub fn to_markdown(conv: &Conversation) -> String {
 ///
 /// {answer}
 ///
+/// <details>
+/// <summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>
+///
+/// ~~~~json
+/// {arguments}
+/// ~~~~
+///
+/// </details>
 /// ```
 ///
-/// (the trailing blank line and answer are omitted when the answer is
-/// empty). Boundary-colliding lines in each piece are escaped (see
+/// (each optional piece is omitted when empty). Boundary-colliding lines
+/// in the reasoning and answer pieces are escaped (see
 /// [`escape_boundaries`]); stray details tags inside the reasoning are
-/// escaped by [`escape_details_tags`].
+/// escaped by [`escape_details_tags`]. The tool call blocks are emitted
+/// verbatim; their tilde fences are sized by [`fence_len`].
 pub fn render_turn_body(t: &Turn) -> String {
-    let answer = t.content.trim();
-    match t.reasoning.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
-        Some(r) => {
-            let escaped_r = escape_boundaries(&escape_details_tags(r));
-            if answer.is_empty() {
-                format!("<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>")
-            } else {
-                format!(
-                    "<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>\n\n{}",
-                    escape_boundaries(answer)
-                )
-            }
-        }
-        None => escape_boundaries(answer),
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = t.reasoning.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        let escaped_r = escape_boundaries(&escape_details_tags(r));
+        parts.push(format!(
+            "<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>"
+        ));
     }
+    let answer = t.content.trim();
+    if !answer.is_empty() {
+        parts.push(escape_boundaries(answer));
+    }
+    for call in &t.tool_calls {
+        parts.push(tool_call_block(call));
+    }
+    parts.join("\n\n")
 }
 
 fn key(s: &str) -> serde_yaml::Value {
@@ -1297,13 +1522,12 @@ impl Conversation {
     /// `**System**` sections are skipped: their content is folded into the
     /// single leading system message by the caller (see
     /// [`crate::context::build_system_prompt`]) and never appears in the
-    /// conversation itself. `**Tool**` turns become `role: "tool"` messages
-    /// carrying the `tool_call_id`, and the `tool_calls` (id, name,
-    /// arguments) are attached to the preceding assistant message — a
-    /// message with `content: None` is synthesized when a tool turn has no
-    /// preceding assistant turn (e.g. a hand-edited file), so reloaded
-    /// histories are always valid API payloads. Malformed tool turns are
-    /// skipped.
+    /// conversation itself. Assistant turns carry their parsed tool calls
+    /// (the trailing Tool Call blocks of §3.3); `**Tool**` turns become
+    /// `role: "tool"` messages carrying the `tool_call_id`. Malformed tool
+    /// turns are skipped. This is a pure projection: it never synthesizes
+    /// messages — see [`crate::llm::complete_tool_calls`] for the
+    /// request-prep step that answers dangling tool calls.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {
         use crate::llm::{Message, ToolCall, ToolFunction};
 
@@ -1315,22 +1539,6 @@ impl Conversation {
                     let Some(data) = parse_tool_turn(turn) else {
                         continue;
                     };
-                    let call = ToolCall {
-                        id: data.id.clone(),
-                        call_type: "function".into(),
-                        function: ToolFunction {
-                            name: data.name.clone(),
-                            arguments: data.arguments.clone(),
-                        },
-                    };
-                    match messages.last_mut() {
-                        Some(last) if last.role == "assistant" => last.tool_calls.push(call),
-                        _ => {
-                            let mut m = Message::new("assistant", None);
-                            m.tool_calls.push(call);
-                            messages.push(m);
-                        }
-                    }
                     messages.push(Message {
                         role: "tool".into(),
                         content: Some(data.output.clone()),
@@ -1342,12 +1550,25 @@ impl Conversation {
                     // Only assistant messages may omit `content` (they
                     // carried tool calls instead); other roles always send
                     // a string, even when empty.
-                    let content = if other == Role::Assistant && turn.content.trim().is_empty() {
-                        None
-                    } else {
-                        Some(turn.content.clone())
-                    };
-                    messages.push(Message::new(other.as_str(), content));
+                    let mut m = Message::new(
+                        other.as_str(),
+                        if turn.content.trim().is_empty() && other == Role::Assistant {
+                            None
+                        } else {
+                            Some(turn.content.clone())
+                        },
+                    );
+                    for c in &turn.tool_calls {
+                        m.tool_calls.push(ToolCall {
+                            id: c.id.clone(),
+                            call_type: "function".into(),
+                            function: ToolFunction {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            },
+                        });
+                    }
+                    messages.push(m);
                 }
             }
         }

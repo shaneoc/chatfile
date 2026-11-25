@@ -353,6 +353,7 @@ fn serialize_canonical_form() {
                 content: "Be terse.".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::User,
@@ -362,6 +363,7 @@ fn serialize_canonical_form() {
                     tags: vec![],
                 },
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
         ],
     };
@@ -380,6 +382,7 @@ fn serialize_omits_missing_metadata() {
             content: "Hi".into(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -396,12 +399,14 @@ fn serialize_system_section_round_trips() {
                 content: "line1\nline2".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::User,
                 content: "hi".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
         ],
         ..Default::default()
@@ -519,6 +524,7 @@ fn escaped_collision_round_trips_as_content() {
             content: "---\n**Assistant** | 2026-11-22 14:31".into(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -544,6 +550,7 @@ fn boundary_collision_round_trips_losslessly() {
                 content: content.clone(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             }],
             ..Default::default()
         };
@@ -566,6 +573,7 @@ fn closed_fence_with_boundary_collision_round_trips() {
             content: content.to_string(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -589,12 +597,14 @@ fn unclosed_fence_at_end_of_message_round_trips() {
                     content: content.clone(),
                     meta: TurnMeta::default(),
                     reasoning: None,
+                    tool_calls: Vec::new(),
                 },
                 Turn {
                     role: Role::Assistant,
                     content: "done".into(),
                     meta: TurnMeta::default(),
                     reasoning: None,
+                    tool_calls: Vec::new(),
                 },
             ],
             ..Default::default()
@@ -696,6 +706,7 @@ fn boundary_collision_without_blank_line_round_trips_losslessly() {
             content: content.to_string(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -719,6 +730,7 @@ fn unclosed_fence_round_trips_without_lingering_backslash() {
             content: content.to_string(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -774,6 +786,7 @@ fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
                 content: "q".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::Assistant,
@@ -783,6 +796,7 @@ fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
                     tags: vec![("thinking".into(), "true".into())],
                 },
                 reasoning: Some(reasoning.to_string()),
+                tool_calls: Vec::new(),
             },
         ],
         ..Default::default()
@@ -937,12 +951,14 @@ fn no_thinking_tag_wrapper_stays_content() {
                 content: "q".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::Assistant,
                 content: body.to_string(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1031,10 +1047,10 @@ fn thinking_tag_rejects_even_backslash_count() {
 // Milestone 2: tool turns and message assembly
 // ---------------------------------------------------------------------------
 
-fn tool_turn_fixture(name: &str, id: &str, arguments: &str, output: &str) -> Turn {
+fn tool_turn_fixture(name: &str, id: &str, output: &str) -> Turn {
     Turn {
         role: Role::Tool,
-        content: tool_turn_body(name, arguments, output),
+        content: tool_turn_body(output),
         meta: TurnMeta {
             timestamp: Some("2026-11-22 14:31".into()),
             tags: vec![
@@ -1043,6 +1059,7 @@ fn tool_turn_fixture(name: &str, id: &str, arguments: &str, output: &str) -> Tur
             ],
         },
         reasoning: None,
+        tool_calls: Vec::new(),
     }
 }
 
@@ -1055,13 +1072,9 @@ fn tool_turn_round_trips() {
                 content: "List the files.".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
-            tool_turn_fixture(
-                "list_files",
-                "call_1",
-                r#"{"subdir": "."}"#,
-                "notes.md  120\nsrc/main.rs  4567",
-            ),
+            tool_turn_fixture("list_files", "call_1", "notes.md  120\nsrc/main.rs  4567"),
         ],
         ..Default::default()
     };
@@ -1071,7 +1084,6 @@ fn tool_turn_round_trips() {
     let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
     assert_eq!(data.name, "list_files");
     assert_eq!(data.id, "call_1");
-    assert_eq!(data.arguments, r#"{"subdir": "."}"#);
     assert_eq!(data.output, "notes.md  120\nsrc/main.rs  4567");
     // Stable under re-serialization.
     assert_eq!(to_markdown(&back), once);
@@ -1089,8 +1101,9 @@ fn tool_turn_output_with_details_and_backticks_round_trips() {
                 content: "run it".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
-            tool_turn_fixture("bash", "call_9", r#"{"command": "ls"}"#, output),
+            tool_turn_fixture("bash", "call_9", output),
         ],
         ..Default::default()
     };
@@ -1113,8 +1126,9 @@ fn tool_turn_output_with_long_tilde_run_round_trips() {
                 content: "read it".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
-            tool_turn_fixture("read_file", "c1", r#"{"path": "a.md"}"#, output),
+            tool_turn_fixture("read_file", "c1", output),
         ],
         ..Default::default()
     };
@@ -1130,20 +1144,22 @@ fn parse_tool_turn_rejects_malformed() {
     // Missing the `id:` tag.
     let no_id = Turn {
         role: Role::Tool,
-        content: tool_turn_body("bash", "{}", "out"),
+        content: tool_turn_body("out"),
         meta: TurnMeta {
             timestamp: None,
             tags: vec![("tool".into(), "bash".into())],
         },
         reasoning: None,
+        tool_calls: Vec::new(),
     };
     assert!(parse_tool_turn(&no_id).is_none());
     // Not a tool role.
     let user = Turn {
         role: Role::User,
-        content: tool_turn_body("bash", "{}", "out"),
+        content: tool_turn_body("out"),
         meta: TurnMeta::default(),
         reasoning: None,
+        tool_calls: Vec::new(),
     };
     assert!(parse_tool_turn(&user).is_none());
     // Body without a summary line or fence.
@@ -1158,12 +1174,13 @@ fn parse_tool_turn_rejects_malformed() {
             ],
         },
         reasoning: None,
+        tool_calls: Vec::new(),
     };
     assert!(parse_tool_turn(&no_body).is_none());
 }
 
 #[test]
-fn to_messages_folds_tool_turns_into_assistant_and_tool() {
+fn to_messages_projects_assistant_tool_calls_and_tool_turns() {
     let conv = Conversation {
         turns: vec![
             Turn {
@@ -1171,14 +1188,20 @@ fn to_messages_folds_tool_turns_into_assistant_and_tool() {
                 content: "List the files.".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::Assistant,
                 content: "Let me check.".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: vec![AssistantToolCall {
+                    id: "call_1".into(),
+                    name: "list_files".into(),
+                    arguments: r#"{"subdir": "."}"#.into(),
+                }],
             },
-            tool_turn_fixture("list_files", "call_1", r#"{"subdir": "."}"#, "a.md  10"),
+            tool_turn_fixture("list_files", "call_1", "a.md  10"),
         ],
         ..Default::default()
     };
@@ -1211,18 +1234,21 @@ fn to_messages_skips_system_sections() {
                 content: "Be terse.".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::User,
                 content: "hi".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::Assistant,
                 content: "hello".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1235,21 +1261,20 @@ fn to_messages_skips_system_sections() {
 }
 
 #[test]
-fn to_messages_synthesizes_assistant_when_tool_turn_leads() {
-    // A file that starts with a tool turn (hand-edited) must still yield a
-    // valid payload: an assistant message with content None carries the call.
+fn to_messages_projects_leading_tool_turn_without_synthesis() {
+    // A file that starts with a tool turn (hand-edited) projects to a bare
+    // `role: "tool"` message: no assistant message is synthesized. The
+    // projection stays pure; payload repair belongs to the request-prep
+    // layer (see `llm::complete_tool_calls`).
     let conv = Conversation {
-        turns: vec![tool_turn_fixture("read_file", "c7", r#"{"path": "x"}"#, "data")],
+        turns: vec![tool_turn_fixture("read_file", "c7", "data")],
         ..Default::default()
     };
     let messages = conv.to_messages();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].role, "assistant");
-    assert_eq!(messages[0].content, None);
-    assert_eq!(messages[0].tool_calls.len(), 1);
-    assert_eq!(messages[0].tool_calls[0].id, "c7");
-    assert_eq!(messages[1].role, "tool");
-    assert_eq!(messages[1].tool_call_id.as_deref(), Some("c7"));
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "tool");
+    assert_eq!(messages[0].content.as_deref(), Some("data"));
+    assert_eq!(messages[0].tool_call_id.as_deref(), Some("c7"));
 }
 
 #[test]
@@ -1261,12 +1286,14 @@ fn to_messages_skips_malformed_tool_turns() {
                 content: "hi".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
             Turn {
                 role: Role::Tool,
                 content: "not a tool turn".into(),
                 meta: TurnMeta::default(),
                 reasoning: None,
+                tool_calls: Vec::new(),
             },
         ],
         ..Default::default()
@@ -1292,6 +1319,7 @@ fn frontmatter_tool_fields_round_trip() {
             content: "hi".into(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
     };
     let md = to_markdown(&conv);
@@ -1312,6 +1340,7 @@ fn frontmatter_defaults_are_omitted() {
             content: "hi".into(),
             meta: TurnMeta::default(),
             reasoning: None,
+            tool_calls: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1331,4 +1360,375 @@ fn frontmatter_legacy_tools_list_reads_as_enabled() {
     let md = "---\ntools:\n  - name: shell\n---\n**User**\n\nhi\n";
     let conv = parse(md).unwrap();
     assert!(conv.frontmatter.tools);
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 3: explicit tool call persistence (`tool_calls: N`)
+// ---------------------------------------------------------------------------
+
+/// One canonical trailing Tool Call block, for hand-written fixtures.
+fn tc_block(name: &str, id: &str, args: &str) -> String {
+    format!(
+        "<details>\n<summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>\n\n~~~~json\n{args}\n~~~~\n\n</details>"
+    )
+}
+
+/// An assistant turn carrying the `model` tag and — when `calls` is
+/// non-empty — the `tool_calls: <N>` tag.
+fn assistant_turn_fixture(content: &str, calls: &[AssistantToolCall]) -> Turn {
+    let mut tags = vec![("model".to_string(), "m1".to_string())];
+    if !calls.is_empty() {
+        tags.push(("tool_calls".to_string(), calls.len().to_string()));
+    }
+    Turn {
+        role: Role::Assistant,
+        content: content.to_string(),
+        meta: TurnMeta {
+            timestamp: Some("2026-11-22 14:31".into()),
+            tags,
+        },
+        reasoning: None,
+        tool_calls: calls.to_vec(),
+    }
+}
+
+fn user_turn_fixture(content: &str) -> Turn {
+    Turn {
+        role: Role::User,
+        content: content.into(),
+        meta: TurnMeta::default(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+#[test]
+fn tool_call_single_round_trips() {
+    let call = AssistantToolCall {
+        id: "call_1".into(),
+        name: "list_files".into(),
+        arguments: r#"{"subdir": "."}"#.into(),
+    };
+    let conv = Conversation {
+        turns: vec![
+            user_turn_fixture("List the files."),
+            assistant_turn_fixture("Let me check.", &[call.clone()]),
+            tool_turn_fixture("list_files", "call_1", "a.md  10"),
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**Assistant** | 2026-11-22 14:31 | model: m1 | tool_calls: 1"),
+        "{once}"
+    );
+    let back = parse(&once).unwrap();
+    assert_eq!(back, conv);
+}
+
+#[test]
+fn tool_call_parallel_round_trips() {
+    let calls = vec![
+        AssistantToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": "a.md"}"#.into(),
+        },
+        AssistantToolCall {
+            id: "call_2".into(),
+            name: "bash".into(),
+            arguments: r#"{"command": "ls"}"#.into(),
+        },
+    ];
+    let conv = Conversation {
+        turns: vec![
+            user_turn_fixture("Check both."),
+            assistant_turn_fixture("Checking both.", &calls),
+            tool_turn_fixture("read_file", "call_1", "content-a"),
+            tool_turn_fixture("bash", "call_2", "a b"),
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back, conv);
+    // Order is preserved.
+    assert_eq!(back.turns[1].tool_calls[0].id, "call_1");
+    assert_eq!(back.turns[1].tool_calls[1].id, "call_2");
+}
+
+#[test]
+fn tool_call_with_thinking_and_content_round_trips() {
+    let calls = vec![
+        AssistantToolCall {
+            id: "call_1".into(),
+            name: "list_files".into(),
+            arguments: r#"{"subdir": "."}"#.into(),
+        },
+        AssistantToolCall {
+            id: "call_2".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": "a.md"}"#.into(),
+        },
+    ];
+    let conv = Conversation {
+        turns: vec![
+            user_turn_fixture("List and read."),
+            Turn {
+                role: Role::Assistant,
+                content: "Here you go.".into(),
+                meta: TurnMeta {
+                    timestamp: Some("2026-11-22 14:31".into()),
+                    tags: vec![
+                        ("model".to_string(), "m1".to_string()),
+                        ("thinking".to_string(), "true".to_string()),
+                        ("tool_calls".to_string(), "2".to_string()),
+                    ],
+                },
+                reasoning: Some("Let me think.".into()),
+                tool_calls: calls.clone(),
+            },
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains(
+            "**Assistant** | 2026-11-22 14:31 | model: m1 | thinking: true | tool_calls: 2"
+        ),
+        "{once}"
+    );
+    let back = parse(&once).unwrap();
+    assert_eq!(back, conv);
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some("Let me think."));
+}
+
+#[test]
+fn tool_call_with_thinking_without_content_round_trips() {
+    // A pure tool-call response from a thinking model: reasoning and calls,
+    // no visible answer.
+    let call = AssistantToolCall {
+        id: "call_1".into(),
+        name: "bash".into(),
+        arguments: r#"{"command": "ls"}"#.into(),
+    };
+    let conv = Conversation {
+        turns: vec![
+            user_turn_fixture("List."),
+            Turn {
+                role: Role::Assistant,
+                content: String::new(),
+                meta: TurnMeta {
+                    timestamp: Some("2026-11-22 14:31".into()),
+                    tags: vec![
+                        ("thinking".to_string(), "true".to_string()),
+                        ("tool_calls".to_string(), "1".to_string()),
+                    ],
+                },
+                reasoning: Some("Quick check.".into()),
+                tool_calls: vec![call.clone()],
+            },
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back, conv);
+    assert_eq!(back.turns[1].content, "");
+    assert_eq!(back.turns[1].tool_calls, vec![call]);
+}
+
+#[test]
+fn tool_call_extraction_ignores_fake_example_in_content() {
+    // The visible content quotes a literal Tool Call block; extraction must
+    // take the real trailing block only and leave the example verbatim.
+    let fake = tc_block("fake_tool", "fake_1", r#"{"x": 1}"#);
+    let content = format!(
+        "Here is what a tool call looks like:\n\n{fake}\n\nAnd here is the real one below."
+    );
+    let real = AssistantToolCall {
+        id: "real_1".into(),
+        name: "read_file".into(),
+        arguments: r#"{"path": "b.md"}"#.into(),
+    };
+    let conv = Conversation {
+        turns: vec![user_turn_fixture("Show me."), assistant_turn_fixture(&content, &[real.clone()])],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].tool_calls, vec![real]);
+    assert_eq!(back.turns[1].content, content);
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn tool_call_block_fence_grows_with_embedded_tilde_runs() {
+    // A five-tilde run at the start of an arguments line forces a
+    // six-tilde fence.
+    let call = AssistantToolCall {
+        id: "c1".into(),
+        name: "write_file".into(),
+        arguments: "a\n~~~~~\nb".into(),
+    };
+    let block = tool_call_block(&call);
+    assert!(block.contains("~~~~~~json"), "{block}");
+    let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n{block}\n");
+    let conv = parse(&input).unwrap();
+    assert_eq!(conv.turns[1].tool_calls, vec![call]);
+    assert_eq!(to_markdown(&conv), input);
+}
+
+#[test]
+fn to_messages_is_pure_and_request_layer_recovers_dangling_calls() {
+    use crate::llm::{complete_tool_calls, CANCELLED_TOOL_OUTPUT};
+
+    let calls = vec![
+        AssistantToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path": "a.md"}"#.into(),
+        },
+        AssistantToolCall {
+            id: "call_2".into(),
+            name: "bash".into(),
+            arguments: r#"{"command": "ls"}"#.into(),
+        },
+    ];
+    // Execution was cancelled after the first result: the file carries the
+    // assistant turn (two calls) and a single **Tool** turn.
+    let conv = Conversation {
+        turns: vec![
+            user_turn_fixture("Do both."),
+            assistant_turn_fixture("Working on it.", &calls),
+            tool_turn_fixture("read_file", "call_1", "content-a"),
+        ],
+        ..Default::default()
+    };
+    let mut messages = conv.to_messages();
+    // Pure projection: the dangling call stays unanswered.
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].tool_calls.len(), 2);
+    assert_eq!(messages[2].role, "tool");
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_1"));
+    // The request-prep layer answers the dangling call.
+    complete_tool_calls(&mut messages);
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[3].role, "tool");
+    assert_eq!(messages[3].content.as_deref(), Some(CANCELLED_TOOL_OUTPUT));
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_2"));
+}
+
+#[test]
+fn tool_calls_zero_rejected() {
+    let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: 0\n\nhi\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'tool_calls' metadata must be a positive integer"
+    );
+}
+
+#[test]
+fn tool_calls_non_integer_rejected() {
+    for v in ["true", "-1", "1.5", ""] {
+        let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: {v}\n\nhi\n");
+        let err = parse(&input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 6: 'tool_calls' metadata must be a positive integer",
+            "value: {v:?}"
+        );
+    }
+}
+
+#[test]
+fn tool_calls_on_non_assistant_header_rejected() {
+    let input = "**User** | 2026-11-22 14:30\n\nq\n\n---\n**User** | tool_calls: 1\n\nhi\n";
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'tool_calls' metadata is only allowed on **Assistant** headers"
+    );
+}
+
+#[test]
+fn tool_calls_empty_body_rejected() {
+    let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: 2\n\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 7: expected 2 tool call blocks at the end of the section; found fewer"
+    );
+}
+
+#[test]
+fn tool_calls_fewer_blocks_than_tag_rejected() {
+    let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: 2\n\n{}", tc_block("a", "c1", "{}"));
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 15: expected 2 tool call blocks at the end of the section; found fewer"
+    );
+}
+
+#[test]
+fn tool_call_block_missing_closer_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n<details>\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\n~~~~json\n{{}}\n~~~~\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 13: expected a closing '</details>' line to end the tool call block"
+    );
+}
+
+#[test]
+fn tool_call_block_missing_fence_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n<details>\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\nnot a fence\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 13: malformed tool call block; expected a tilde-fenced arguments block"
+    );
+}
+
+#[test]
+fn tool_call_block_missing_summary_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n<details>\n\n~~~~json\n{{}}\n~~~~\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 14: malformed tool call block; expected a Tool Call summary line"
+    );
+}
+
+#[test]
+fn tool_call_block_missing_opening_tag_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\n~~~~json\n{{}}\n~~~~\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 8: malformed tool call block; expected an opening '<details>' line"
+    );
+}
+
+#[test]
+fn tool_call_block_invalid_summary_rejected() {
+    // An empty name fails the summary grammar, so the block is malformed.
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 1\n\n<details>\n<summary>Tool Call: <code></code> (<code>c1</code>)</summary>\n\n~~~~json\n{{}}\n~~~~\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 15: malformed tool call block; expected a Tool Call summary line"
+    );
 }

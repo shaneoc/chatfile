@@ -18,7 +18,9 @@ use futures::StreamExt;
 use serde_json::{json, Value as Json};
 
 use crate::context;
-use crate::llm::{AssistantTurn, Client, Message, StreamDelta, ToolCall, ToolFunction};
+use crate::llm::{
+    AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
+};
 use crate::parser;
 use crate::sandbox::{self, SandboxPolicy};
 
@@ -687,11 +689,12 @@ async fn bash(args: &Json, config: &ToolConfig) -> String {
 // ---------------------------------------------------------------------------
 
 /// Build the persisted form of a tool result turn (`**Tool**` with `tool:`
-/// and `id:` meta tags, `<details>` body).
-pub fn tool_turn(name: &str, id: &str, arguments: &str, output: &str) -> parser::Turn {
+/// and `id:` meta tags, `<details><summary>Output</summary>` body). The
+/// call's name/id/arguments live on the issuing assistant turn, not here.
+pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
     parser::Turn {
         role: parser::Role::Tool,
-        content: parser::tool_turn_body(name, arguments, output),
+        content: parser::tool_turn_body(output),
         meta: parser::TurnMeta {
             timestamp: Some(parser::now_timestamp()),
             tags: vec![
@@ -700,18 +703,30 @@ pub fn tool_turn(name: &str, id: &str, arguments: &str, output: &str) -> parser:
             ],
         },
         reasoning: None,
+        tool_calls: Vec::new(),
     }
 }
 
 /// Build the persisted form of an assistant response: the visible answer,
 /// plus — when there is reasoning — a `thinking: true` header tag and the
 /// reasoning carried in [`parser::Turn::reasoning`] (serialized as a
-/// collapsible `<details><summary>Thinking</summary>` block).
-pub fn assistant_turn(model: &str, reasoning: &str, content: &str) -> parser::Turn {
+/// collapsible `<details><summary>Thinking</summary>` block), and — when
+/// tool calls were issued — a `tool_calls: <N>` header tag and the calls
+/// carried in [`parser::Turn::tool_calls`] (serialized as trailing Tool
+/// Call blocks).
+pub fn assistant_turn(
+    model: &str,
+    reasoning: &str,
+    content: &str,
+    tool_calls: &[CompletedToolCall],
+) -> parser::Turn {
     let has_reasoning = !reasoning.trim().is_empty();
     let mut tags = vec![("model".to_string(), model.to_string())];
     if has_reasoning {
         tags.push(("thinking".to_string(), "true".to_string()));
+    }
+    if !tool_calls.is_empty() {
+        tags.push(("tool_calls".to_string(), tool_calls.len().to_string()));
     }
     parser::Turn {
         role: parser::Role::Assistant,
@@ -721,6 +736,14 @@ pub fn assistant_turn(model: &str, reasoning: &str, content: &str) -> parser::Tu
             tags,
         },
         reasoning: has_reasoning.then(|| reasoning.trim().to_string()),
+        tool_calls: tool_calls
+            .iter()
+            .map(|c| parser::AssistantToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -765,7 +788,12 @@ pub enum LoopEvent {
     Content(String),
     /// The current assistant response has ended — either before tool
     /// execution or as the final response of the turn.
-    ResponseEnd,
+    ResponseEnd {
+        /// The calls the response issued (ids normalized), so the caller
+        /// can persist them on the assistant turn even when execution is
+        /// interrupted before every result arrives.
+        tool_calls: Vec<CompletedToolCall>,
+    },
     /// A tool call has been executed; the fields describe the persisted
     /// result.
     ToolResult {
@@ -814,10 +842,31 @@ pub async fn run_turn(
                 return Ok(());
             }
         }
-        if !on_event(&LoopEvent::ResponseEnd) {
+        // Normalize the calls first: servers that omit the id would break
+        // the follow-up request (and the persisted pairing), so generate
+        // one. The normalized list rides on `ResponseEnd` so the caller
+        // can persist it on the assistant turn even when execution is
+        // interrupted before every result arrives.
+        let calls: Vec<CompletedToolCall> = turn
+            .tool_calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| CompletedToolCall {
+                id: if c.id.is_empty() {
+                    format!("call_gen_{i}")
+                } else {
+                    c.id.clone()
+                },
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            })
+            .collect();
+        if !on_event(&LoopEvent::ResponseEnd {
+            tool_calls: calls.clone(),
+        }) {
             return Ok(());
         }
-        if turn.tool_calls.is_empty() {
+        if calls.is_empty() {
             return Ok(());
         }
 
@@ -827,16 +876,9 @@ pub async fn run_turn(
             "assistant",
             (!turn.content.trim().is_empty()).then(|| turn.content.clone()),
         );
-        for (i, c) in turn.tool_calls.iter().enumerate() {
-            // Servers that omit the id would break the follow-up request;
-            // generate one so the pairing stays intact.
-            let id = if c.id.is_empty() {
-                format!("call_gen_{i}")
-            } else {
-                c.id.clone()
-            };
+        for c in &calls {
             assistant.tool_calls.push(ToolCall {
-                id: id.clone(),
+                id: c.id.clone(),
                 call_type: "function".to_string(),
                 function: ToolFunction {
                     name: c.name.clone(),
@@ -845,22 +887,17 @@ pub async fn run_turn(
             });
         }
         messages.push(assistant);
-        for (i, c) in turn.tool_calls.iter().enumerate() {
-            let id = if c.id.is_empty() {
-                format!("call_gen_{i}")
-            } else {
-                c.id.clone()
-            };
+        for c in &calls {
             let output = execute(&c.name, &c.arguments, config).await;
             if !on_event(&LoopEvent::ToolResult {
-                id: id.clone(),
+                id: c.id.clone(),
                 name: c.name.clone(),
                 arguments: c.arguments.clone(),
                 output: output.clone(),
             }) {
                 return Ok(());
             }
-            messages.push(Message::tool_result(&id, output));
+            messages.push(Message::tool_result(&c.id, output));
         }
     }
     bail!("no final reply after {MAX_TOOL_ITERATIONS} tool iterations")

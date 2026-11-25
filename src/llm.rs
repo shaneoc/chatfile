@@ -92,6 +92,46 @@ impl Message {
     }
 }
 
+/// The fixed output of a synthetic tool message standing in for a call
+/// whose execution was cancelled or interrupted before it could be
+/// persisted.
+pub const CANCELLED_TOOL_OUTPUT: &str = "Tool execution cancelled or interrupted";
+
+/// Request-prep step that turns a projected history into a valid API
+/// payload: for every assistant message, each `tool_call_id` without a
+/// matching following `role: "tool"` message gets a synthetic tool message
+/// carrying [`CANCELLED_TOOL_OUTPUT`], inserted right after the batch of
+/// real tool responses. This is the layer that repairs histories whose
+/// file was persisted mid-tool-execution; [`crate::parser::Conversation::to_messages`]
+/// itself stays a pure projection.
+pub fn complete_tool_calls(messages: &mut Vec<Message>) {
+    let mut i = 0usize;
+    while i < messages.len() {
+        if messages[i].role != "assistant" || messages[i].tool_calls.is_empty() {
+            i += 1;
+            continue;
+        }
+        // The batch of tool responses directly following the assistant
+        // message.
+        let mut j = i + 1;
+        while j < messages.len() && messages[j].role == "tool" {
+            j += 1;
+        }
+        for call in messages[i].tool_calls.clone() {
+            let answered = (i + 1..j)
+                .any(|k| messages[k].tool_call_id.as_deref() == Some(call.id.as_str()));
+            if !answered {
+                messages.insert(
+                    j,
+                    Message::tool_result(call.id.clone(), CANCELLED_TOOL_OUTPUT),
+                );
+                j += 1;
+            }
+        }
+        i = j;
+    }
+}
+
 /// Default llama.cpp endpoint.
 pub const DEFAULT_ENDPOINT: &str = "http://localhost:9000/v1/chat/completions";
 
