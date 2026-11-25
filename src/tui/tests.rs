@@ -97,11 +97,12 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
     let mut app = test_app();
     app.conv.turns.push(parser::Turn {
         role: parser::Role::Assistant,
-        content: "think\nbecause 6*9\nendthink\n\n54".into(),
+        content: "54".into(),
         meta: parser::TurnMeta {
             timestamp: Some("2026-11-23 00:00".into()),
-            tags: vec![],
+            tags: vec![("thinking".into(), "true".into())],
         },
+        reasoning: Some("because 6*9".into()),
     });
     let screen = render(&app, 80, 24).join("\n");
     assert!(screen.contains("because 6*9"));

@@ -240,10 +240,16 @@ impl Frontmatter {
 pub struct Turn {
     /// The turn's role.
     pub role: Role,
-    /// The turn body (for assistant turns, reasoning tags included).
+    /// The turn body (for assistant turns, the visible answer — the
+    /// reasoning block is carried separately in [`Turn::reasoning`]).
     pub content: String,
     /// Optional timestamp and `key: value` tags from the boundary line.
     pub meta: TurnMeta,
+    /// Assistant turns only: the model's reasoning, persisted in a
+    /// `<details><summary>Thinking</summary>` block that requires the
+    /// header tag `thinking: true`. `None` for every other turn, and for
+    /// assistant turns without the tag (whose body is verbatim content).
+    pub reasoning: Option<String>,
 }
 
 /// Structured data of a persisted `**Tool**` turn.
@@ -518,6 +524,24 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
             }
         }
     }
+    // The `thinking` tag is an assistant-only switch and must be exactly
+    // the lowercase literal `true`.
+    for (k, v) in &meta.tags {
+        if k == "thinking" {
+            if role != Role::Assistant {
+                return Err(line_error(
+                    line_no,
+                    "'thinking' metadata is only allowed on **Assistant** headers",
+                ));
+            }
+            if v != "true" {
+                return Err(line_error(
+                    line_no,
+                    "'thinking' metadata must be the literal value 'true'",
+                ));
+            }
+        }
+    }
     Ok((role, meta))
 }
 
@@ -656,10 +680,14 @@ pub fn parse(input: &str) -> Result<Conversation> {
         return Err(bad_first());
     }
 
-    let mut turns: Vec<Turn> = Vec::new();
+    // Sections are collected as raw line runs first; the `N -> 2N + 1`
+    // boundary escapes are restored per section afterwards (reasoning
+    // extraction must see the backslashes before they are stripped).
+    let mut raw_turns: Vec<(Role, TurnMeta, Vec<String>, usize)> = Vec::new();
     let mut cur_role = first_role;
     let mut cur_meta = first_meta;
     let mut cur_lines: Vec<String> = Vec::new();
+    let mut cur_start = 1usize; // body-line index of the first content line
     let mut fence = FenceTracker::default();
     fence.next_line(lines[0]); // keep the tracker in sync with the header line
 
@@ -685,7 +713,9 @@ pub fn parse(input: &str) -> Result<Conversation> {
                     ));
                 }
                 if k > 0 {
-                    cur_lines.push(restore_backslashes(lines[i], k));
+                    // Escaped content: keep the raw line; the backslashes
+                    // are restored when the section is finalized.
+                    cur_lines.push(lines[i].to_string());
                     i += 1;
                     continue;
                 }
@@ -711,14 +741,10 @@ pub fn parse(input: &str) -> Result<Conversation> {
                         ));
                     }
                     fence.next_line(lines[i + 1]); // keep the tracker in sync
-                    turns.push(Turn {
-                        role: cur_role,
-                        meta: cur_meta,
-                        content: cur_lines.join("\n").trim().to_string(),
-                    });
+                    raw_turns.push((cur_role, cur_meta, std::mem::take(&mut cur_lines), cur_start));
                     cur_role = role;
                     cur_meta = meta;
-                    cur_lines.clear();
+                    cur_start = i + 2;
                     i += 2;
                     continue;
                 }
@@ -728,7 +754,8 @@ pub fn parse(input: &str) -> Result<Conversation> {
             continue;
         }
         // A backslash-escaped code-fence line outside a fence: odd k is
-        // restored content, even k is a format error.
+        // escaped content (restored when the section is finalized), even k
+        // is a format error.
         if let Some((k, _)) = fence_backslashes(lines[i]) {
             if k % 2 == 0 {
                 return Err(line_error(
@@ -736,18 +763,38 @@ pub fn parse(input: &str) -> Result<Conversation> {
                     "even number of backslashes before a code fence; expected an odd count",
                 ));
             }
-            cur_lines.push(restore_backslashes(lines[i], k));
+            cur_lines.push(lines[i].to_string());
             i += 1;
             continue;
         }
         cur_lines.push(lines[i].to_string());
         i += 1;
     }
-    turns.push(Turn {
-        role: cur_role,
-        meta: cur_meta,
-        content: cur_lines.join("\n").trim().to_string(),
-    });
+    raw_turns.push((cur_role, cur_meta, cur_lines, cur_start));
+
+    // Finalize each section: restore boundary escapes, and for assistant
+    // turns carrying `thinking: true` split off the reasoning block (from
+    // the raw lines, before restoration).
+    let mut turns: Vec<Turn> = Vec::new();
+    for (role, meta, raw_lines, start) in raw_turns {
+        let first = first_line + start;
+        if role == Role::Assistant && meta.tags.iter().any(|(k, _)| k == "thinking") {
+            let (reasoning, content) = finalize_thinking_turn(&raw_lines, first)?;
+            turns.push(Turn {
+                role,
+                content,
+                meta,
+                reasoning: Some(reasoning),
+            });
+        } else {
+            turns.push(Turn {
+                role,
+                content: restore_boundaries(&raw_lines, first)?,
+                meta,
+                reasoning: None,
+            });
+        }
+    }
 
     conv.turns = turns;
     Ok(conv)
@@ -822,51 +869,313 @@ pub fn escape_boundaries(content: &str) -> String {
     out.concat()
 }
 
-/// The opening tag of a persisted reasoning block (line-anchored).
-pub const THINK_OPEN: &str = "think";
-/// The closing tag of a persisted reasoning block (line-anchored).
-pub const THINK_CLOSE: &str = "endthink";
+// Reasoning-block helpers live below [`escape_boundaries`].
 
-/// Split turn content into `(reasoning, answer)` at line-anchored
-/// `think` / `endthink` tags.
-///
-/// Returns `(None, content)` when no complete tag pair is present, so
-/// content that merely mentions the words is left untouched. Only the
-/// first pair is treated as reasoning; any text before it is prepended to
-/// the answer.
-pub fn split_reasoning(content: &str) -> (Option<String>, String) {
-    let lines: Vec<&str> = content.lines().collect();
-    let Some(open) = lines.iter().position(|l| l.trim() == THINK_OPEN) else {
-        return (None, content.to_string());
-    };
-    let Some(rel_close) = lines[open + 1..]
-        .iter()
-        .position(|l| l.trim() == THINK_CLOSE)
-    else {
-        return (None, content.to_string());
-    };
-    let close = open + 1 + rel_close;
-    let reasoning = lines[open + 1..close].join("\n").trim().to_string();
-    let before = lines[..open].join("\n").trim().to_string();
-    let after = lines[close + 1..].join("\n").trim().to_string();
-    let answer = match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => after,
-        (false, true) => before,
-        (false, false) => format!("{before}\n\n{after}"),
-    };
-    (Some(reasoning), answer)
+/// Restore the `N -> 2N + 1` odd-backslash boundary escapes in a run of
+/// body lines — the inverse of [`escape_boundaries`]. A line of `k >= 1`
+/// leading backslashes before `---` (directly above a line that begins
+/// with `**`) or immediately before a code fence comes back with
+/// `(k - 1) / 2` backslashes; an even count is a format error. Lines
+/// inside fenced code blocks are verbatim, exactly as
+/// [`escape_boundaries`] left them. The result is trimmed of surrounding
+/// whitespace.
+fn restore_boundaries(lines: &[String], first_line: usize) -> Result<String> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut fence = FenceTracker::default();
+    for (i, line) in lines.iter().enumerate() {
+        if fence.next_line(line) {
+            // Content inside a fenced code block: verbatim.
+            out.push(line.clone());
+            continue;
+        }
+        if let Some(k) = hr_backslashes(line) {
+            let next_role = i + 1 < lines.len() && lines[i + 1].starts_with("**");
+            if next_role {
+                if k % 2 == 0 {
+                    return Err(line_error(
+                        first_line + i,
+                        "even number of backslashes before '---'; expected an odd count",
+                    ));
+                }
+                if k > 0 {
+                    out.push(restore_backslashes(line, k));
+                    continue;
+                }
+            }
+        } else if let Some((k, _)) = fence_backslashes(line) {
+            if k % 2 == 0 {
+                return Err(line_error(
+                    first_line + i,
+                    "even number of backslashes before a code fence; expected an odd count",
+                ));
+            }
+            out.push(restore_backslashes(line, k));
+            continue;
+        }
+        out.push(line.clone());
+    }
+    Ok(out.join("\n").trim().to_string())
 }
 
-/// Format reasoning plus answer into the canonical persisted form:
-/// `think` / `endthink` tags around the reasoning, a blank line, then the
-/// answer. With no reasoning, just the (trimmed) answer.
-pub fn with_reasoning(reasoning: Option<&str>, answer: &str) -> String {
-    let answer = answer.trim();
-    match reasoning.map(str::trim).filter(|r| !r.is_empty()) {
-        Some(r) => format!("{THINK_OPEN}\n{r}\n{THINK_CLOSE}\n\n{answer}"),
-        None => answer.to_string(),
+/// Escape stray `<details>` / `</details>` tags in persisted reasoning so
+/// the block a later parse extracts is exactly this text.
+///
+/// A single forward pass tracks fenced code blocks and inline backtick
+/// spans; details tags are matched case-insensitively outside both. An
+/// already-backslashed tag (with `k >= 1` leading backslashes) is rewritten
+/// with `2 * k + 1` backslashes (`N -> 2N + 1`, no stack effect); an
+/// unescaped opener is remembered; an unescaped closer pops the stack when
+/// a matching opener exists (the nested pair stays untouched) or gets one
+/// backslash prepended when it does not. Openers left on the stack at the
+/// end (unmatched within the reasoning) also get one backslash prepended.
+/// Edits are applied in descending byte-offset order; the mapping is the
+/// exact inverse of the restoration performed by
+/// [`finalize_thinking_turn`].
+pub fn escape_details_tags(text: &str) -> String {
+    let mut out = text.to_string();
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut open_stack: Vec<usize> = Vec::new();
+    let mut fence = FenceTracker::default();
+    let mut base = 0usize;
+    for line in text.split_inclusive('\n') {
+        let l = match line.strip_suffix('\n') {
+            Some(l) => l,
+            None => line,
+        };
+        let was_open = fence.char.is_some();
+        let in_fence = fence.next_line(l);
+        let now_open = fence.char.is_some();
+        if in_fence || was_open != now_open {
+            // Fenced content or a fence delimiter line: untouched.
+            base += line.len();
+            continue;
+        }
+        for (p, is_closer, k) in details_tags_in_line(l) {
+            let abs = base + p;
+            if k > 0 {
+                // Rewrite the backslash run itself: N -> 2N + 1.
+                edits.push((abs - k, k, "\\".repeat(2 * k + 1)));
+            } else if is_closer {
+                if open_stack.pop().is_none() {
+                    edits.push((abs, 0, "\\".to_string()));
+                }
+            } else {
+                open_stack.push(abs);
+            }
+        }
+        base += line.len();
     }
+    for &off in &open_stack {
+        edits.push((off, 0, "\\".to_string()));
+    }
+    edits.sort_by(|a, b| b.0.cmp(&a.0));
+    for (start, len, rep) in edits {
+        out.replace_range(start..start + len, &rep);
+    }
+    out
+}
+
+/// The byte ranges of inline backtick code spans in `line`: a run of N
+/// backticks opens a span closed by the next run of exactly N backticks;
+/// an unclosed run extends to the end of the line.
+fn inline_code_spans(line: &str) -> Vec<(usize, usize)> {
+    let b = line.as_bytes();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let run = b[i..].iter().take_while(|&&c| c == b'`').count();
+        let mut j = i + run;
+        let mut closed: Option<usize> = None;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let r2 = b[j..].iter().take_while(|&&c| c == b'`').count();
+                if r2 == run {
+                    closed = Some(j + r2);
+                    break;
+                }
+                j += r2;
+            } else {
+                j += 1;
+            }
+        }
+        match closed {
+            Some(end) => {
+                spans.push((start, end));
+                i = end;
+            }
+            None => {
+                spans.push((start, b.len()));
+                break;
+            }
+        }
+    }
+    spans
+}
+
+/// The details tags in `line` outside inline code spans, as
+/// `(byte offset of '<', is_closer, leading backslashes)`.
+///
+/// An opener is `<details` (no whitespace between `<` and `details`)
+/// followed by `>` or by attributes before `>`; a closer is `</details`
+/// followed only by optional whitespace before `>`. Matching is
+/// case-insensitive; `< details>` and `</ details>` are not tags.
+fn details_tags_in_line(line: &str) -> Vec<(usize, bool, usize)> {
+    let spans = inline_code_spans(line);
+    let in_span = |p: usize| spans.iter().any(|&(s, e)| p >= s && p < e);
+    let lower = line.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut out: Vec<(usize, bool, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i + 8 <= b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"</details") && !in_span(i) {
+            if let Some(gt) = line[i + 9..].find('>') {
+                let between = &line[i + 9..i + 9 + gt];
+                if between.bytes().all(|c| c.is_ascii_whitespace()) {
+                    out.push((i, true, backslash_run(line, i)));
+                    i += 9;
+                    continue;
+                }
+            }
+        } else if b[i..].starts_with(b"<details") && !in_span(i) {
+            if let Some(gt) = line[i + 8..].find('>') {
+                let between = &line[i + 8..i + 8 + gt];
+                if between.is_empty()
+                    || between.bytes().next().map_or(false, |c| c.is_ascii_whitespace())
+                {
+                    out.push((i, false, backslash_run(line, i)));
+                    i += 8;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The number of consecutive backslashes ending immediately before byte
+/// position `pos` in `line`.
+fn backslash_run(line: &str, pos: usize) -> usize {
+    let b = line.as_bytes();
+    let mut k = 0usize;
+    let mut j = pos;
+    while j > 0 && b[j - 1] == b'\\' {
+        j -= 1;
+        k += 1;
+    }
+    k
+}
+
+/// Finalize an assistant section whose header carries `thinking: true`:
+/// split the raw body lines into the reasoning block and the visible
+/// content, restoring boundary escapes in each piece.
+///
+/// The trimmed body must begin with a bare `<details>` line immediately
+/// followed by a bare `<summary>Thinking</summary>` line. The scan then
+/// tracks fenced code blocks and inline backtick spans; an unescaped
+/// `<details…>` opens a level, an unescaped `</details…>` closes one, and
+/// the wrapper ends at the first closer that returns the depth to zero,
+/// which must be a bare `</details>` line. Backslashes immediately before
+/// a details tag must come in odd counts (the inverse of the `N -> 2N + 1`
+/// escape applied by [`escape_details_tags`]); `(k - 1) / 2` are restored.
+fn finalize_thinking_turn(raw_lines: &[String], first_line: usize) -> Result<(String, String)> {
+    // The first non-blank line must be the bare opening tag.
+    let mut s = 0usize;
+    while s < raw_lines.len() && raw_lines[s].trim().is_empty() {
+        s += 1;
+    }
+    if s >= raw_lines.len() || raw_lines[s].trim() != "<details>" {
+        return Err(line_error(
+            first_line + s.min(raw_lines.len().saturating_sub(1)),
+            "expected a bare '<details>' line to open the reasoning block",
+        ));
+    }
+    if s + 1 >= raw_lines.len() || raw_lines[s + 1].trim() != "<summary>Thinking</summary>" {
+        return Err(line_error(
+            first_line + (s + 1).min(raw_lines.len().saturating_sub(1)),
+            "expected a bare '<summary>Thinking</summary>' line after the opening tag",
+        ));
+    }
+
+    let mut fence = FenceTracker::default();
+    let mut depth = 1usize;
+    let mut reason_lines: Vec<String> = Vec::new();
+    let mut i = s + 2;
+    let mut close_at: Option<usize> = None;
+    while i < raw_lines.len() {
+        let line = &raw_lines[i];
+        let was_open = fence.char.is_some();
+        let in_fence = fence.next_line(line);
+        let now_open = fence.char.is_some();
+        if in_fence || was_open != now_open {
+            // Fenced content or a fence delimiter line: part of the
+            // reasoning, never a details tag.
+            reason_lines.push(line.clone());
+            i += 1;
+            continue;
+        }
+        let mut edits: Vec<(usize, usize, String)> = Vec::new();
+        let mut closes = false;
+        for (p, is_closer, k) in details_tags_in_line(line) {
+            if k >= 2 && k % 2 == 0 {
+                return Err(line_error(
+                    first_line + i,
+                    "even number of backslashes before a <details> tag; expected an odd count",
+                ));
+            }
+            if k > 0 {
+                // Escaped tag: restore `(k - 1) / 2` backslashes; the tag
+                // is inert and does not affect the depth.
+                edits.push((p - k, k, "\\".repeat((k - 1) / 2)));
+            } else if is_closer {
+                depth -= 1;
+                if depth == 0 {
+                    if line.trim() != "</details>" {
+                        return Err(line_error(
+                            first_line + i,
+                            "a closing '</details>' must stand alone on its own line",
+                        ));
+                    }
+                    closes = true;
+                    break;
+                }
+            } else {
+                depth += 1;
+            }
+        }
+        let mut t = line.clone();
+        edits.sort_by(|a, b| b.0.cmp(&a.0));
+        for (start, len, rep) in &edits {
+            t.replace_range(*start..*start + *len, rep);
+        }
+        if closes {
+            close_at = Some(i);
+            break;
+        }
+        reason_lines.push(t);
+        i += 1;
+    }
+    let Some(close_at) = close_at else {
+        return Err(line_error(
+            first_line + raw_lines.len().saturating_sub(1),
+            "unclosed reasoning block; expected a closing '</details>' line",
+        ));
+    };
+
+    // Each piece is restored independently: the wrapper lines separate the
+    // pieces, so no boundary collision can straddle them.
+    let reasoning = restore_boundaries(&reason_lines, first_line + s + 2)?;
+    let content = restore_boundaries(&raw_lines[close_at + 1..], first_line + close_at + 1)?;
+    Ok((reasoning, content))
 }
 
 /// Serialize a [`Conversation`] back to canonical Markdown.
@@ -928,11 +1237,49 @@ pub fn to_markdown(conv: &Conversation) -> String {
             out.push_str(&format!(" | {meta}"));
         }
         out.push_str("\n\n");
-        out.push_str(&escape_boundaries(t.content.trim()));
+        out.push_str(&render_turn_body(t));
         out.push('\n');
     }
 
     out
+}
+
+/// The persisted body of a turn: the visible content, or — for an
+/// assistant turn with non-empty reasoning — the collapsible Thinking
+/// block ahead of it:
+///
+/// ```markdown
+/// <details>
+/// <summary>Thinking</summary>
+///
+/// {reasoning}
+///
+/// </details>
+///
+/// {answer}
+///
+/// ```
+///
+/// (the trailing blank line and answer are omitted when the answer is
+/// empty). Boundary-colliding lines in each piece are escaped (see
+/// [`escape_boundaries`]); stray details tags inside the reasoning are
+/// escaped by [`escape_details_tags`].
+pub fn render_turn_body(t: &Turn) -> String {
+    let answer = t.content.trim();
+    match t.reasoning.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => {
+            let escaped_r = escape_boundaries(&escape_details_tags(r));
+            if answer.is_empty() {
+                format!("<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>")
+            } else {
+                format!(
+                    "<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>\n\n{}",
+                    escape_boundaries(answer)
+                )
+            }
+        }
+        None => escape_boundaries(answer),
+    }
 }
 
 fn key(s: &str) -> serde_yaml::Value {

@@ -512,16 +512,21 @@ fn tool_turn_helper_builds_persistable_turn() {
 }
 
 #[test]
-fn assistant_turn_helper_wraps_reasoning() {
+fn assistant_turn_helper_sets_reasoning_field() {
     let turn = assistant_turn("m1", "thinking hard", "the answer");
     assert_eq!(turn.role, parser::Role::Assistant);
-    assert_eq!(
-        turn.content,
-        "think\nthinking hard\nendthink\n\nthe answer"
-    );
-    // Empty reasoning is omitted.
+    assert_eq!(turn.content, "the answer");
+    assert_eq!(turn.reasoning.as_deref(), Some("thinking hard"));
+    assert!(turn
+        .meta
+        .tags
+        .iter()
+        .any(|(k, v)| k == "thinking" && v == "true"));
+    // Empty reasoning is omitted (no tag, no field).
     let turn = assistant_turn("m1", "  ", "just");
     assert_eq!(turn.content, "just");
+    assert_eq!(turn.reasoning, None);
+    assert!(!turn.meta.tags.iter().any(|(k, _)| k == "thinking"));
 }
 
 #[test]

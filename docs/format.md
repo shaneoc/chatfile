@@ -104,7 +104,7 @@ serializes as an empty `---\n---\n`.
 | ----------- | -------------------------------------------------------------- |
 | `System`    | Per-file system instructions; first section only; folded into the single leading system message, never sent as conversation content. |
 | `User`      | A user prompt.                                                 |
-| `Assistant` | A model reply (reasoning tags may be embedded, see §3.4).     |
+| `Assistant` | A model reply (reasoning is persisted in a collapsible block, see §3.4). |
 | `Tool`      | A persisted tool result (§3.3).                                |
 
 Role names in headers are matched case-insensitively and tolerate surrounding
@@ -153,8 +153,19 @@ Each non-timestamp segment is `key: value`:
 - An empty value is allowed (`flag:` or `flag: ` parses as key `flag` with an
   empty value).
 - Tag order is preserved. Well-known tags: `model` (which model produced the
-  turn) and, on `**Tool**` turns, `tool` (the tool name) and `id` (the tool
-  call id — required for the turn to be well-formed, §3.3).
+  turn), `thinking` (assistant-only switch for the collapsible reasoning
+  block — see below and §3.4), and, on `**Tool**` turns, `tool` (the tool
+  name) and `id` (the tool call id — required for the turn to be well-formed,
+  §3.3).
+
+The `thinking` tag is special:
+
+- It is **only allowed on `**Assistant**` headers**; on any other role it is a
+  header-format error (§4.3).
+- Its value must be **exactly the lowercase literal `true`**; anything else
+  (`false`, `True`, empty, …) is a header-format error (§4.3).
+- When present, the turn's body must carry the collapsible reasoning block of
+  §3.4; when absent, the whole body is verbatim content (no reasoning).
 
 ### 2.3 Whitespace handling
 
@@ -313,27 +324,69 @@ always valid API payloads. **Malformed tool turns are skipped entirely** —
 they produce neither a tool message nor a tool call, and the conversation
 remains usable.
 
-### 3.4 Reasoning blocks (`think` / `endthink`)
+### 3.4 Reasoning blocks (`thinking: true`)
 
-Assistant turns from thinking models persist their reasoning inline:
+Assistant turns from thinking models persist their reasoning in a collapsible
+`<details>` block. The `**Assistant**` header must carry the tag
+`thinking: true` (exactly lowercase, §2.2); **without the tag the whole body
+is verbatim content**, even if it looks exactly like a wrapper.
+
+Canonical form (reasoning followed by a visible answer):
 
 ```markdown
-think
-step one
-step two
-endthink
+**Assistant** | 2026-11-23 22:42 | model: local-model | thinking: true
 
-the answer
+<details>
+<summary>Thinking</summary>
+
+{reasoning}
+
+</details>
+
+{answer}
 ```
 
-- The tags are **line-anchored**: a line that trims to exactly `think` opens
-  the block, and the next line that trims to exactly `endthink` closes it.
-  Only the first complete pair is treated as reasoning; text before it is
-  prepended to the answer (joined with a blank line), text after follows.
-- An unclosed `think`, or the words appearing mid-line, are left untouched —
-  the content is returned as-is with no reasoning.
-- The serializer emits reasoning as `think\n{reasoning}\nendthink\n\n{answer}`
-  and omits the tags entirely when there is no reasoning.
+When the answer is empty, the trailing blank line and the answer are omitted —
+the body ends at the `</details>` line.
+
+**Serialization.** The wrapper is emitted only when the reasoning is non-empty
+after trimming. Each piece (reasoning, answer) is escaped **independently**
+for boundary collisions (§3.2), so fence state never leaks from one piece into
+the other. Stray details tags inside the reasoning are additionally escaped so
+a later parse extracts exactly this text:
+
+- Tag matching is **case-insensitive** and happens only **outside** fenced
+  code blocks and inline backtick spans (a run of N backticks opens a span
+  closed by the next run of exactly N; an unclosed run extends to end of
+  line). An *opener* is `<details` — no whitespace between `<` and `details` —
+  followed by `>` or by attributes before `>`; a *closer* is `</details`
+  followed only by optional whitespace before `>`. `< details>` and
+  `</ details>` are not tags.
+- A tag already preceded by `k >= 1` backslashes is rewritten with `2 * k + 1`
+  backslashes (the same bijective rule as §3.2) and has **no effect on the
+  nesting stack**.
+- An unescaped opener is remembered; an unescaped closer pops the stack when a
+  matching opener exists (a matched nested pair is left untouched) or gets one
+  backslash prepended when it does not. Openers still on the stack at the end
+  of the reasoning also get one backslash prepended.
+
+**Parsing** (only for `**Assistant**` sections carrying `thinking: true`):
+
+- The **first non-blank line** of the body must trim to exactly `<details>`
+  (lowercase), immediately followed by a line that trims to exactly
+  `<summary>Thinking</summary>`; otherwise a line-numbered error (§4.4).
+- A forward scan from there tracks fenced code blocks and inline backtick
+  spans, starting at depth 1: an unescaped opener increments the depth, an
+  unescaped closer decrements it. The wrapper ends at the first closer that
+  brings the depth to zero, and that line must trim to exactly `</details>`
+  (lowercase) — a closer sharing its line with other text, or carrying
+  attributes/whitespace before `>`, is an error (§4.4).
+- Backslashes immediately before a details tag inside the reasoning must come
+  in an **odd** count `k >= 1`; `(k - 1) / 2` are restored (the inverse of the
+  serializer's rewrite). An even count is an error (§4.4).
+- The lines between the summary line and the closing line (boundary escapes
+  restored, §3.2) are the **reasoning**; the lines after the closing line
+  (trimmed, escapes restored) are the **visible content**.
 
 ---
 
@@ -387,8 +440,23 @@ content and never triggers them.
 | `line N: invalid header metadata; expected a timestamp or 'key: value'` | A segment is neither timestamp-shaped nor contains a colon — a bare word without a key prefix. | `**User** \| 2026-11-23 22:42 \| note` |
 | `line N: invalid header; expected a bold role like **User**` | Defensive: a line in header position lacks the opening or closing `**`. (Unreachable through `parse()`, which pre-checks the role prefix, but part of the strict parser's contract.) | — |
 | `line N: unknown role in header: <text>` | Defensive: the bolded text is not one of System/User/Assistant/Tool. (Same reachability note.) | — |
+| `line N: 'thinking' metadata is only allowed on **Assistant** headers` | A `thinking:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| thinking: true` |
+| `line N: 'thinking' metadata must be the literal value 'true'` | The `thinking` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| thinking: false` |
 
-### 4.4 What is *not* an error
+### 4.4 Reasoning-block errors
+
+All of these apply to a `**Assistant**` section whose header carries
+`thinking: true` (§3.4). N is the offending physical line.
+
+| Error message | Condition | Example (invalid) |
+| ------------- | --------- | ----------------- |
+| `line N: expected a bare '<details>' line to open the reasoning block` | The first non-blank body line does not trim to exactly `<details>` (lowercase — e.g. `<DETAILS>`). | `**Assistant** \| thinking: true\n\n<DETAILS>\n<summary>Thinking</summary>\n…` |
+| `line N: expected a bare '<summary>Thinking</summary>' line after the opening tag` | The line after the opening tag does not trim to exactly `<summary>Thinking</summary>` (wrong case or extra text). | `**Assistant** \| thinking: true\n\n<details>\n<summary>thinking</summary>\n…` |
+| `line N: a closing '</details>' must stand alone on its own line` | A closer that brings the nesting depth to zero shares its line with other text, or carries attributes/whitespace before `>`. | `**Assistant** \| thinking: true\n\n<details>\n<summary>Thinking</summary>\n\nr\n\n</details >` |
+| `line N: even number of backslashes before a <details> tag; expected an odd count` | An even count `k >= 2` of backslashes immediately before a details tag inside the reasoning. Odd counts restore `(k - 1) / 2` (§3.4). | `**Assistant** \| thinking: true\n\n<details>\n<summary>Thinking</summary>\n\n\\</details>` |
+| `line N: unclosed reasoning block; expected a closing '</details>' line` | No closer brings the depth to zero before the end of the section. N points at the section's last line. | `**Assistant** \| thinking: true\n\n<details>\n<summary>Thinking</summary>\n\nreasoning…` |
+
+### 4.5 What is *not* an error
 
 - **Unknown frontmatter keys** — ignored on parse.
 - **A `---` whose next line does not begin with `**`** — plain content (a Markdown horizontal rule inside the message).
@@ -398,6 +466,7 @@ content and never triggers them.
 - **Role-looking lines without a preceding rule** (and not the first body line) — plain content.
 - **Escaped collision lines** — odd-backslash `\---`-style lines and backslashed fence lines are content; the parser restores the original backslashes (§3.2).
 - **Malformed tool turns** (missing `tool:`/`id:` tags, or a missing output fence) — the file still parses; the turn is skipped when building API messages (§3.3).
+- **An assistant body that looks like a Thinking wrapper but whose header lacks `thinking: true`** — the whole body is verbatim content; no reasoning is extracted and no §4.4 error fires.
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
 - **Trailing whitespace** on header lines, and CRLF line endings in general.
 

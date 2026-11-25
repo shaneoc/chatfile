@@ -268,8 +268,13 @@ impl App {
             if t.role == parser::Role::Tool {
                 push_tool_turn(&mut lines, t);
             } else {
-                let (reason, answer) = parser::split_reasoning(&t.content);
-                push_turn(&mut lines, t.role, &t.meta, reason.as_deref(), &answer);
+                push_turn(
+                    &mut lines,
+                    t.role,
+                    &t.meta,
+                    t.reasoning.as_deref(),
+                    &t.content,
+                );
             }
             lines.push(Line::default());
         }
@@ -663,6 +668,7 @@ async fn submit(
             timestamp: Some(ts),
             tags: vec![],
         },
+        reasoning: None,
     };
     tools::append_turn(&app.path, &user_turn)?;
     app.conv.turns.push(user_turn);

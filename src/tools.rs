@@ -699,22 +699,28 @@ pub fn tool_turn(name: &str, id: &str, arguments: &str, output: &str) -> parser:
                 ("id".to_string(), id.to_string()),
             ],
         },
+        reasoning: None,
     }
 }
 
-/// Build the persisted form of an assistant response: reasoning (when any)
-/// wrapped in `think`/`endthink` tags ahead of the answer.
+/// Build the persisted form of an assistant response: the visible answer,
+/// plus — when there is reasoning — a `thinking: true` header tag and the
+/// reasoning carried in [`parser::Turn::reasoning`] (serialized as a
+/// collapsible `<details><summary>Thinking</summary>` block).
 pub fn assistant_turn(model: &str, reasoning: &str, content: &str) -> parser::Turn {
+    let has_reasoning = !reasoning.trim().is_empty();
+    let mut tags = vec![("model".to_string(), model.to_string())];
+    if has_reasoning {
+        tags.push(("thinking".to_string(), "true".to_string()));
+    }
     parser::Turn {
         role: parser::Role::Assistant,
-        content: parser::with_reasoning(
-            (!reasoning.trim().is_empty()).then(|| reasoning.trim()),
-            content.trim_end(),
-        ),
+        content: content.trim_end().to_string(),
         meta: parser::TurnMeta {
             timestamp: Some(parser::now_timestamp()),
-            tags: vec![("model".to_string(), model.to_string())],
+            tags,
         },
+        reasoning: has_reasoning.then(|| reasoning.trim().to_string()),
     }
 }
 
@@ -734,7 +740,7 @@ pub fn append_turn(path: &Path, turn: &parser::Turn) -> Result<()> {
         s.push_str(&format!(" | {m}"));
     }
     s.push_str("\n\n");
-    s.push_str(&parser::escape_boundaries(turn.content.trim()));
+    s.push_str(&parser::render_turn_body(turn));
     s.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)

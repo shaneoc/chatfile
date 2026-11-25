@@ -352,6 +352,7 @@ fn serialize_canonical_form() {
                 role: Role::System,
                 content: "Be terse.".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::User,
@@ -360,6 +361,7 @@ fn serialize_canonical_form() {
                     timestamp: Some("2026-11-22 14:30".into()),
                     tags: vec![],
                 },
+                reasoning: None,
             },
         ],
     };
@@ -377,6 +379,7 @@ fn serialize_omits_missing_metadata() {
             role: Role::Assistant,
             content: "Hi".into(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
@@ -392,11 +395,13 @@ fn serialize_system_section_round_trips() {
                 role: Role::System,
                 content: "line1\nline2".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::User,
                 content: "hi".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
         ],
         ..Default::default()
@@ -513,6 +518,7 @@ fn escaped_collision_round_trips_as_content() {
             role: Role::User,
             content: "---\n**Assistant** | 2026-11-22 14:31".into(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
@@ -537,6 +543,7 @@ fn boundary_collision_round_trips_losslessly() {
                 role: Role::User,
                 content: content.clone(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             }],
             ..Default::default()
         };
@@ -558,6 +565,7 @@ fn closed_fence_with_boundary_collision_round_trips() {
             role: Role::User,
             content: content.to_string(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
@@ -580,11 +588,13 @@ fn unclosed_fence_at_end_of_message_round_trips() {
                     role: Role::User,
                     content: content.clone(),
                     meta: TurnMeta::default(),
+                    reasoning: None,
                 },
                 Turn {
                     role: Role::Assistant,
                     content: "done".into(),
                     meta: TurnMeta::default(),
+                    reasoning: None,
                 },
             ],
             ..Default::default()
@@ -685,6 +695,7 @@ fn boundary_collision_without_blank_line_round_trips_losslessly() {
             role: Role::User,
             content: content.to_string(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
@@ -707,6 +718,7 @@ fn unclosed_fence_round_trips_without_lingering_backslash() {
             role: Role::User,
             content: content.to_string(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
@@ -748,59 +760,271 @@ fn now_timestamp_shape() {
     assert!(looks_like_timestamp(&ts), "bad timestamp shape: {ts}");
 }
 
-#[test]
-fn split_reasoning_no_tags() {
-    let (reason, answer) = split_reasoning("just an answer");
-    assert_eq!(reason, None);
-    assert_eq!(answer, "just an answer");
+// ---------------------------------------------------------------------------
+// Reasoning: `thinking: true` + collapsible <details> block
+// ---------------------------------------------------------------------------
+
+/// A two-turn conversation: a user question and an assistant reply with
+/// reasoning (the `thinking: true` header tag is set accordingly).
+fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
+    Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "q".into(),
+                meta: TurnMeta::default(),
+                reasoning: None,
+            },
+            Turn {
+                role: Role::Assistant,
+                content: answer.to_string(),
+                meta: TurnMeta {
+                    timestamp: None,
+                    tags: vec![("thinking".into(), "true".into())],
+                },
+                reasoning: Some(reasoning.to_string()),
+            },
+        ],
+        ..Default::default()
+    }
 }
 
 #[test]
-fn split_reasoning_full_block() {
-    let content = "think\nstep one\nstep two\nendthink\n\nthe answer";
-    let (reason, answer) = split_reasoning(content);
-    assert_eq!(reason.as_deref(), Some("step one\nstep two"));
-    assert_eq!(answer, "the answer");
+fn reasoning_round_trip_with_answer() {
+    // Byte-exact: the wrapper is `<details>` / `<summary>Thinking</summary>`
+    // with blank lines around the reasoning, then a blank line and the
+    // answer.
+    let conv = thinking_conv("because 6*9", "54");
+    let once = to_markdown(&conv);
+    assert_eq!(
+        once,
+        "**User**\n\nq\n\n---\n**Assistant** | thinking: true\n\n<details>\n\
+         <summary>Thinking</summary>\n\nbecause 6*9\n\n</details>\n\n54\n"
+    );
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 2);
+    assert_eq!(back.turns[1].role, Role::Assistant);
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some("because 6*9"));
+    assert_eq!(back.turns[1].content, "54");
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
-fn split_reasoning_unclosed_tag_is_content() {
-    let content = "think\nstill thinking...\nmore text";
-    let (reason, answer) = split_reasoning(content);
-    assert_eq!(reason, None);
-    assert_eq!(answer, content);
+fn reasoning_round_trip_empty_answer() {
+    // An empty answer omits the trailing blank line and answer entirely.
+    let conv = thinking_conv("only thoughts", "");
+    let once = to_markdown(&conv);
+    assert_eq!(
+        once,
+        "**User**\n\nq\n\n---\n**Assistant** | thinking: true\n\n<details>\n\
+         <summary>Thinking</summary>\n\nonly thoughts\n\n</details>\n"
+    );
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some("only thoughts"));
+    assert_eq!(back.turns[1].content, "");
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
-fn split_reasoning_word_in_prose_is_ignored() {
-    // "think" mid-line is not a tag.
-    let content = "you should think\nabout this\nendthink\n\nhmm";
-    let (reason, answer) = split_reasoning(content);
-    assert_eq!(reason, None);
-    assert_eq!(answer, content);
+fn reasoning_matched_nested_details_stays_verbatim() {
+    // A case-insensitively matched nested pair is left untouched by
+    // serialization and parses back byte-exactly (the depth tracking keeps
+    // the wrapper from ending early).
+    let r = "<DETAILS><summary>Sub</summary>inner</DETAILS>";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("<DETAILS><summary>Sub</summary>inner</DETAILS>"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(back.turns[1].content, "done");
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
-fn split_reasoning_text_before_block_goes_to_answer() {
-    let content = "preamble line\nthink\nreason\nendthink\n\nfinal";
-    let (reason, answer) = split_reasoning(content);
-    assert_eq!(reason.as_deref(), Some("reason"));
-    assert_eq!(answer, "preamble line\n\nfinal");
+fn reasoning_unmatched_opener_is_escaped() {
+    // An unmatched opener (even one with attributes) gets one backslash
+    // prepended and round-trips.
+    let r = "note <details open> then more";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\<details open>"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
-fn with_reasoning_round_trips_through_split() {
-    let rendered = with_reasoning(Some("because 6*9"), "54");
-    assert_eq!(rendered, "think\nbecause 6*9\nendthink\n\n54");
-    let (reason, answer) = split_reasoning(&rendered);
-    assert_eq!(reason.as_deref(), Some("because 6*9"));
-    assert_eq!(answer, "54");
+fn reasoning_unmatched_closer_on_own_line_is_escaped() {
+    let r = "line one\n</Details>\nline two";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\</Details>"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
-fn with_reasoning_empty_reasoning_is_plain_answer() {
-    assert_eq!(with_reasoning(Some("   "), "hi"), "hi");
-    assert_eq!(with_reasoning(None, "  hi  "), "hi");
+fn reasoning_unmatched_closer_mid_line_is_escaped() {
+    // `</details >` (whitespace before `>`) is a valid closer shape but
+    // must stand alone to end the block, so mid-line it is escaped.
+    let r = "see <span></span></details > here";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\</details >"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn reasoning_already_escaped_closer_re_escapes() {
+    // An already-backslashed tag is rewritten N -> 2N + 1 (1 -> 3) and
+    // parses back to the original single backslash.
+    let r = "keep \\</details> literal";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\\\\\</details>"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn reasoning_invalid_spacing_is_not_a_tag() {
+    // `< details>` and `</ details>` (whitespace after `<`) are not tags.
+    let r = "not a tag: < details> and </ details>";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("< details> and </ details>"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn reasoning_closer_in_inline_code_is_ignored() {
+    let r = "use `</details>` in markdown";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("`</details>`"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn reasoning_closer_in_fenced_block_is_ignored() {
+    let r = "```\n</details>\n```\nafter";
+    let conv = thinking_conv(r, "done");
+    let once = to_markdown(&conv);
+    assert!(once.contains("```\n</details>\n```"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning.as_deref(), Some(r));
+    assert_eq!(back.turns[1].content, "done");
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn no_thinking_tag_wrapper_stays_content() {
+    // Without `thinking: true` the whole body is verbatim content, even if
+    // it looks exactly like a Thinking wrapper.
+    let body = "<details>\n<summary>Thinking</summary>\n\nfake\n\n</details>\n\nreal answer";
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "q".into(),
+                meta: TurnMeta::default(),
+                reasoning: None,
+            },
+            Turn {
+                role: Role::Assistant,
+                content: body.to_string(),
+                meta: TurnMeta::default(),
+                reasoning: None,
+            },
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(!once.contains("thinking: true"));
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns[1].reasoning, None);
+    assert_eq!(back.turns[1].content, body);
+    assert_eq!(to_markdown(&back), once);
+}
+
+/// A user preamble so the tested assistant section is not the first one.
+const USER_PREAMBLE: &str = "**User** | 2026-11-22 14:30\n\nq\n\n---\n";
+
+#[test]
+fn thinking_tag_rejects_non_true_value() {
+    let input = format!("{USER_PREAMBLE}**Assistant** | thinking: false\n\nhi\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'thinking' metadata must be the literal value 'true'"
+    );
+}
+
+#[test]
+fn thinking_tag_rejects_non_assistant_role() {
+    let input = "**User** | thinking: true\n\nhi\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: 'thinking' metadata is only allowed on **Assistant** headers"
+    );
+}
+
+#[test]
+fn thinking_tag_requires_lowercase_details_opener() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | thinking: true\n\n<DETAILS>\n<summary>Thinking</summary>\n\nr\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 8: expected a bare '<details>' line to open the reasoning block"
+    );
+}
+
+#[test]
+fn thinking_tag_requires_exact_summary_line() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | thinking: true\n\n<details>\n<summary>thinking</summary>\n\nr\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 9: expected a bare '<summary>Thinking</summary>' line after the opening tag"
+    );
+}
+
+#[test]
+fn thinking_tag_requires_closing_details_line() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | thinking: true\n\n<details>\n<summary>Thinking</summary>\n\nreasoning...\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: unclosed reasoning block; expected a closing '</details>' line"
+    );
+}
+
+#[test]
+fn thinking_tag_rejects_even_backslash_count() {
+    // Two backslashes before the closer: an even count is a format error.
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | thinking: true\n\n<details>\n<summary>Thinking</summary>\n\n\\\\</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: even number of backslashes before a <details> tag; expected an odd count"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1042,7 @@ fn tool_turn_fixture(name: &str, id: &str, arguments: &str, output: &str) -> Tur
                 ("id".into(), id.into()),
             ],
         },
+        reasoning: None,
     }
 }
 
@@ -829,6 +1054,7 @@ fn tool_turn_round_trips() {
                 role: Role::User,
                 content: "List the files.".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             tool_turn_fixture(
                 "list_files",
@@ -862,6 +1088,7 @@ fn tool_turn_output_with_details_and_backticks_round_trips() {
                 role: Role::User,
                 content: "run it".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             tool_turn_fixture("bash", "call_9", r#"{"command": "ls"}"#, output),
         ],
@@ -885,6 +1112,7 @@ fn tool_turn_output_with_long_tilde_run_round_trips() {
                 role: Role::User,
                 content: "read it".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             tool_turn_fixture("read_file", "c1", r#"{"path": "a.md"}"#, output),
         ],
@@ -907,6 +1135,7 @@ fn parse_tool_turn_rejects_malformed() {
             timestamp: None,
             tags: vec![("tool".into(), "bash".into())],
         },
+        reasoning: None,
     };
     assert!(parse_tool_turn(&no_id).is_none());
     // Not a tool role.
@@ -914,6 +1143,7 @@ fn parse_tool_turn_rejects_malformed() {
         role: Role::User,
         content: tool_turn_body("bash", "{}", "out"),
         meta: TurnMeta::default(),
+        reasoning: None,
     };
     assert!(parse_tool_turn(&user).is_none());
     // Body without a summary line or fence.
@@ -927,6 +1157,7 @@ fn parse_tool_turn_rejects_malformed() {
                 ("id".into(), "c1".into()),
             ],
         },
+        reasoning: None,
     };
     assert!(parse_tool_turn(&no_body).is_none());
 }
@@ -939,11 +1170,13 @@ fn to_messages_folds_tool_turns_into_assistant_and_tool() {
                 role: Role::User,
                 content: "List the files.".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::Assistant,
                 content: "Let me check.".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             tool_turn_fixture("list_files", "call_1", r#"{"subdir": "."}"#, "a.md  10"),
         ],
@@ -977,16 +1210,19 @@ fn to_messages_skips_system_sections() {
                 role: Role::System,
                 content: "Be terse.".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::User,
                 content: "hi".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::Assistant,
                 content: "hello".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
         ],
         ..Default::default()
@@ -1024,11 +1260,13 @@ fn to_messages_skips_malformed_tool_turns() {
                 role: Role::User,
                 content: "hi".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
             Turn {
                 role: Role::Tool,
                 content: "not a tool turn".into(),
                 meta: TurnMeta::default(),
+                reasoning: None,
             },
         ],
         ..Default::default()
@@ -1053,6 +1291,7 @@ fn frontmatter_tool_fields_round_trip() {
             role: Role::User,
             content: "hi".into(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
     };
     let md = to_markdown(&conv);
@@ -1072,6 +1311,7 @@ fn frontmatter_defaults_are_omitted() {
             role: Role::User,
             content: "hi".into(),
             meta: TurnMeta::default(),
+            reasoning: None,
         }],
         ..Default::default()
     };
