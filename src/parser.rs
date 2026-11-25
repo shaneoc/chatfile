@@ -29,8 +29,9 @@
 //! must be `**System**` or `**User**`; the frontmatter's closing fence (or
 //! the start of the file, when there is no frontmatter) serves as its
 //! leading horizontal rule, so it carries no `---` of its own. Every later
-//! section is preceded by a `---` horizontal rule. A `**System**` section is
-//! only valid as the first section: its content is combined with the
+//! section is preceded by a blank line and a `---` horizontal rule (the
+//! blank line is mandatory on parse). A `**System**` section is only valid
+//! as the first section: its content is combined with the
 //! hierarchical `AGENTS.md` context into the single leading system message
 //! and never appears in the conversation itself. When serializing, colliding
 //! lines in unfenced message content — a `---` line directly before a line
@@ -688,10 +689,19 @@ pub fn parse(input: &str) -> Result<Conversation> {
                     i += 1;
                     continue;
                 }
-                // k == 0: a real boundary only when the next line is a
-                // recognized role header; anything else is content. A line
-                // that starts a section must be a *valid* header; a
-                // malformed one is a format error, not content.
+                // k == 0: a real separator candidate (escaped content,
+                // k > 0, is exempt). It must be preceded by a blank or
+                // whitespace-only line.
+                if !lines[i - 1].trim().is_empty() {
+                    return Err(line_error(
+                        first_line + i,
+                        "turn separator '---' must be preceded by a blank line",
+                    ));
+                }
+                // A real boundary only when the next line is a recognized
+                // role header; anything else is content. A line that starts
+                // a section must be a *valid* header; a malformed one is a
+                // format error, not content.
                 if is_role_header_line(lines[i + 1]) {
                     let (role, meta) = parse_header_line(lines[i + 1], first_line + i + 1)?;
                     if role == Role::System {
@@ -864,7 +874,8 @@ pub fn with_reasoning(reasoning: Option<&str>, answer: &str) -> String {
 /// The first section is emitted without a leading horizontal rule: the
 /// frontmatter's closing fence (or the start of the file, when there is no
 /// frontmatter) serves that visual purpose. Every later section is preceded
-/// by its own `---`. Content has any colliding boundary patterns escaped
+/// by a blank line and its own `---` (`\n\n---\n`). Content has any colliding
+/// boundary patterns escaped
 /// (see [`escape_boundaries`]). The output always ends with a single
 /// trailing newline, and `parse(to_markdown(c)) == c` for any `c` produced
 /// by `parse`.

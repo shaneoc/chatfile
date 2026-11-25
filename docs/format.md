@@ -85,8 +85,10 @@ serializes as an empty `---\n---\n`.
   frontmatter's closing fence (or the start of the file) serves that visual
   purpose.
 - **Every later section** is introduced by a `---` horizontal-rule line
-  immediately followed by the section's header line. In canonical output the
-  rule is preceded by a blank line (`\n\n---\n`).
+  immediately followed by the section's header line. The rule must be
+  preceded by a blank (or whitespace-only) line; otherwise it is a parse
+  error (§4.2). In canonical output the separator is exactly `\n\n---\n`,
+  even when the preceding section's content is empty.
 - A `**System**` section is **only valid as the first section**. It is
   forbidden mid-conversation because every request must carry exactly one
   system message, always first: the hierarchical `AGENTS.md` context followed
@@ -222,15 +224,20 @@ this is just text in a fence
 ### 3.2 Boundary detection and lossless escaping
 
 A **boundary** is a `---` horizontal-rule line (exactly `---`, surrounding
-whitespace tolerated) that is outside any fence and immediately followed by a
-line that *begins* with `**`. The following line must start with the two
-asterisks at column 0 — an indented role-looking line does not form a
-boundary. Two consequences:
+whitespace tolerated) that is outside any fence, immediately followed by a
+line that *begins* with `**`, and preceded by a blank or whitespace-only
+line. The following line must start with the two asterisks at column 0 — an
+indented role-looking line does not form a boundary. Three consequences:
 
 - A `---` line whose next line does not begin with `**` is ordinary content (a
-  Markdown horizontal rule inside the message).
+  Markdown horizontal rule inside the message), whether or not a blank line
+  precedes it.
 - A `---` on the very last line of a section has no following line, so it is
   content too.
+- A `---` directly above a line that begins with `**` but **not** preceded by
+  a blank line is a format error (§4.2). The serializer never emits this:
+  every separator it writes is `\n\n---\n`, so there is always a blank line
+  above the rule — even when the preceding section's content is empty.
 
 Because of this, message content that itself contains such a pattern would be
 misread on the next parse. The serializer therefore **escapes** colliding
@@ -243,7 +250,10 @@ lines with a bijective odd-backslash rule, and the parser inverts it exactly:
   (`\\\---`), `2 -> 5` (`\\\\\---`). On parse, such a line must carry an
   **odd** count `k >= 1` of leading backslashes; the parser restores
   `(k - 1) / 2` backslashes (`1 -> 0`, `3 -> 1`, `5 -> 2`) and treats the
-  line as content. An even count is a format error (§4.2).
+  line as content. An even count is a format error (§4.2). Because escaped
+  lines are content, they are exempt from the blank-line rule above: user
+  content such as `Some text\n---\n**Bold**` (no blank line) serializes as
+  `Some text\n\---\n**Bold**` and parses back byte-for-byte.
 - **Code-fence collisions.** An unfenced line starting with `N >= 1`
   backslashes immediately followed by three or more `` ` `` or `~` characters
   is rewritten on serialize with `2 * N + 1` leading backslashes (the same
@@ -253,7 +263,10 @@ lines with a bijective odd-backslash rule, and the parser inverts it exactly:
   message body without a matching closing fence, the serializer prepends one
   backslash to the opener (```` ```rust ```` becomes ```` \```rust ````) and
   appends **no** synthetic closing fence. On parse the backslashed opener is
-  not a fence delimiter, so it and everything after it are plain content.
+  not a fence delimiter: the odd-backslash rule above applies (`1 -> 0`), so
+  the single added backslash is stripped and the opener — and everything
+  after it — comes back as plain content exactly as written. Unclosed fences
+  are therefore 100% lossless, byte-for-byte.
 
 Lines inside a fenced code block are never inspected or escaped. The rules
 are bijective: for every message body `c`, parsing the serialized form
@@ -352,7 +365,8 @@ Caused by:
 | ------------- | --------- | ----------------- |
 | `line N: file has no sections; expected a **System** or **User** header` | The body is empty — an empty file, or frontmatter with nothing after it. | `` (empty file) |
 | `line N: first section must be a **System** or **User** header` | The first body line is not a role header at all (plain text, an unknown bold role, …), **or** it is a valid header for a role other than System/User (`**Assistant**`, `**Tool**`). | `Just some notes.` / `**Assistant**\n\nhi` |
-| `line N: **System** is only allowed as the first section` | A `---` boundary introduces a `**System**` header in any later section. N points at the `**System**` line (one below the rule). | `**User**\n\nhi\n---\n**System**\n\nlate` |
+| `line N: **System** is only allowed as the first section` | A `---` boundary introduces a `**System**` header in any later section. N points at the `**System**` line (one below the rule). | `**User**\n\nhi\n\n---\n**System**\n\nlate` |
+| `line N: turn separator '---' must be preceded by a blank line` | An unfenced `---` line directly above a line that begins with `**` whose preceding line is not blank (or whitespace-only). Escaped lines (odd leading backslashes, §3.2) are content and exempt. N points at the `---` line. | `**User**\n\nhi\n---\n**Assistant**\n\nhello` |
 | `line N: even number of backslashes before '---'; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes followed by `---`, directly before a line that begins with `**`. Odd counts are valid escapes (§3.2) that restore `(k - 1) / 2` backslashes. | `**User**\n\n\\---\n**Assistant**` |
 | `line N: even number of backslashes before a code fence; expected an odd count` | An unfenced line with an even count `k >= 2` of leading backslashes immediately followed by three or more `` ` `` or `~`. Odd counts are valid escapes (§3.2). | `**User**\n\n\\~~~x` |
 
@@ -379,6 +393,7 @@ content and never triggers them.
 - **Unknown frontmatter keys** — ignored on parse.
 - **A `---` whose next line does not begin with `**`** — plain content (a Markdown horizontal rule inside the message).
 - **A `---` as the last line of a section** — no following line, so content.
+- **A blank-line-preceded `---` directly above a bold line that is not a valid role header** (e.g. `**Bold**`) — not a boundary; both lines are content.
 - **A `---` followed by an *indented* role-looking line** — not a boundary (the following line must begin with `**` at column 0); both lines are content.
 - **Role-looking lines without a preceding rule** (and not the first body line) — plain content.
 - **Escaped collision lines** — odd-backslash `\---`-style lines and backslashed fence lines are content; the parser restores the original backslashes (§3.2).

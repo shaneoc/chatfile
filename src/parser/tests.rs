@@ -81,10 +81,10 @@ fn parse_first_line_must_be_system_or_user() {
 
 #[test]
 fn parse_system_only_allowed_as_first_section() {
-    // Lines: 1 **User**, 2 blank, 3 hi, 4 ---, 5 **System**.
-    let err = parse("**User**\n\nhi\n---\n**System**\n\nlate\n").unwrap_err();
+    // Lines: 1 **User**, 2 blank, 3 hi, 4 blank, 5 ---, 6 **System**.
+    let err = parse("**User**\n\nhi\n\n---\n**System**\n\nlate\n").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("line 5"), "{msg}");
+    assert!(msg.contains("line 6"), "{msg}");
     assert!(msg.contains("**System**"), "{msg}");
 }
 
@@ -93,7 +93,7 @@ fn parse_header_rejects_wrong_separators() {
     // The legacy `·` separator is no longer a header.
     for (input, at) in [
         ("**User** · *2026-11-22 14:30*\n\nhi\n", "line 1"),
-        ("**User**\n\nhi\n---\n**Assistant** - 2026-11-22 14:31\n\nlate\n", "line 5"),
+        ("**User**\n\nhi\n\n---\n**Assistant** - 2026-11-22 14:31\n\nlate\n", "line 6"),
         // Missing the spaces around `|`.
         ("**User**| 2026-11-22 14:30\n\nhi\n", "line 1"),
     ] {
@@ -132,9 +132,9 @@ fn parse_header_requires_key_prefix_after_timestamp() {
     );
 
     // Same violation in a later section: the line number tracks it.
-    let err = parse("**User**\n\nhi\n---\n**Assistant** | 2026-11-22 14:31 | model\n\nlate\n")
+    let err = parse("**User**\n\nhi\n\n---\n**Assistant** | 2026-11-22 14:31 | model\n\nlate\n")
         .unwrap_err();
-    assert!(err.to_string().contains("line 5"), "{err}");
+    assert!(err.to_string().contains("line 6"), "{err}");
 
     // An empty key is rejected too.
     let err = parse("**User** | : value\n\nhi\n").unwrap_err();
@@ -194,7 +194,7 @@ fn parse_boundary_whitespace_tolerant() {
 
 #[test]
 fn parse_role_line_case_insensitive() {
-    let conv = parse("**User**\n\nhello\n---\n**assistant**\n\nhi\n").unwrap();
+    let conv = parse("**User**\n\nhello\n\n---\n**assistant**\n\nhi\n").unwrap();
     assert_eq!(conv.turns.len(), 2);
     assert_eq!(conv.turns[1].role, Role::Assistant);
 }
@@ -227,7 +227,7 @@ fn parse_metadata_optional_variants() {
 
     // Timestamp plus several tags; tag values may contain colons.
     let conv = parse(
-        "**User**\n\nhello\n---\n**Assistant** | 2026-11-22 14:31 | model: unsloth/Qwen:Q8 | note: a: b\n\nhi\n",
+        "**User**\n\nhello\n\n---\n**Assistant** | 2026-11-22 14:31 | model: unsloth/Qwen:Q8 | note: a: b\n\nhi\n",
     )
     .unwrap();
     assert_eq!(
@@ -640,6 +640,83 @@ fn parse_rejects_even_backslash_counts() {
     let msg = err.to_string();
     assert!(msg.contains("line 3"), "{msg}");
     assert!(msg.contains("even number of backslashes before a code fence"), "{msg}");
+}
+
+#[test]
+fn parse_requires_blank_line_before_separator() {
+    // A `---` directly above a `**` line must be preceded by a blank line.
+    // Lines: 1 **User**, 2 blank, 3 hi, 4 ---.
+    let err = parse("**User**\n\nhi\n---\n**Assistant**\n\nhello\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 4"), "{msg}");
+    assert!(
+        msg.contains("turn separator '---' must be preceded by a blank line"),
+        "{msg}"
+    );
+
+    // A whitespace-only line counts as blank.
+    let conv = parse("**User**\n\nhi\n   \n---\n**Assistant**\n\nhello\n").unwrap();
+    assert_eq!(conv.turns.len(), 2);
+    assert_eq!(conv.turns[0].content, "hi");
+}
+
+#[test]
+fn empty_section_serializes_with_blank_line_before_separator() {
+    // An empty section still gets a blank line above its separator.
+    let conv = parse("**User**\n\n\n---\n**Assistant**\n\nhello\n").unwrap();
+    assert_eq!(conv.turns.len(), 2);
+    assert_eq!(conv.turns[0].content, "");
+    let md = to_markdown(&conv);
+    assert!(md.contains("\n\n---\n"), "{md}");
+    // Round-trips stably.
+    let back = parse(&md).unwrap();
+    assert_eq!(back.turns[0].content, "");
+    assert_eq!(to_markdown(&back), md);
+}
+
+#[test]
+fn boundary_collision_without_blank_line_round_trips_losslessly() {
+    // Content with a `---` directly above a `**` line and no blank line is
+    // escaped on serialize (`N -> 2N + 1`) and parses back byte-exactly,
+    // without tripping the missing-blank-line rule.
+    let content = "Heading\n---\n**Bold**";
+    let conv = Conversation {
+        turns: vec![Turn {
+            role: Role::User,
+            content: content.to_string(),
+            meta: TurnMeta::default(),
+        }],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\---\n**Bold**"), "{once}");
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 1);
+    assert_eq!(back.turns[0].content, content);
+    assert_eq!(to_markdown(&back), once);
+}
+
+#[test]
+fn unclosed_fence_round_trips_without_lingering_backslash() {
+    // An unclosed opening fence is escaped on serialize (`0 -> 1`) and the
+    // parser restores `1 -> 0`, so the content comes back byte-exactly with
+    // no backslash left behind.
+    let content = "```rust\nfn main() {";
+    let conv = Conversation {
+        turns: vec![Turn {
+            role: Role::User,
+            content: content.to_string(),
+            meta: TurnMeta::default(),
+        }],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    assert!(once.contains("\\```rust"), "{once}");
+    let back = parse(&once).unwrap();
+    assert_eq!(back.turns.len(), 1);
+    assert_eq!(back.turns[0].content, content);
+    assert!(!back.turns[0].content.contains('\\'));
+    assert_eq!(to_markdown(&back), once);
 }
 
 #[test]
