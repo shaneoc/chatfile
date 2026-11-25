@@ -26,9 +26,16 @@ Hello!
 Hi there.
 
 ---
-**Tool** | 2026-11-22 14:31 | model: local-model
+**Tool** | 2026-11-22 14:31 | tool: bash | id: call_1
 
+<details>
+<summary>Output</summary>
+
+~~~~text
 exit code 0
+~~~~
+
+</details>
 ";
     let conv = parse(input).unwrap();
     assert!(conv.had_frontmatter);
@@ -61,7 +68,10 @@ exit code 0
         }
     );
     assert_eq!(conv.turns[3].role, Role::Tool);
-    assert_eq!(conv.turns[3].content, "exit code 0");
+    let data = parse_tool_turn(&conv.turns[3]).expect("well-formed tool turn");
+    assert_eq!(data.name, "bash");
+    assert_eq!(data.id, "call_1");
+    assert_eq!(data.output, "exit code 0");
 }
 
 #[test]
@@ -1731,4 +1741,224 @@ fn tool_call_block_invalid_summary_rejected() {
         err.to_string(),
         "line 15: malformed tool call block; expected a Tool Call summary line"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Strict header metadata keys & strict **Tool** turn validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn duplicate_metadata_key_rejected() {
+    let input = "**User** | model: a | model: b\n\nhi\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'model' in header");
+}
+
+#[test]
+fn duplicate_metadata_key_non_adjacent_rejected() {
+    let input = "**User** | model: a | note: x | model: b\n\nhi\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'model' in header");
+}
+
+#[test]
+fn duplicate_metadata_key_on_tool_header_rejected() {
+    let input = "**User**\n\nq\n\n---\n**Tool** | tool: a | id: c1 | tool: b\n\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(err.to_string(), "line 6: duplicate metadata key 'tool' in header");
+}
+
+#[test]
+fn duplicate_thinking_key_rejected() {
+    // The header error fires before any body validation.
+    let input = "**Assistant** | thinking: true | thinking: true\n\nhi\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'thinking' in header");
+}
+
+#[test]
+fn tool_tag_on_non_tool_header_rejected() {
+    for header in ["**User** | tool: bash", "**Assistant** | tool: bash", "**System** | tool: bash"] {
+        let input = format!("{header}\n\nhi\n");
+        let err = parse(&input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 1: 'tool' metadata is only allowed on **Tool** headers",
+            "header: {header}"
+        );
+    }
+}
+
+#[test]
+fn id_tag_on_non_tool_header_rejected() {
+    for header in ["**User** | id: c1", "**Assistant** | id: c1", "**System** | id: c1"] {
+        let input = format!("{header}\n\nhi\n");
+        let err = parse(&input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 1: 'id' metadata is only allowed on **Tool** headers",
+            "header: {header}"
+        );
+    }
+}
+
+#[test]
+fn tool_turn_missing_tool_tag_rejected() {
+    let input = format!("{USER_PREAMBLE}**Tool** | id: c1\n\n{}", tool_turn_body("out"));
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: **Tool** header requires a non-empty 'tool:' metadata tag"
+    );
+}
+
+#[test]
+fn tool_turn_missing_id_tag_rejected() {
+    let input = format!("{USER_PREAMBLE}**Tool** | tool: bash\n\n{}", tool_turn_body("out"));
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: **Tool** header requires a non-empty 'id:' metadata tag"
+    );
+}
+
+#[test]
+fn tool_turn_empty_tool_tag_rejected() {
+    let input = format!("{USER_PREAMBLE}**Tool** | tool: | id: c1\n\n{}", tool_turn_body("out"));
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: **Tool** header requires a non-empty 'tool:' metadata tag"
+    );
+}
+
+#[test]
+fn legacy_free_form_tool_turn_rejected() {
+    // The pre-strict free-form shape (no tool:/id: tags, bare output) is now
+    // a hard error.
+    let input = "**User**\n\nhi\n\n---\n**Tool** | model: m\n\nexit code 0\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: **Tool** header requires a non-empty 'tool:' metadata tag"
+    );
+}
+
+#[test]
+fn tool_turn_empty_body_rejected() {
+    let input = format!("{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 7: expected a bare '<details>' line to open the tool output block"
+    );
+}
+
+#[test]
+fn tool_turn_missing_summary_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n\n~~~~text\nout\n~~~~\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 9: expected a bare '<summary>Output</summary>' line after the opening tag"
+    );
+}
+
+#[test]
+fn tool_turn_missing_fence_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n<summary>Output</summary>\n\nnot a fence\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: expected a tilde-fenced output block in the tool turn body"
+    );
+}
+
+#[test]
+fn tool_turn_no_fence_at_all_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n<summary>Output</summary>\n\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: expected a tilde-fenced output block in the tool turn body"
+    );
+}
+
+#[test]
+fn tool_turn_unclosed_fence_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n<summary>Output</summary>\n\n~~~~text\nout\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 12: unclosed tool output block; expected a closing tilde fence"
+    );
+}
+
+#[test]
+fn tool_turn_missing_closer_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n<summary>Output</summary>\n\n~~~~text\nout\n~~~~\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 13: expected a bare '</details>' line to close the tool output block"
+    );
+}
+
+#[test]
+fn tool_turn_trailing_content_after_closer_rejected() {
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash | id: c1\n\n<details>\n<summary>Output</summary>\n\n~~~~text\nout\n~~~~\nextra\n</details>\n"
+    );
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 14: expected a bare '</details>' line to close the tool output block"
+    );
+}
+
+#[test]
+fn tool_turn_body_with_extra_blanks_round_trips() {
+    // Blank lines between the wrapper's pieces are optional; a hand-edited
+    // wrapper with extra blanks parses and round-trips verbatim.
+    let content = "<details>\n<summary>Output</summary>\n\n\n~~~~text\nout\n~~~~\n\n\n</details>";
+    let conv = Conversation {
+        turns: vec![
+            Turn {
+                role: Role::User,
+                content: "run it".into(),
+                meta: TurnMeta::default(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            Turn {
+                role: Role::Tool,
+                content: content.into(),
+                meta: TurnMeta {
+                    timestamp: Some("2026-11-22 14:31".into()),
+                    tags: vec![
+                        ("tool".to_string(), "bash".to_string()),
+                        ("id".to_string(), "c1".to_string()),
+                    ],
+                },
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let once = to_markdown(&conv);
+    let back = parse(&once).unwrap();
+    assert_eq!(back, conv);
+    let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
+    assert_eq!(data.output, "out");
 }

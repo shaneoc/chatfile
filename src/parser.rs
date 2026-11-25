@@ -296,9 +296,10 @@ pub struct ToolTurnData {
 
 /// Parse a `Role::Tool` turn's persisted `<details>` body into structured
 /// data. Returns `None` when the turn is not a well-formed tool turn (the
-/// name and id meta tags are required; the body must carry a tilde-fenced
-/// output block). The arguments live on the issuing assistant turn, not
-/// here.
+/// name and id meta tags are required; the body must carry the canonical
+/// output wrapper). [`parse`] rejects such turns with a line-numbered
+/// error, so this predicate only fails for hand-constructed [`Turn`]s. The
+/// arguments live on the issuing assistant turn, not here.
 pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
     if turn.role != Role::Tool {
         return None;
@@ -556,6 +557,12 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                         "invalid header metadata; 'key: value' requires a non-empty key",
                     ));
                 }
+                if meta.tags.iter().any(|(seen, _)| seen == k) {
+                    return Err(line_error(
+                        line_no,
+                        format!("duplicate metadata key '{k}' in header"),
+                    ));
+                }
                 meta.tags.push((k.to_string(), v.trim().to_string()));
             } else {
                 return Err(line_error(
@@ -597,6 +604,28 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                 return Err(line_error(
                     line_no,
                     "'tool_calls' metadata must be a positive integer",
+                ));
+            }
+        }
+    }
+    // The `tool` and `id` tags name a tool call and are only allowed on
+    // **Tool** headers.
+    for (k, _) in &meta.tags {
+        if (k == "tool" || k == "id") && role != Role::Tool {
+            return Err(line_error(
+                line_no,
+                format!("'{k}' metadata is only allowed on **Tool** headers"),
+            ));
+        }
+    }
+    // A **Tool** header must name the call: non-empty `tool` and `id` tags.
+    if role == Role::Tool {
+        for k in ["tool", "id"] {
+            let ok = meta.tags.iter().any(|(seen, v)| seen == k && !v.is_empty());
+            if !ok {
+                return Err(line_error(
+                    line_no,
+                    format!("**Tool** header requires a non-empty '{k}:' metadata tag"),
                 ));
             }
         }
@@ -846,6 +875,12 @@ pub fn parse(input: &str) -> Result<Conversation> {
             reasoning = Some(r);
             body_lines = lines;
             body_first = f;
+        }
+        if role == Role::Tool {
+            // Strict validation (§3.3.2): the header tags are checked in
+            // parse_header_line, the body shape here. The unwrapped output
+            // is re-extracted by parse_tool_turn when building messages.
+            finalize_tool_turn(&body_lines, body_first)?;
         }
         let mut content_lines = body_lines;
         let mut tool_calls: Vec<AssistantToolCall> = Vec::new();
@@ -1393,6 +1428,102 @@ fn extract_one_tool_call_block(
     ))
 }
 
+/// Validate the persisted body of a `**Tool**` turn and return the unwrapped
+/// output. The body must be the canonical `<details>` wrapper (§3.3.2): a
+/// bare `<details>` line immediately followed by a bare
+/// `<summary>Output</summary>` line, then a tilde-fenced output (info string
+/// `text` or empty, run of at least three tildes), and finally a bare
+/// `</details>` line; blank lines may separate the pieces.
+fn finalize_tool_turn(lines: &[String], first_line: usize) -> Result<String> {
+    let last_line = first_line + lines.len().saturating_sub(1);
+    // 1. First non-blank line: a bare <details>.
+    let mut d = 0;
+    while d < lines.len() && lines[d].trim().is_empty() {
+        d += 1;
+    }
+    if d == lines.len() || lines[d].trim() != "<details>" {
+        return Err(line_error(
+            last_line,
+            "expected a bare '<details>' line to open the tool output block",
+        ));
+    }
+    // 2. Next line: a bare <summary>Output</summary>.
+    if d + 1 >= lines.len() || lines[d + 1].trim() != "<summary>Output</summary>" {
+        return Err(line_error(
+            first_line + (d + 1).min(lines.len() - 1),
+            "expected a bare '<summary>Output</summary>' line after the opening tag",
+        ));
+    }
+    let s = d + 1;
+    // 3. Opening fence: the first non-blank line below the summary must be a
+    // tilde fence (info string `text` or empty).
+    let mut o: Option<usize> = None;
+    for i in (s + 1)..lines.len() {
+        let t = lines[i].trim();
+        if t.is_empty() {
+            continue;
+        }
+        let run = t.chars().take_while(|&c| c == '~').count();
+        if run >= 3 && (t[run..].trim() == "text" || t[run..].trim().is_empty()) {
+            o = Some(i);
+        } else {
+            return Err(line_error(
+                first_line + i,
+                "expected a tilde-fenced output block in the tool turn body",
+            ));
+        }
+        break;
+    }
+    let Some(o) = o else {
+        return Err(line_error(
+            last_line,
+            "expected a tilde-fenced output block in the tool turn body",
+        ));
+    };
+    let open_len = lines[o]
+        .trim()
+        .chars()
+        .take_while(|&c| c == '~')
+        .count();
+    // 4. Closing fence: a bare tilde run at least as long as the opener.
+    let mut c: Option<usize> = None;
+    for i in (o + 1)..lines.len() {
+        let t = lines[i].trim();
+        let run = t.chars().take_while(|&ch| ch == '~').count();
+        if run >= open_len && t.len() == run {
+            c = Some(i);
+            break;
+        }
+    }
+    let Some(c) = c else {
+        return Err(line_error(
+            last_line,
+            "unclosed tool output block; expected a closing tilde fence",
+        ));
+    };
+    // 5. After the closing fence: only blank lines, then a final bare
+    // </details> line.
+    let mut e = lines.len();
+    while e > 0 && lines[e - 1].trim().is_empty() {
+        e -= 1;
+    }
+    if e == 0 || lines[e - 1].trim() != "</details>" {
+        return Err(line_error(
+            last_line,
+            "expected a bare '</details>' line to close the tool output block",
+        ));
+    }
+    for i in (c + 1)..(e - 1) {
+        if !lines[i].trim().is_empty() {
+            return Err(line_error(
+                first_line + i,
+                "expected a bare '</details>' line to close the tool output block",
+            ));
+        }
+    }
+    Ok(lines[o + 1..c].join("\n").trim().to_string())
+}
+
 /// Serialize a [`Conversation`] back to canonical Markdown.
 ///
 /// The first section is emitted without a leading horizontal rule: the
@@ -1524,8 +1655,9 @@ impl Conversation {
     /// [`crate::context::build_system_prompt`]) and never appears in the
     /// conversation itself. Assistant turns carry their parsed tool calls
     /// (the trailing Tool Call blocks of §3.3); `**Tool**` turns become
-    /// `role: "tool"` messages carrying the `tool_call_id`. Malformed tool
-    /// turns are skipped. This is a pure projection: it never synthesizes
+    /// `role: "tool"` messages carrying the `tool_call_id`. [`parse`]
+    /// rejects malformed tool turns, so only hand-constructed ones are
+    /// skipped defensively. This is a pure projection: it never synthesizes
     /// messages — see [`crate::llm::complete_tool_calls`] for the
     /// request-prep step that answers dangling tool calls.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {

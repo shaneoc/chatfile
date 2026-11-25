@@ -152,12 +152,15 @@ Each non-timestamp segment is `key: value`:
   `unsloth/Qwen:Q8`).
 - An empty value is allowed (`flag:` or `flag: ` parses as key `flag` with an
   empty value).
+- A key may appear **at most once** per header; a repeated key is a
+  header-format error (§4.3). Keys are case-sensitive (`model` and `Model`
+  are different keys).
 - Tag order is preserved. Well-known tags: `model` (which model produced the
   turn), `thinking` (assistant-only switch for the collapsible reasoning
   block — see below and §3.4), `tool_calls` (assistant-only count of the
-  trailing Tool Call blocks — see below and §3.3), and, on `**Tool**` turns,
-  `tool` (the tool name) and `id` (the tool call id — required for the turn
-  to be well-formed, §3.3).
+  trailing Tool Call blocks — see below and §3.3), and `tool` (the tool
+  name) / `id` (the tool call id), which are **`**Tool**`-only** and required
+  there (§3.3.2).
 
 The `thinking` tag is special:
 
@@ -399,16 +402,20 @@ a b
 
 - The output sits in a **tilde fence** whose info string is `text` (or
   empty), with the same fence sizing rule as Tool Call blocks.
-- A turn is *well-formed* (`parse_tool_turn` returns data) when it carries
-  the `tool` and `id` header tags and a matching output fence pair. Anything
-  else makes the turn *malformed*.
+- Validation is **strict**: the header must carry non-empty `tool:` and
+  `id:` tags, and the body must be exactly this wrapper — a bare `<details>`
+  line immediately followed by a bare `<summary>Output</summary>` line, then
+  the tilde fence (a run of at least three tildes), and finally a bare
+  `</details>` line; blank lines may separate the pieces. Any deviation is a
+  line-numbered parse error (§4.2, §4.3).
 
-**Wire-format pairing and recovery** (`to_messages`): each well-formed tool
-turn becomes a `role: "tool"` message carrying `tool_call_id` (the `id:`
-tag); the call itself (id, name, arguments) comes from the **issuing
-assistant turn's** parsed Tool Call blocks. **Malformed tool turns are
-skipped entirely** — they produce neither a tool message nor a tool call, and
-the conversation remains usable.
+**Wire-format pairing** (`to_messages`): each tool turn becomes a
+`role: "tool"` message carrying `tool_call_id` (the `id:` tag) and the
+unwrapped output; the call itself (id, name, arguments) comes from the
+**issuing assistant turn's** parsed Tool Call blocks. Since `parse()`
+rejects malformed tool turns, every parsed tool turn projects cleanly; only
+hand-constructed turns can fail the well-formedness predicate, and those are
+skipped defensively.
 
 `to_messages` is a **pure projection**: it never synthesizes messages. When
 an assistant turn carries more tool calls than there are following `**Tool**`
@@ -522,6 +529,11 @@ Caused by:
 | `line N: malformed tool call block; expected a tilde-fenced arguments block` | The extracted block has no valid fence pair: no closing fence above the closer, no opening fence below the summary, or the opening fence is longer than the closing one. | `**Assistant** \| tool_calls: 1\n\n<details>\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\nnot a fence\n\n</details>` |
 | `line N: malformed tool call block; expected a Tool Call summary line` | No line above the closing fence parses as `<summary>Tool Call: <code>{name}</code> (<code>{id}</code>)</summary>` with non-empty, whitespace-free `name` and `id`. | `**Assistant** \| tool_calls: 1\n\n<details>\n\n~~~~json\n{}\n~~~~\n\n</details>` (no summary) |
 | `line N: malformed tool call block; expected an opening '<details>' line` | The first non-blank line above the summary is not a bare `<details>`. | `**Assistant** \| tool_calls: 1\n\n<summary>Tool Call: <code>a</code> (<code>c1</code>)</summary>\n\n~~~~json\n{}\n~~~~\n\n</details>` (no opener) |
+| `line N: expected a bare '<details>' line to open the tool output block` | A `**Tool**` body's first non-blank line is not a bare `<details>` (or the body is empty). N points at the section's last line. | `**User**\n\nq\n\n---\n**Tool** \| tool: bash \| id: c1\n\n` (empty body) |
+| `line N: expected a bare '<summary>Output</summary>' line after the opening tag` | The line after the opening `<details>` does not trim to exactly `<summary>Output</summary>`. | `**Tool** \| tool: bash \| id: c1\n\n<details>\n\n~~~~text\nout\n~~~~\n\n</details>` (no summary) |
+| `line N: expected a tilde-fenced output block in the tool turn body` | The first non-blank line below the summary is not a tilde fence (info string `text` or empty), or no fence exists before the section ends. | `**Tool** \| tool: bash \| id: c1\n\n<details>\n<summary>Output</summary>\n\nnot a fence\n\n</details>` |
+| `line N: unclosed tool output block; expected a closing tilde fence` | No bare tilde run at least as long as the opener follows it. N points at the section's last line. | `**Tool** \| tool: bash \| id: c1\n\n<details>\n<summary>Output</summary>\n\n~~~~text\nout` (no closing fence) |
+| `line N: expected a bare '</details>' line to close the tool output block` | The section's last non-blank line is not a bare `</details>`, or non-blank content follows the closing fence. | `**Tool** \| tool: bash \| id: c1\n\n<details>\n<summary>Output</summary>\n\n~~~~text\nout\n~~~~\nextra\n</details>` (trailing content) |
 
 ### 4.3 Header-format errors
 
@@ -544,6 +556,11 @@ content and never triggers them.
 | `line N: 'thinking' metadata must be the literal value 'true'` | The `thinking` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| thinking: false` |
 | `line N: 'tool_calls' metadata is only allowed on **Assistant** headers` | A `tool_calls:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tool_calls: 1` |
 | `line N: 'tool_calls' metadata must be a positive integer` | The `tool_calls` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tool_calls: 0` |
+| `line N: duplicate metadata key '<key>' in header` | The same `key:` appears more than once in one header (keys are case-sensitive; timestamps are not keys and have their own duplicate check). | `**Assistant** \| model: a \| model: b` |
+| `line N: 'tool' metadata is only allowed on **Tool** headers` | A `tool:` tag appears on a `**System**`, `**User**`, or `**Assistant**` header (§2.2). | `**User** \| tool: bash` |
+| `line N: 'id' metadata is only allowed on **Tool** headers` | An `id:` tag appears on a `**System**`, `**User**`, or `**Assistant**` header (§2.2). | `**Assistant** \| id: call_1` |
+| `line N: **Tool** header requires a non-empty 'tool:' metadata tag` | A `**Tool**` header lacks a `tool:` tag, or its value is empty (§3.3.2). | `**Tool** \| id: call_1` / `**Tool** \| tool: \| id: call_1` |
+| `line N: **Tool** header requires a non-empty 'id:' metadata tag` | A `**Tool**` header lacks an `id:` tag, or its value is empty (§3.3.2). | `**Tool** \| tool: bash` |
 
 ### 4.4 Reasoning-block errors
 
@@ -567,7 +584,6 @@ All of these apply to a `**Assistant**` section whose header carries
 - **A `---` followed by an *indented* role-looking line** — not a boundary (the following line must begin with `**` at column 0); both lines are content.
 - **Role-looking lines without a preceding rule** (and not the first body line) — plain content.
 - **Escaped collision lines** — odd-backslash `\---`-style lines and backslashed fence lines are content; the parser restores the original backslashes (§3.2).
-- **Malformed tool turns** (missing `tool:`/`id:` tags, or a missing output fence) — the file still parses; the turn is skipped when building API messages (§3.3).
 - **An assistant body that looks like a Thinking wrapper but whose header lacks `thinking: true`** — the whole body is verbatim content; no reasoning is extracted and no §4.4 error fires.
 - **`<details>` blocks in an assistant body whose header lacks `tool_calls:`** — verbatim content; no Tool Call extraction happens and no §3.3.1 error fires (the same applies to a literal example block ahead of the real trailing ones, §3.3.1).
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
