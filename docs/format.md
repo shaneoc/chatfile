@@ -235,7 +235,7 @@ fence tracker implements a CommonMark subset:
 Consequently, a message body may quote or contain example conversation
 fragments without them being mistaken for section boundaries:
 
-```markdown
+````markdown
 **User**
 
 Here is an example:
@@ -246,7 +246,7 @@ Here is an example:
 
 this is just text in a fence
 ```
-```
+````
 
 ### 3.2 Boundary detection and lossless escaping
 
