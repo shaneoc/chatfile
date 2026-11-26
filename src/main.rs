@@ -313,7 +313,7 @@ async fn compact(file: &Path) -> Result<()> {
             file.display()
         );
     }
-    let request = tools::compact_request_turn();
+    let request = llm::compact_request_turn();
     tools::append_turn(file, &request)?;
     conv.turns.push(request);
 
@@ -334,7 +334,7 @@ async fn compact(file: &Path) -> Result<()> {
     let mut reply = String::new();
     let mut reasoning = String::new();
     let stdout = std::io::stdout();
-    tools::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
+    llm::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
         use tools::LoopEvent::*;
         match ev {
             Reasoning(chunk) => {

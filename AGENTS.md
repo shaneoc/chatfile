@@ -37,14 +37,17 @@ conversations stored as plain Markdown files inside nested directories.
 ## Source Layout
 - `src/lib.rs` — crate root; exposes the public modules so docs.rs renders
   complete documentation.
-- `src/main.rs` — thin CLI entrypoint (`chatfile <file>`, `run`, `new`).
+- `src/main.rs` — thin CLI entrypoint (`chatfile <file>`, `run`, `compact`,
+  `new`).
 - `src/parser.rs` — parse/serialize `.chat.md` files: frontmatter, turn
   boundaries, persisted tool turns, reasoning tags; `to_messages` folds the
   file into OpenAI wire-format messages.
 - `src/context.rs` — hierarchical `AGENTS.md` walk to the vault root (`.git`
   or `.chatfile` marker) and system-prompt assembly.
 - `src/llm.rs` — OpenAI-compatible streaming client (SSE deltas, reasoning,
-  streamed tool-call fragments).
+  streamed tool-call fragments), context-window assembly
+  (`build_api_messages`, `set_system_prompt`), and conversation compaction
+  (`compact_request_turn`, `run_compact`).
 - `src/tools.rs` — built-in tools (`list_files`, `read_file`, `write_file`,
   `edit_file`, `search_files`, `fetch_url`, `bash`) with path-containment
   safety (`resolve_safe_path`), and the multi-turn tool-calling loop

@@ -19,7 +19,7 @@ use serde_json::{Value as Json, json};
 
 use crate::context;
 use crate::llm::{
-    self, AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
+    AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
 };
 use crate::parser;
 use crate::sandbox::{self, SandboxPolicy};
@@ -943,80 +943,6 @@ pub async fn run_turn(
         }
     }
     bail!("no final reply after {MAX_TOOL_ITERATIONS} tool iterations")
-}
-
-// ---------------------------------------------------------------------------
-// Context compaction
-// ---------------------------------------------------------------------------
-
-/// The body of the `**User** | compact: true` turn that a compaction
-/// appends: it asks the model for a handoff summary (without tool calls)
-/// that replaces the pre-checkpoint history in all future requests (§5 of
-/// `docs/format.md`).
-pub const COMPACT_INSTRUCTION: &str = "\
-The conversation above is being compacted to keep its context small. \
-Write a handoff summary of it; your reply will be kept while the older \
-turns are dropped from future requests. Do not call any tools. Cover, in \
-order: **Goal** — what the user asked for; **Key decisions** — technical \
-choices made and why; **Files** — files created or modified, with a one-\
-line note each; **Current state** — what is done and just verified; \
-**Next steps** — what remains, in order.";
-
-/// The `**User** | <timestamp> | compact: true` turn that requests a
-/// compaction of the conversation so far.
-pub fn compact_request_turn() -> parser::Turn {
-    parser::Turn {
-        role: parser::Role::User,
-        content: COMPACT_INSTRUCTION.to_string(),
-        meta: parser::TurnMeta {
-            timestamp: Some(parser::now_timestamp()),
-            tags: Vec::new(),
-            compact: true,
-        },
-        reasoning: None,
-        tool_calls: Vec::new(),
-    }
-}
-
-/// Drive one context compaction: build the windowed request (the §5
-/// compaction rule, the hierarchical system prompt overlaid, and the tool
-/// schemas preserved so the server's KV-cache prefix stays warm), stream a
-/// single assistant summary, and report its deltas through `on_event`
-/// (returning `false` stops early). No tool loop runs: the summary
-/// instruction forbids tool calls, so any stray call is ignored. Returns
-/// the assembled response; the caller persists it as an `**Assistant**`
-/// turn via [`assistant_turn`].
-///
-/// `conv` must already end with the appended `compact: true` request turn
-/// (see [`compact_request_turn`]).
-pub async fn run_compact(
-    client: &Client,
-    conv: &parser::Conversation,
-    system_prompt: &str,
-    config: &ToolConfig,
-    mut on_event: impl FnMut(&LoopEvent) -> bool,
-) -> Result<AssistantTurn> {
-    let mut messages = llm::build_api_messages(conv);
-    llm::set_system_prompt(&mut messages, system_prompt);
-    llm::complete_tool_calls(&mut messages);
-    let schemas = tool_schemas(config);
-    let mut stream = client
-        .stream_chat(&messages, (!schemas.is_empty()).then_some(&schemas))
-        .await?;
-    let mut turn = AssistantTurn::default();
-    while let Some(delta) = stream.next().await {
-        let delta = delta.context("stream error")?;
-        let stop = match &delta {
-            StreamDelta::Reasoning(s) => !on_event(&LoopEvent::Reasoning(s.clone())),
-            StreamDelta::Content(s) => !on_event(&LoopEvent::Content(s.clone())),
-            _ => false,
-        };
-        turn.push(&delta);
-        if stop {
-            return Ok(turn);
-        }
-    }
-    Ok(turn)
 }
 
 #[cfg(test)]

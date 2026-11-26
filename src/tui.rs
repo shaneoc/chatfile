@@ -784,7 +784,7 @@ async fn compact(
     app: &mut App,
     tx: &mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let request = tools::compact_request_turn();
+    let request = llm::compact_request_turn();
     tools::append_turn(&app.path, &request)?;
     app.conv.turns.push(request);
 
@@ -800,7 +800,7 @@ async fn compact(
     let conv = app.conv.clone();
     let tx = tx.clone();
     let task = tokio::spawn(async move {
-        let res = tools::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
+        let res = llm::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
             match ev {
                 tools::LoopEvent::Reasoning(s) => tx
                     .send(StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone())))

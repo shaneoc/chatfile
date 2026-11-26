@@ -98,7 +98,7 @@ data: [DONE]\n\n";
     assert_eq!(msgs[0]["content"], "You are terse.\n\nbe terse");
     let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, vec!["system", "user", "assistant", "user", "user"]);
-    assert_eq!(msgs[4]["content"], tools::COMPACT_INSTRUCTION);
+    assert_eq!(msgs[4]["content"], llm::COMPACT_INSTRUCTION);
     assert!(v.get("tools").is_none());
 
     // The file keeps its full history: the request turn (persisted before
@@ -108,7 +108,7 @@ data: [DONE]\n\n";
     assert_eq!(conv.turns.len(), 6);
     assert_eq!(conv.turns[4].role, parser::Role::User);
     assert!(conv.turns[4].meta.compact);
-    assert_eq!(conv.turns[4].content, tools::COMPACT_INSTRUCTION);
+    assert_eq!(conv.turns[4].content, llm::COMPACT_INSTRUCTION);
     assert_eq!(conv.turns[5].role, parser::Role::Assistant);
     assert!(conv.turns[5].content.contains("Goal"));
     let model_tag = conv.turns[5]
