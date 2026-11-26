@@ -17,15 +17,29 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde_json::{Value as Json, json};
 
+use crate::config::{AppConfig, SandboxConfig};
 use crate::context;
 use crate::llm::{
     AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
 };
 use crate::parser;
-use crate::sandbox::{self, SandboxPolicy};
+use crate::sandbox;
 
 /// Maximum LLM round-trips per user turn before the loop gives up.
 pub const MAX_TOOL_ITERATIONS: usize = 15;
+
+/// All built-in tool names. This is the default allow-list when the active
+/// profile does not restrict tools with a `tools` list; `fetch_url` and
+/// `bash` are additionally gated by the frontmatter's `network`/`allow_shell`.
+pub const DEFAULT_TOOLS: &[&str] = &[
+    "list_files",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "search_files",
+    "fetch_url",
+    "bash",
+];
 
 /// Hard cap on tool output bytes fed back to the model (and persisted).
 const MAX_TOOL_OUTPUT: usize = 16384;
@@ -105,7 +119,8 @@ fn split_existing(path: &Path) -> (PathBuf, PathBuf) {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Per-conversation tool configuration, derived from frontmatter.
+/// Per-conversation tool configuration, derived from frontmatter with the
+/// app config supplying defaults (frontmatter wins).
 #[derive(Debug, Clone)]
 pub struct ToolConfig {
     /// Whether built-in tools are enabled at all (frontmatter `tools`).
@@ -114,21 +129,43 @@ pub struct ToolConfig {
     pub network: bool,
     /// Allow the `bash` tool.
     pub allow_shell: bool,
-    /// The directory file tools operate in (from frontmatter `scope`).
+    /// The directory file tools operate in (from frontmatter `scope`, with
+    /// the active profile's `scope` as the fallback default).
     pub work_dir: PathBuf,
+    /// Tool names enabled for this conversation (the active profile's
+    /// `tools` list); `None` means all built-in file tools.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Sandbox policy for the `bash` tool (from `[sandbox]` in
+    /// `config.toml`, with built-in defaults).
+    pub sandbox: SandboxConfig,
 }
 
 impl ToolConfig {
     /// Build the config for a conversation file: `scope: folder` selects the
     /// file's own directory, `scope: vault` the nearest ancestor carrying a
     /// `.chatfile` marker or `.git` entry (falling back to the file's dir).
-    pub fn for_file(fm: &parser::Frontmatter, file: &Path) -> Self {
+    /// The active profile supplies the default scope and tool list; explicit
+    /// frontmatter settings win.
+    pub fn for_file(fm: &parser::Frontmatter, file: &Path, config: &AppConfig) -> Self {
         let file_dir = file
             .parent()
             .map(Path::to_path_buf)
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| PathBuf::from("."));
-        let work_dir = match fm.scope {
+        // The frontmatter's scope is a concrete value (default `folder`), so
+        // an explicit `scope: vault` wins; otherwise the profile's default
+        // applies (the format itself treats `folder` as the absent value).
+        let scope = if fm.scope == parser::Scope::Vault
+            || config
+                .active_profile()
+                .and_then(|p| p.scope.as_deref())
+                .is_some_and(|s| s == "vault")
+        {
+            parser::Scope::Vault
+        } else {
+            parser::Scope::Folder
+        };
+        let work_dir = match scope {
             parser::Scope::Folder => file_dir,
             parser::Scope::Vault => context::agent_chain(&file_dir)
                 .last()
@@ -144,6 +181,8 @@ impl ToolConfig {
             network: fm.network,
             allow_shell: fm.allow_shell,
             work_dir,
+            allowed_tools: config.active_profile().and_then(|p| p.tools.clone()),
+            sandbox: config.sandbox.clone(),
         }
     }
 }
@@ -153,13 +192,22 @@ impl ToolConfig {
 // ---------------------------------------------------------------------------
 
 /// The OpenAI `tools` array for the request body. Empty when tools are
-/// disabled or no tool is permitted by the frontmatter.
+/// disabled or no tool is permitted by the frontmatter/profile.
 pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
     if !config.enabled {
         return Vec::new();
     }
-    let mut v = vec![
-        schema(
+    let allowed: Vec<String> = config
+        .allowed_tools
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect());
+    let mut v = Vec::new();
+    for name in DEFAULT_TOOLS.iter().copied() {
+        if !allowed.iter().any(|a| a == name) {
+            continue;
+        }
+        match name {
+            "list_files" => v.push(schema(
             "list_files",
             "List files recursively under a subdirectory of the working directory, \
              skipping .git, target, and dotfiles. Returns relative paths with byte \
@@ -174,8 +222,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 }
             }),
             &[],
-        ),
-        schema(
+            )),
+            "read_file" => v.push(schema(
             "read_file",
             "Read a text file from the working directory. Returns numbered lines \
              in the form `N | text` plus a total-line-count note (defaults: first \
@@ -190,8 +238,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["path"]
             }),
             &["path"],
-        ),
-        schema(
+            )),
+            "write_file" => v.push(schema(
             "write_file",
             "Create or overwrite a file in the working directory with the given \
              content. Parent directories are created as needed.",
@@ -204,8 +252,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["path", "content"]
             }),
             &["path", "content"],
-        ),
-        schema(
+            )),
+            "edit_file" => v.push(schema(
             "edit_file",
             "Replace one exact occurrence of `old_text` with `new_text` in a file. \
              Fails when `old_text` is missing or matches more than once — include \
@@ -220,8 +268,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["path", "old_text", "new_text"]
             }),
             &["path", "old_text", "new_text"],
-        ),
-        schema(
+            )),
+            "search_files" => v.push(schema(
             "search_files",
             "Case-insensitive substring search over the text files under a \
              subdirectory of the working directory. Returns `path:line: text` \
@@ -235,10 +283,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["query"]
             }),
             &["query"],
-        ),
-    ];
-    if config.network {
-        v.push(schema(
+            )),
+            "fetch_url" if config.network => v.push(schema(
             "fetch_url",
             "Fetch an http(s) URL and return its content as plain text (HTML \
              stripped), truncated to 16 KB.",
@@ -250,10 +296,8 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["url"]
             }),
             &["url"],
-        ));
-    }
-    if config.allow_shell {
-        v.push(schema(
+            )),
+            "bash" if config.allow_shell => v.push(schema(
             "bash",
             "Run a shell command in a sandboxed environment whose only writable \
              location is the working directory. Prefer read_file, write_file, \
@@ -269,7 +313,9 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
                 "required": ["command"]
             }),
             &["command"],
-        ));
+            )),
+            _ => {}
+        }
     }
     v
 }
@@ -693,12 +739,8 @@ async fn bash(args: &Json, config: &ToolConfig) -> String {
         return "Error: 'command' is empty".to_string();
     }
     let timeout_secs = arg_usize(args, "timeout_secs").unwrap_or(60).clamp(1, 300);
-    let policy = match SandboxPolicy::load() {
-        Ok(p) => p,
-        Err(e) => return format!("Error: loading sandbox config: {e}"),
-    };
     match sandbox::run_sandboxed(
-        &policy,
+        &config.sandbox,
         &config.work_dir,
         config.network,
         Duration::from_secs(timeout_secs as u64),

@@ -24,8 +24,8 @@ editable by hand, and portable between tools.
   entry or a `.chatfile` marker file) and concatenates every `AGENTS.md` found
   along the way into the system prompt, most general first.
 - **Interactive TUI** — a `ratatui` terminal UI with per-role styling, live
-  streaming, cancel (Ctrl+C), and scrolling; `run` mode streams the next
-  assistant turn to stdout for scripting (e.g. from Neovim).
+  streaming, cancel (Ctrl+C), and keyboard/mouse-wheel scrolling; `run` mode
+  streams the next assistant turn to stdout for scripting (e.g. from Neovim).
 - **Sandboxed agent tools** — built-in `list_files`, `read_file`, `write_file`,
   `edit_file`, `search_files`, `fetch_url`, and a `bash` tool executed inside a
   rootless [`bubblewrap`](https://github.com/containers/bubblewrap) sandbox:
@@ -54,7 +54,8 @@ With no configuration, chatfile targets llama.cpp at
 ### Environment variables
 
 Frontmatter in the `.chat.md` file wins over environment variables; the
-`CHATFILE_*` variables win over the standard OpenAI-compatible ones.
+`CHATFILE_*` variables win over the standard OpenAI-compatible ones, and both
+win over a named profile from `config.toml` (see [Configuration](#configuration)).
 
 | Variable            | Meaning                                          |
 | ------------------- | ------------------------------------------------ |
@@ -103,32 +104,79 @@ The complete specification — file structure, header grammar, fenced blocks,
 tool turns, and the full error catalog — lives in
 [docs/format.md](docs/format.md).
 
-## Sandbox configuration
+## Configuration
 
-The `bash` tool runs through bubblewrap with a policy loaded from optional YAML
-config files — `/etc/chatfile/config.yaml` (system) and
-`~/.config/chatfile/config.yaml` (user, overrides system) — falling back to
-built-in distro-agnostic defaults when neither exists. A config file may name
-any subset of the fields; unnamed fields keep the value from the layer below:
+chatfile reads an optional TOML config file from the standard XDG locations,
+lowest priority first:
 
-```yaml
-bwrap_path: bwrap            # path to the bwrap binary (bare names use PATH)
-ro_bind: [/usr, /etc]        # host paths bound read-only
-ro_bind_try: [/nix, /opt]    # ...only if they exist
-symlink_or_ro_bind: [/bin]   # recreate symlinks / bind dirs (usr-merged distros)
-mask_tmpfs: [/etc/ssh]       # cover with an empty tmpfs
-mask_devnull: [/etc/shadow]  # replace with /dev/null
-env:                         # the complete environment (--clearenv is used)
-  PATH: /usr/local/bin:/usr/bin:/bin
-extra_args: []               # raw bwrap flags appended last
+1. `<dir>/chatfile/config.toml` for each directory in `$XDG_CONFIG_DIRS`
+   (colon-separated; per the XDG spec the *first* entry has the *highest*
+   priority), falling back to `/etc/xdg/chatfile/config.toml` when the
+   variable is unset or empty.
+2. `$XDG_CONFIG_HOME/chatfile/config.toml`, falling back to
+   `~/.config/chatfile/config.toml` when `$XDG_CONFIG_HOME` is unset or empty.
+
+A file may name any subset of the keys; unnamed keys keep the value from the
+layer below, and missing files are skipped. A file that exists but is not
+valid TOML is a hard error. Every field in the schema below is optional:
+
+```toml
+# The profile used when frontmatter and CHATFILE_* env vars are unset.
+default_profile = "local"
+
+[profiles.local]
+endpoint = "http://localhost:9000/v1/chat/completions"
+model = "qwen"
+api_key_env = "MY_KEY"           # name of the env var holding the key (never the key itself)
+scope = "vault"                  # default tool scope: "folder" (default) or "vault"
+tools = ["read_file", "bash"]    # optional allow-list of built-in tools
+
+[profiles.cloud]
+endpoint = "https://api.example.com/v1/chat/completions"
+model = "gpt-x"
+
+[sandbox]
+bwrap_path = "bwrap"             # path to the bwrap binary (bare names use PATH)
+ro_bind = ["/usr", "/etc"]       # host paths bound read-only
+ro_bind_try = ["/nix", "/opt"]   # ...only if they exist
+symlink_or_ro_bind = ["/bin"]    # recreate symlinks / bind dirs (usr-merged distros)
+mask_tmpfs = ["/etc/ssh"]        # cover with an empty tmpfs
+mask_devnull = ["/etc/shadow"]   # replace with /dev/null
+env = { PATH = "/usr/local/bin:/usr/bin:/bin" }  # the complete environment (--clearenv is used)
+extra_args = []                  # raw bwrap flags appended last
+
+[tui]
+mouse = true                     # capture mouse events (scroll wheel scrolls the history)
+
+[prompts]
+compact = """Summarize in three bullets.
+Keep it short."""
 ```
 
-Inside the sandbox, the conversation's working directory is the only writable
-location and becomes the child's cwd; `/proc`, `/dev`, and a private `/tmp` are
-provided by bubblewrap. The network namespace is unshared unless `network:
-true` is set in the conversation's frontmatter (loopback works either way).
-Commands are killed after a timeout and their combined output is truncated
-before being fed back to the model.
+### LLM resolution precedence
+
+`.chat.md` frontmatter > `CHATFILE_*` environment variables > the active
+profile (`default_profile`) > standard `OPENAI_*` variables > built-in
+defaults (llama.cpp at `http://localhost:9000/v1/chat/completions`, model
+`local-model`). The API key resolves as `CHATFILE_API_KEY` > the active
+profile's `api_key_env` variable > `OPENAI_API_KEY`. A profile's `tools`
+allow-list and `scope` apply to conversations that do not override them in
+frontmatter; `fetch_url` and `bash` still require the frontmatter's
+`network`/`allow_shell` flags.
+
+The `[tui] mouse` setting (default `true`) can be overridden per invocation
+with `chatfile --mouse <file>` or `chatfile --mouse=false <file>`.
+
+### Sandbox behavior
+
+The `bash` tool runs through bubblewrap with the policy from the `[sandbox]`
+table above, falling back to built-in distro-agnostic defaults when no config
+names a key. Inside the sandbox, the conversation's working directory is the
+only writable location and becomes the child's cwd; `/proc`, `/dev`, and a
+private `/tmp` are provided by bubblewrap. The network namespace is unshared
+unless `network: true` is set in the conversation's frontmatter (loopback
+works either way). Commands are killed after a timeout and their combined
+output is truncated before being fed back to the model.
 
 ## Development notes
 

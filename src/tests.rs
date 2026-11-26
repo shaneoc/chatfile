@@ -85,7 +85,7 @@ data: [DONE]\n\n";
     )
     .unwrap();
 
-    compact(&file).await.unwrap();
+    compact(&file, &config::AppConfig::default()).await.unwrap();
 
     // The request carried the hierarchical system prompt (AGENTS.md + the
     // System section), every section of the file (no prior checkpoint), and
@@ -130,7 +130,7 @@ fn new_creates_template_and_refuses_overwrite() {
     let _ = std::fs::remove_dir_all(&dir);
     let file = dir.join("a").join("b").join("conv.md");
 
-    new(&file).unwrap();
+    new(&file, &config::AppConfig::default()).unwrap();
     // A plain `.md` name is normalized to `.chat.md`.
     let created = dir.join("a").join("b").join("conv.chat.md");
     assert!(created.exists());
@@ -147,7 +147,7 @@ fn new_creates_template_and_refuses_overwrite() {
     assert_eq!(conv.turns[0].content, "Your prompt here");
 
     // Refuse to overwrite an existing file.
-    assert!(new(&file).is_err());
+    assert!(new(&file, &config::AppConfig::default()).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -158,11 +158,11 @@ fn new_appends_default_extension() {
     let _ = std::fs::remove_dir_all(&dir);
     let file = dir.join("notes");
 
-    new(&file).unwrap();
+    new(&file, &config::AppConfig::default()).unwrap();
     assert!(dir.join("notes.chat.md").exists());
 
     // An explicit `.chat.md` is left untouched.
-    new(&dir.join("exact.chat.md")).unwrap();
+    new(&dir.join("exact.chat.md"), &config::AppConfig::default()).unwrap();
     assert!(dir.join("exact.chat.md").exists());
     assert!(!dir.join("exact.chat.chat.md").exists());
 

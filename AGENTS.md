@@ -37,8 +37,13 @@ conversations stored as plain Markdown files inside nested directories.
 ## Source Layout
 - `src/lib.rs` — crate root; exposes the public modules so docs.rs renders
   complete documentation.
-- `src/main.rs` — thin CLI entrypoint (`chatfile <file>`, `run`, `compact`,
-  `new`).
+- `src/main.rs` — thin CLI entrypoint (`chatfile <file>` with a `--mouse`
+  override, `run`, `compact`, `new`); loads the XDG config once and threads
+  it through.
+- `src/config.rs` — XDG-compliant TOML configuration (`config.toml`): named
+  endpoint/model profiles, sandbox policy, TUI settings, prompt overrides;
+  `resolve_llm` implements the precedence chain frontmatter > `CHATFILE_*`
+  env > active profile > `OPENAI_*` env > built-in defaults.
 - `src/parser.rs` — parse/serialize `.chat.md` files: frontmatter, turn
   boundaries, persisted tool turns, reasoning tags; `to_messages` folds the
   file into OpenAI wire-format messages.
@@ -53,10 +58,10 @@ conversations stored as plain Markdown files inside nested directories.
   safety (`resolve_safe_path`), and the multi-turn tool-calling loop
   (`run_turn`) that executes calls against the conversation's working
   directory and persists `**Tool**` turns.
-- `src/sandbox.rs` — config-driven rootless bubblewrap sandbox
-  (`/etc/chatfile/config.yaml`, `~/.config/chatfile/config.yaml`) used by the
-  `bash` tool: fresh mount/network namespaces, the work dir as the only
-  writable location, timeouts and output truncation.
+- `src/sandbox.rs` — rootless bubblewrap sandbox used by the `bash` tool,
+  driven by the `[sandbox]` table of the XDG config (see `src/config.rs`):
+  fresh mount/network namespaces, the work dir as the only writable location,
+  timeouts and output truncation.
 - `src/tui.rs` — the `ratatui` interactive UI (streaming, cancel, scrolling).
 
 ## Build & Verification Rules

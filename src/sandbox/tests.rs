@@ -6,9 +6,12 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OUTPUT: usize = 16384;
 
 /// The effective policy when `bwrap` is actually installed, otherwise a
-/// skip notice and `None` (the sandbox needs bubblewrap to run).
-fn sandbox_ready() -> Option<SandboxPolicy> {
-    let policy = SandboxPolicy::load().expect("loading effective sandbox policy");
+/// skip notice and `None` (the sandbox needs bubblewrap to run). The policy
+/// comes from the `[sandbox]` table of the effective XDG config.
+fn sandbox_ready() -> Option<SandboxConfig> {
+    let policy = crate::config::AppConfig::load()
+        .expect("loading effective config")
+        .sandbox;
     match find_program(&policy.bwrap_path) {
         Some(_) => Some(policy),
         None => {
@@ -16,80 +19,6 @@ fn sandbox_ready() -> Option<SandboxPolicy> {
             None
         }
     }
-}
-
-#[test]
-fn sandbox_config_yaml_parsing() {
-    let dir = TempDir::new().unwrap();
-
-    // An empty document yields pure defaults.
-    let empty = dir.path().join("empty.yaml");
-    std::fs::write(&empty, "").unwrap();
-    assert_eq!(
-        SandboxPolicy::load_from(&[empty.to_path_buf()]).unwrap(),
-        SandboxPolicy::default()
-    );
-
-    // A partial file overrides only the keys it names.
-    let partial = dir.path().join("partial.yaml");
-    std::fs::write(
-        &partial,
-        "bwrap_path: /usr/local/bin/bwrap\nro_bind:\n  - /opt/only\n",
-    )
-    .unwrap();
-    let policy = SandboxPolicy::load_from(&[empty.to_path_buf(), partial.clone()]).unwrap();
-    assert_eq!(policy.bwrap_path, "/usr/local/bin/bwrap");
-    assert_eq!(policy.ro_bind, vec!["/opt/only".to_string()]);
-    let defaults = SandboxPolicy::default();
-    assert_eq!(policy.symlink_or_ro_bind, defaults.symlink_or_ro_bind);
-    assert_eq!(policy.mask_devnull, defaults.mask_devnull);
-    assert_eq!(
-        policy.env.get("PATH").map(String::as_str),
-        Some("/usr/local/bin:/usr/bin:/bin")
-    );
-
-    // A later file overrides an earlier one, key by key.
-    let later = dir.path().join("later.yaml");
-    std::fs::write(&later, "bwrap_path: bwrap2\n").unwrap();
-    let policy = SandboxPolicy::load_from(&[partial, later.clone()]).unwrap();
-    assert_eq!(policy.bwrap_path, "bwrap2");
-    assert_eq!(policy.ro_bind, vec!["/opt/only".to_string()]);
-
-    // A complete file sets every field.
-    let full = dir.path().join("full.yaml");
-    std::fs::write(
-        &full,
-        "bwrap_path: bwrap\n\
-         ro_bind:\n  - /usr\n\
-         ro_bind_try:\n  - /opt\n\
-         symlink_or_ro_bind:\n  - /bin\n\
-         mask_tmpfs:\n  - /etc/ssh\n\
-         mask_devnull:\n  - /etc/shadow\n\
-         env:\n  PATH: /bin\n  HOME: /tmp\n\
-         extra_args:\n  - --ro-bind-try\n  - /var\n",
-    )
-    .unwrap();
-    let policy = SandboxPolicy::load_from(&[full]).unwrap();
-    assert_eq!(policy.ro_bind, vec!["/usr".to_string()]);
-    assert_eq!(policy.ro_bind_try, vec!["/opt".to_string()]);
-    assert_eq!(policy.symlink_or_ro_bind, vec!["/bin".to_string()]);
-    assert_eq!(policy.mask_tmpfs, vec!["/etc/ssh".to_string()]);
-    assert_eq!(policy.mask_devnull, vec!["/etc/shadow".to_string()]);
-    assert_eq!(policy.env.get("PATH").map(String::as_str), Some("/bin"));
-    assert_eq!(
-        policy.extra_args,
-        vec!["--ro-bind-try".to_string(), "/var".to_string()]
-    );
-
-    // Missing files are skipped; invalid YAML is an error.
-    let missing = dir.path().join("nope.yaml");
-    assert_eq!(
-        SandboxPolicy::load_from(&[missing]).unwrap(),
-        SandboxPolicy::default()
-    );
-    let bad = dir.path().join("bad.yaml");
-    std::fs::write(&bad, "bwrap_path: [unclosed\n").unwrap();
-    assert!(SandboxPolicy::load_from(&[bad]).is_err());
 }
 
 #[tokio::test]

@@ -7,8 +7,9 @@
 //!
 //! Streaming runs on a background tokio task feeding a `tokio::sync::mpsc`
 //! channel, so the UI stays responsive while a reply arrives: `Ctrl+C`
-//! cancels an active stream, and `PageUp`/`PageDown` (or `Ctrl+U`/`Ctrl+D`)
-//! scroll the history at any time. Typing `/compact` and pressing Enter
+//! cancels an active stream, and `PageUp`/`PageDown` (or `Ctrl+U`/`Ctrl+D`,
+//! or the mouse wheel when `[tui] mouse` is enabled) scroll the history at
+//! any time. Typing `/compact` and pressing Enter
 //! appends a `**User** | compact: true` request turn and streams the
 //! model's handoff summary as the next `**Assistant**` turn (context
 //! compaction, §5 of `docs/format.md`).
@@ -17,7 +18,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -32,19 +35,10 @@ use ratatui::{
 };
 use tokio::sync::mpsc;
 
-use crate::{context, llm, parser, tools};
+use crate::{config, context, llm, parser, tools};
 
-/// Environment variable overrides (frontmatter wins over these).
-const ENV_ENDPOINT: &str = "CHATFILE_ENDPOINT";
-const ENV_MODEL: &str = "CHATFILE_MODEL";
-const ENV_API_KEY: &str = "CHATFILE_API_KEY";
-/// Standard OpenAI-compatible variables, honored as a fallback when the
-/// `CHATFILE_*` equivalents are unset.
-const ENV_OPENAI_BASE: &str = "OPENAI_API_BASE";
-const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
-const DEFAULT_MODEL: &str = "local-model";
-
-/// Scroll step for PageUp/PageDown/Ctrl+U/Ctrl+D, in lines.
+/// Scroll step for PageUp/PageDown/Ctrl+U/Ctrl+D (and the mouse wheel),
+/// in lines.
 const SCROLL_STEP: usize = 10;
 
 /// Events produced by the background streaming task (one user turn, which
@@ -85,6 +79,12 @@ pub struct App {
     pub endpoint: String,
     /// API key, when configured via the environment.
     pub api_key: Option<String>,
+    /// Tool configuration for this conversation (frontmatter over the
+    /// active profile from config.toml).
+    pub tool_config: tools::ToolConfig,
+    /// Custom compaction prompt from `[prompts] compact` in config.toml,
+    /// when set.
+    pub compact_prompt: Option<String>,
     /// Multi-line input buffer.
     pub input: String,
     /// Byte offset of the cursor within `input`.
@@ -119,36 +119,31 @@ pub struct App {
     pub status: String,
 }
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
-}
-
 impl App {
-    /// Load a conversation file and prepare an app for it.
-    pub fn load(path: PathBuf) -> Result<Self> {
+    /// Load a conversation file and prepare an app for it. The endpoint,
+    /// model, and API key are resolved from the frontmatter, the
+    /// environment, and the active profile (see
+    /// [`config::AppConfig::resolve_llm`]); the tool configuration and the
+    /// compaction prompt come from the config.
+    pub fn load(path: PathBuf, app_config: &config::AppConfig) -> Result<Self> {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let conv =
             parser::parse(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
-        let endpoint = conv
-            .frontmatter
-            .endpoint
-            .clone()
-            .or_else(|| env(ENV_ENDPOINT))
-            .or_else(|| env(ENV_OPENAI_BASE))
-            .unwrap_or_else(|| llm::DEFAULT_ENDPOINT.to_string());
-        let model = conv
-            .frontmatter
-            .model
-            .clone()
-            .or_else(|| env(ENV_MODEL))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let (endpoint, model, api_key) = app_config.resolve_llm(
+            conv.frontmatter.endpoint.as_deref(),
+            conv.frontmatter.model.as_deref(),
+        );
+        let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, &path, app_config);
+        let compact_prompt = app_config.prompts.compact.clone();
         Ok(Self {
             path,
             conv,
             endpoint,
             model,
-            api_key: env(ENV_API_KEY).or_else(|| env(ENV_OPENAI_KEY)),
+            api_key,
+            tool_config,
+            compact_prompt,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -164,6 +159,34 @@ impl App {
             quit: false,
             status: String::new(),
         })
+    }
+
+    /// Scroll up by one step, unpinning from the bottom.
+    pub fn scroll_up(&mut self) {
+        self.scroll += SCROLL_STEP;
+        self.stick = false;
+    }
+
+    /// Scroll down by one step; at the bottom, re-pin to it.
+    pub fn scroll_down(&mut self) {
+        if self.scroll <= SCROLL_STEP {
+            // Reached the bottom: re-pin to it.
+            self.stick = true;
+            self.scroll = 0;
+        } else {
+            self.scroll -= SCROLL_STEP;
+        }
+    }
+
+    /// Handle a mouse event: the scroll wheel scrolls the history like
+    /// PageUp/PageDown (events are only delivered when mouse capture is
+    /// enabled).
+    pub fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        match mouse.kind {
+            crossterm::event::MouseEventKind::ScrollUp => self.scroll_up(),
+            crossterm::event::MouseEventKind::ScrollDown => self.scroll_down(),
+            _ => {}
+        }
     }
 
     /// Insert `s` at the cursor and advance the cursor past it.
@@ -228,18 +251,9 @@ impl App {
                 }
             }
             // Scrolling works at any time, including while streaming.
-            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.scroll += SCROLL_STEP;
-                self.stick = false;
-            }
+            (KeyCode::PageUp, _) | (KeyCode::Char('u'), KeyModifiers::CONTROL) => self.scroll_up(),
             (KeyCode::PageDown, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                if self.scroll <= SCROLL_STEP {
-                    // Reached the bottom: re-pin to it.
-                    self.stick = true;
-                    self.scroll = 0;
-                } else {
-                    self.scroll -= SCROLL_STEP;
-                }
+                self.scroll_down()
             }
             // Input editing is locked while a reply is streaming.
             _ if self.streaming => {}
@@ -548,18 +562,26 @@ fn role_style(role: parser::Role) -> Style {
     Style::default().fg(color)
 }
 
-/// Run the interactive TUI for `path` (the file must exist).
-pub async fn run_tui(path: PathBuf) -> Result<()> {
-    let mut app = App::load(path)?;
+/// Run the interactive TUI for `path` (the file must exist). When `mouse`
+/// is true, mouse capture is enabled so the scroll wheel scrolls the
+/// history.
+pub async fn run_tui(path: PathBuf, mouse: bool, config: &config::AppConfig) -> Result<()> {
+    let mut app = App::load(path, config)?;
     enable_raw_mode().context("failed to enable raw terminal mode")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = event_loop(&mut terminal, &mut app).await;
     // Restore the terminal even when the loop failed.
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    if mouse {
+        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+    }
     terminal.show_cursor()?;
     result
 }
@@ -622,6 +644,9 @@ async fn event_loop(
                             break;
                         }
                     }
+                    // Mouse wheel scrolls the history (only delivered when
+                    // mouse capture is enabled).
+                    Some(Ok(Event::Mouse(mouse))) => app.handle_mouse(mouse),
                     Some(Err(e)) => return Err(e.into()),
                     _ => {}
                 }
@@ -730,7 +755,7 @@ async fn submit(
     llm::complete_tool_calls(&mut messages);
 
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
-    let tool_config = tools::ToolConfig::for_file(&app.conv.frontmatter, &app.path);
+    let tool_config = app.tool_config.clone();
     let tx = tx.clone();
     let task = tokio::spawn(async move {
         // The whole (possibly multi-round) turn runs here; each event is
@@ -784,7 +809,7 @@ async fn compact(
     app: &mut App,
     tx: &mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let request = llm::compact_request_turn();
+    let request = llm::compact_request_turn(app.compact_prompt.as_deref());
     tools::append_turn(&app.path, &request)?;
     app.conv.turns.push(request);
 
@@ -796,7 +821,7 @@ async fn compact(
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(&app.path, system_section);
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
-    let tool_config = tools::ToolConfig::for_file(&app.conv.frontmatter, &app.path);
+    let tool_config = app.tool_config.clone();
     let conv = app.conv.clone();
     let tx = tx.clone();
     let task = tokio::spawn(async move {

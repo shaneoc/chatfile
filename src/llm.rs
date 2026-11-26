@@ -221,10 +221,17 @@ line note each; **Current state** — what is done and just verified; \
 
 /// The `**User** | <timestamp> | compact: true` turn that requests a
 /// compaction of the conversation so far.
-pub fn compact_request_turn() -> parser::Turn {
+///
+/// `custom_prompt` (e.g. `[prompts] compact` from `config.toml`) replaces
+/// [`COMPACT_INSTRUCTION`] when `Some`.
+pub fn compact_request_turn(custom_prompt: Option<&str>) -> parser::Turn {
+    let content = custom_prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(COMPACT_INSTRUCTION);
     parser::Turn {
         role: parser::Role::User,
-        content: COMPACT_INSTRUCTION.to_string(),
+        content: content.to_string(),
         meta: parser::TurnMeta {
             timestamp: Some(parser::now_timestamp()),
             tags: Vec::new(),

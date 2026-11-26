@@ -8,6 +8,9 @@
 //!
 //! # Modules
 //!
+//! - [`config`] — XDG-compliant TOML configuration
+//!   (`$XDG_CONFIG_HOME/chatfile/config.toml`, `$XDG_CONFIG_DIRS`): profiles,
+//!   sandbox policy, TUI settings, and prompt overrides.
 //! - [`parser`] — parse and serialize `.chat.md` files (frontmatter, turns,
 //!   persisted tool results, reasoning blocks).
 //! - [`context`] — hierarchical `AGENTS.md` context: walk up from the
@@ -18,8 +21,8 @@
 //! - [`tools`] — built-in tools (`list_files`, `read_file`, `write_file`,
 //!   `edit_file`, `search_files`, `fetch_url`, sandboxed `bash`) and the
 //!   multi-turn tool-calling loop ([`tools::run_turn`]).
-//! - [`sandbox`] — config-driven rootless bubblewrap sandbox used by the
-//!   `bash` tool.
+//! - [`sandbox`] — rootless bubblewrap sandbox used by the `bash` tool
+//!   (policy comes from [`config::SandboxConfig`]).
 //! - [`tui`] — the interactive `ratatui` terminal UI.
 //!
 //! The binary (`src/main.rs`) is a thin CLI over these modules:
@@ -41,6 +44,7 @@
 
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod context;
 pub mod llm;
 pub mod parser;

@@ -1,12 +1,10 @@
-//! Config-driven rootless [`bubblewrap`](https://github.com/containers/bubblewrap)
-//! sandbox for running untrusted commands (e.g. model-generated shell) without
-//! host filesystem or network access.
+//! Rootless [`bubblewrap`](https://github.com/containers/bubblewrap) sandbox
+//! for running untrusted commands (e.g. model-generated shell) without host
+//! filesystem or network access.
 //!
-//! The policy is loaded from optional YAML config files —
-//! `/etc/chatfile/config.yaml` (system) and `~/.config/chatfile/config.yaml`
-//! (user, overrides system) — falling back to built-in distro-agnostic
-//! defaults when neither exists. A config file may name any subset of the
-//! fields; unnamed fields keep the value from the layer below.
+//! The policy is a [`SandboxConfig`] passed in by the caller (loaded from the
+//! XDG `config.toml` by [`crate::config`] — see its `[sandbox]` table — with
+//! built-in distro-agnostic defaults when no config file exists).
 //!
 //! Sandbox layout: a fresh mount namespace containing only what the policy
 //! binds plus bwrap's own `/proc`, `/dev`, and a private `/tmp`. `work_dir`
@@ -14,174 +12,13 @@
 //! directory. The network namespace is unshared unless the caller passes
 //! `allow_network` (loopback works inside the fresh namespace either way).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::de::Deserializer;
-use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// System-wide sandbox config location.
-pub const SYSTEM_CONFIG_PATH: &str = "/etc/chatfile/config.yaml";
-
-/// User-level sandbox config location (`$HOME/.config/chatfile/config.yaml`),
-/// or `None` when `$HOME` is unset.
-pub fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| {
-        Path::new(&home)
-            .join(".config")
-            .join("chatfile")
-            .join("config.yaml")
-    })
-}
-
-/// Effective sandbox policy: built-in defaults with config-file overrides.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SandboxPolicy {
-    /// Path to the `bwrap` binary (bare names are resolved via `PATH`).
-    pub bwrap_path: String,
-    /// Host paths bind-mounted read-only into the sandbox.
-    pub ro_bind: Vec<String>,
-    /// Host paths bind-mounted read-only only if they exist on the host.
-    pub ro_bind_try: Vec<String>,
-    /// Host paths recreated inside the sandbox as a symlink (using the
-    /// host's link target) when they are symlinks, or read-only bound when
-    /// they are directories; missing paths are skipped. This keeps
-    /// usr-merged distros (`/bin -> usr/bin`) working without binding `/`.
-    pub symlink_or_ro_bind: Vec<String>,
-    /// Host paths covered by an empty tmpfs inside the sandbox, only when
-    /// the path exists on the host (so masking a missing dir under a
-    /// read-only bind can never fail).
-    pub mask_tmpfs: Vec<String>,
-    /// Host files replaced by a bind of `/dev/null` inside the sandbox,
-    /// only when the path is a regular file on the host.
-    pub mask_devnull: Vec<String>,
-    /// The complete environment of the sandboxed program (`--clearenv` is
-    /// always used, so nothing else leaks in).
-    pub env: BTreeMap<String, String>,
-    /// Extra raw `bwrap` flags appended after all standard flags.
-    pub extra_args: Vec<String>,
-}
-
-impl Default for SandboxPolicy {
-    fn default() -> Self {
-        let mut env = BTreeMap::new();
-        env.insert("PATH".into(), "/usr/local/bin:/usr/bin:/bin".into());
-        env.insert("HOME".into(), "/tmp".into());
-        env.insert("LANG".into(), "C.UTF-8".into());
-        env.insert("CARGO_HOME".into(), "/tmp/.cargo".into());
-        Self {
-            bwrap_path: "bwrap".into(),
-            ro_bind: vec!["/usr".into(), "/etc".into()],
-            ro_bind_try: vec!["/nix".into(), "/opt".into()],
-            symlink_or_ro_bind: vec![
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/lib64".into(),
-                "/lib32".into(),
-            ],
-            mask_tmpfs: vec!["/etc/ssh".into()],
-            mask_devnull: vec!["/etc/shadow".into(), "/etc/gshadow".into()],
-            env,
-            extra_args: Vec::new(),
-        }
-    }
-}
-
-/// Wire format for config files: every field optional so a partial file only
-/// overrides the keys it names.
-#[derive(Debug, Default, Deserialize)]
-struct PolicyOverrides {
-    bwrap_path: Option<String>,
-    ro_bind: Option<Vec<String>>,
-    ro_bind_try: Option<Vec<String>>,
-    symlink_or_ro_bind: Option<Vec<String>>,
-    mask_tmpfs: Option<Vec<String>>,
-    mask_devnull: Option<Vec<String>>,
-    env: Option<BTreeMap<String, String>>,
-    extra_args: Option<Vec<String>>,
-}
-
-impl PolicyOverrides {
-    fn apply(self, policy: &mut SandboxPolicy) {
-        if let Some(v) = self.bwrap_path {
-            policy.bwrap_path = v;
-        }
-        if let Some(v) = self.ro_bind {
-            policy.ro_bind = v;
-        }
-        if let Some(v) = self.ro_bind_try {
-            policy.ro_bind_try = v;
-        }
-        if let Some(v) = self.symlink_or_ro_bind {
-            policy.symlink_or_ro_bind = v;
-        }
-        if let Some(v) = self.mask_tmpfs {
-            policy.mask_tmpfs = v;
-        }
-        if let Some(v) = self.mask_devnull {
-            policy.mask_devnull = v;
-        }
-        if let Some(v) = self.env {
-            policy.env = v;
-        }
-        if let Some(v) = self.extra_args {
-            policy.extra_args = v;
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for SandboxPolicy {
-    /// A `SandboxPolicy` deserializes from the same partial YAML as a config
-    /// file, with missing keys filled in from the built-in defaults (an empty
-    /// document yields pure defaults).
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let overrides = Option::<PolicyOverrides>::deserialize(deserializer)?;
-        let mut policy = SandboxPolicy::default();
-        if let Some(overrides) = overrides {
-            overrides.apply(&mut policy);
-        }
-        Ok(policy)
-    }
-}
-
-impl SandboxPolicy {
-    /// Load the effective policy: built-in defaults, overridden by
-    /// `/etc/chatfile/config.yaml` when present, then by
-    /// `~/.config/chatfile/config.yaml` when present.
-    pub fn load() -> Result<Self> {
-        let mut paths = vec![PathBuf::from(SYSTEM_CONFIG_PATH)];
-        if let Some(user) = user_config_path() {
-            paths.push(user);
-        }
-        Self::load_from(&paths)
-    }
-
-    /// Like [`Self::load`] but from an explicit list of config files in
-    /// increasing precedence order. Missing files are skipped.
-    fn load_from(paths: &[PathBuf]) -> Result<Self> {
-        let mut policy = SandboxPolicy::default();
-        for path in paths {
-            if !path.is_file() {
-                continue;
-            }
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading sandbox config {}", path.display()))?;
-            let overrides: Option<PolicyOverrides> = serde_yaml::from_str(&text)
-                .with_context(|| format!("parsing sandbox config {}", path.display()))?;
-            if let Some(overrides) = overrides {
-                overrides.apply(&mut policy);
-            }
-        }
-        Ok(policy)
-    }
-}
+use crate::config::SandboxConfig;
 
 /// Result of a sandboxed command: exit status plus combined, truncated
 /// stdout+stderr.
@@ -220,7 +57,7 @@ fn find_program(program: &str) -> Option<PathBuf> {
 /// stdout+stderr is truncated to `max_output_bytes` with a `\n[truncated]`
 /// notice when truncation happens.
 pub async fn run_sandboxed(
-    policy: &SandboxPolicy,
+    policy: &SandboxConfig,
     work_dir: &Path,
     allow_network: bool,
     timeout: Duration,

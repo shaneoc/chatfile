@@ -16,18 +16,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chatfile::{context, llm, parser, tools, tui};
+use chatfile::{config, context, llm, parser, tools, tui};
 use clap::{Parser, Subcommand};
-
-/// Environment variable overrides (frontmatter wins over these).
-const ENV_ENDPOINT: &str = "CHATFILE_ENDPOINT";
-const ENV_MODEL: &str = "CHATFILE_MODEL";
-const ENV_API_KEY: &str = "CHATFILE_API_KEY";
-/// Standard OpenAI-compatible variables, honored as a fallback when the
-/// `CHATFILE_*` equivalents are unset.
-const ENV_OPENAI_BASE: &str = "OPENAI_API_BASE";
-const ENV_OPENAI_KEY: &str = "OPENAI_API_KEY";
-const DEFAULT_MODEL: &str = "local-model";
 
 /// The only file extension accepted for conversation files.
 const CONVERSATION_EXT: &str = "chat.md";
@@ -42,6 +32,10 @@ struct Cli {
     /// Conversation file to open in the interactive TUI.
     #[arg(value_name = "FILE")]
     file: Option<PathBuf>,
+    /// Enable or disable mouse capture in the TUI (overrides the `[tui]`
+    /// `mouse` setting from config.toml).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    mouse: Option<bool>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -74,12 +68,13 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = config::AppConfig::load()?;
     match cli.command {
-        Some(Command::Run { file }) => run(&file).await,
-        Some(Command::New { file }) => new(&file),
-        Some(Command::Compact { file }) => compact(&file).await,
+        Some(Command::Run { file }) => run(&file, &config).await,
+        Some(Command::New { file }) => new(&file, &config),
+        Some(Command::Compact { file }) => compact(&file, &config).await,
         None => match cli.file {
-            Some(file) => open_tui(file).await,
+            Some(file) => open_tui(file, cli.mouse, &config).await,
             None => bail!("missing conversation file; try `chatfile --help`"),
         },
     }
@@ -126,7 +121,7 @@ fn require_conversation_ext(path: &Path) -> Result<()> {
 }
 
 /// `chatfile <file>` — open the interactive TUI.
-async fn open_tui(path: PathBuf) -> Result<()> {
+async fn open_tui(path: PathBuf, mouse: Option<bool>, config: &config::AppConfig) -> Result<()> {
     // Append the extension when none was given; otherwise require it.
     let path = if path.extension().is_none() {
         path.with_extension(CONVERSATION_EXT)
@@ -142,42 +137,20 @@ async fn open_tui(path: PathBuf) -> Result<()> {
                 })?;
             }
         }
-        std::fs::write(&path, default_template())
+        std::fs::write(&path, default_template(config))
             .with_context(|| format!("failed to create {}", path.display()))?;
         eprintln!(
             "[chatfile] created {} with default frontmatter",
             path.display()
         );
     }
-    tui::run_tui(path).await
-}
-
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|s| !s.is_empty())
-}
-
-/// Resolve the endpoint, model, and API key for a conversation: frontmatter
-/// wins over the environment variables, then the built-in defaults.
-fn resolve_llm(conv: &parser::Conversation) -> (String, String, Option<String>) {
-    let endpoint = conv
-        .frontmatter
-        .endpoint
-        .clone()
-        .or_else(|| env(ENV_ENDPOINT))
-        .or_else(|| env(ENV_OPENAI_BASE))
-        .unwrap_or_else(|| llm::DEFAULT_ENDPOINT.to_string());
-    let model = conv
-        .frontmatter
-        .model
-        .clone()
-        .or_else(|| env(ENV_MODEL))
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let api_key = env(ENV_API_KEY).or_else(|| env(ENV_OPENAI_KEY));
-    (endpoint, model, api_key)
+    // The CLI flag overrides the config file when given.
+    let mouse = mouse.unwrap_or(config.tui.mouse);
+    tui::run_tui(path, mouse, config).await
 }
 
 /// `chatfile run <file.chat.md>`
-async fn run(file: &Path) -> Result<()> {
+async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
@@ -196,7 +169,10 @@ async fn run(file: &Path) -> Result<()> {
         .filter(|t| t.role == parser::Role::System)
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(file, system_section);
-    let (endpoint, model, api_key) = resolve_llm(&conv);
+    let (endpoint, model, api_key) = config.resolve_llm(
+        conv.frontmatter.endpoint.as_deref(),
+        conv.frontmatter.model.as_deref(),
+    );
 
     // `build_api_messages` applies the compaction windowing (§5 of
     // docs/format.md: a `compact: true` **User** checkpoint truncates the
@@ -213,7 +189,7 @@ async fn run(file: &Path) -> Result<()> {
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
-    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file);
+    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
 
     // Run the (possibly multi-turn) assistant reply. stdout stays a clean
     // stream of answer text: reasoning and tool results are only persisted
@@ -300,7 +276,7 @@ async fn run(file: &Path) -> Result<()> {
 /// an `**Assistant**` turn. The request turn is persisted before the model
 /// is called, so a failed run leaves a well-formed file whose trailing
 /// unanswered request the next `run` (or `compact`) simply answers.
-async fn compact(file: &Path) -> Result<()> {
+async fn compact(file: &Path, config: &config::AppConfig) -> Result<()> {
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
@@ -313,7 +289,7 @@ async fn compact(file: &Path) -> Result<()> {
             file.display()
         );
     }
-    let request = llm::compact_request_turn();
+    let request = llm::compact_request_turn(config.prompts.compact.as_deref());
     tools::append_turn(file, &request)?;
     conv.turns.push(request);
 
@@ -323,11 +299,14 @@ async fn compact(file: &Path) -> Result<()> {
         .filter(|t| t.role == parser::Role::System)
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(file, system_section);
-    let (endpoint, model, api_key) = resolve_llm(&conv);
+    let (endpoint, model, api_key) = config.resolve_llm(
+        conv.frontmatter.endpoint.as_deref(),
+        conv.frontmatter.model.as_deref(),
+    );
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key);
-    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file);
+    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
 
     // Stream the summary: stdout stays a clean stream of answer text, with
     // progress notes on stderr.
@@ -377,17 +356,14 @@ async fn compact(file: &Path) -> Result<()> {
 }
 
 /// The starter template written by `new` (and by the TUI when it creates a
-/// missing file).
-fn default_template() -> String {
-    format!(
-        "---\nmodel: {0}\nendpoint: {1}\n---\n**User**\n\nYour prompt here\n",
-        DEFAULT_MODEL,
-        llm::DEFAULT_ENDPOINT
-    )
+/// missing file), seeded with the resolved default endpoint and model.
+fn default_template(config: &config::AppConfig) -> String {
+    let (endpoint, model, _) = config.resolve_llm(None, None);
+    format!("---\nmodel: {model}\nendpoint: {endpoint}\n---\n**User**\n\nYour prompt here\n")
 }
 
 /// `chatfile new <file>`
-fn new(file: &Path) -> Result<()> {
+fn new(file: &Path, config: &config::AppConfig) -> Result<()> {
     let file = with_conversation_ext(file);
     if file.exists() {
         bail!("{} already exists; refusing to overwrite", file.display());
@@ -399,7 +375,7 @@ fn new(file: &Path) -> Result<()> {
             })?;
         }
     }
-    std::fs::write(&file, default_template())
+    std::fs::write(&file, default_template(config))
         .with_context(|| format!("failed to write {}", file.display()))?;
     eprintln!("[chatfile] created {}", file.display());
     Ok(())

@@ -8,6 +8,8 @@ fn config(dir: &Path) -> ToolConfig {
         network: false,
         allow_shell: false,
         work_dir: dir.to_path_buf(),
+        allowed_tools: None,
+        sandbox: SandboxConfig::default(),
     }
 }
 
