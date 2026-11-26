@@ -78,7 +78,10 @@ async fn write_and_read_file_round_trip() {
         "one\ntwo\nthree"
     );
     let out = execute("read_file", r#"{"path": "deep/dir/notes.md"}"#, &cfg).await;
-    assert_eq!(out, "1 | one\n2 | two\n3 | three\n(3 lines total, showing 1-3)\n");
+    assert_eq!(
+        out,
+        "1 | one\n2 | two\n3 | three\n(3 lines total, showing 1-3)\n"
+    );
 }
 
 #[tokio::test]
@@ -167,7 +170,11 @@ async fn list_files_skips_dotfiles_and_target() {
 #[tokio::test]
 async fn search_files_is_case_insensitive_and_capped() {
     let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "Hello world\nnothing\nHELLO again").unwrap();
+    std::fs::write(
+        dir.path().join("a.txt"),
+        "Hello world\nnothing\nHELLO again",
+    )
+    .unwrap();
     let cfg = config(dir.path());
     let out = execute("search_files", r#"{"query": "hello"}"#, &cfg).await;
     assert_eq!(out, "a.txt:1: Hello world\na.txt:3: HELLO again\n");
@@ -284,15 +291,19 @@ async fn bash_runs_in_sandbox_when_enabled() {
     assert!(out.starts_with("exit code: 0"), "{out}");
     assert!(out.contains("hello"), "{out}");
     // The sandboxed cwd is the working directory.
-    let cwd = dir.path().canonicalize().unwrap().to_string_lossy().into_owned();
+    let cwd = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     assert!(out.contains(&cwd), "{out}");
 }
 
 #[tokio::test]
 async fn bash_reports_nonzero_exit_codes() {
     let dir = TempDir::new().unwrap();
-    let Some(out) = sandboxed(r#"{"command": "echo oops >&2; exit 3"}"#, dir.path(), false)
-        .await
+    let Some(out) = sandboxed(r#"{"command": "echo oops >&2; exit 3"}"#, dir.path(), false).await
     else {
         return;
     };
@@ -358,10 +369,8 @@ async fn mock_server(responses: Vec<Vec<u8>>) -> (String, Arc<Mutex<Vec<String>>
 }
 
 fn sse(body: &str) -> Vec<u8> {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
-    )
-    .into_bytes()
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
+        .into_bytes()
 }
 
 const TOOL_CALL_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]}}]}\n\n\
@@ -375,11 +384,7 @@ data: [DONE]\n\n";
 #[tokio::test]
 async fn run_turn_executes_tool_call_then_finalizes() {
     let dir = TempDir::new().unwrap();
-    let (url, bodies) = mock_server(vec![
-        sse(TOOL_CALL_RESPONSE),
-        sse(FINAL_RESPONSE),
-    ])
-    .await;
+    let (url, bodies) = mock_server(vec![sse(TOOL_CALL_RESPONSE), sse(FINAL_RESPONSE)]).await;
     let client = Client::new(url, "test-model", None);
     let cfg = config(dir.path());
 
@@ -410,22 +415,28 @@ async fn run_turn_executes_tool_call_then_finalizes() {
     assert!(events[tool_idx].contains("call_1"));
     let ends = events.iter().filter(|e| e.contains("ResponseEnd")).count();
     assert_eq!(ends, 2);
-    assert!(events.iter().any(|e| e.contains("Content(\"Done writing.\")")));
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("Content(\"Done writing.\")"))
+    );
 
     // The second request carried the assistant tool call and the tool
     // result message.
     let b = bodies.lock().unwrap();
     assert_eq!(b.len(), 2);
     let v: Json = serde_json::from_str(&b[1]).unwrap();
-    let roles: Vec<&str> = v["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+    let roles: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
     assert_eq!(roles, vec!["user", "assistant", "tool"]);
     assert_eq!(v["messages"][1]["tool_calls"][0]["id"], "call_1");
     assert_eq!(v["messages"][2]["tool_call_id"], "call_1");
     // The tool message carries the write_file output, not the content.
-    assert_eq!(
-        v["messages"][2]["content"],
-        "Wrote 8 bytes to hello.txt\n"
-    );
+    assert_eq!(v["messages"][2]["content"], "Wrote 8 bytes to hello.txt\n");
 }
 
 #[tokio::test]
@@ -436,17 +447,12 @@ async fn run_turn_plain_response_needs_no_tools() {
     let cfg = config(dir.path());
 
     let mut content = String::new();
-    run_turn(
-        &client,
-        vec![Message::user("hi")],
-        &cfg,
-        |ev| {
-            if let LoopEvent::Content(s) = ev {
-                content.push_str(s);
-            }
-            true
-        },
-    )
+    run_turn(&client, vec![Message::user("hi")], &cfg, |ev| {
+        if let LoopEvent::Content(s) = ev {
+            content.push_str(s);
+        }
+        true
+    })
     .await
     .unwrap();
     assert_eq!(content, "Done writing.");
@@ -467,7 +473,10 @@ async fn run_turn_stops_at_max_iterations() {
     let err = run_turn(&client, vec![Message::user("loop")], &cfg, |_| true)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains(&MAX_TOOL_ITERATIONS.to_string()), "{err}");
+    assert!(
+        err.to_string().contains(&MAX_TOOL_ITERATIONS.to_string()),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -516,11 +525,12 @@ fn assistant_turn_helper_sets_reasoning_field() {
     assert_eq!(turn.role, parser::Role::Assistant);
     assert_eq!(turn.content, "the answer");
     assert_eq!(turn.reasoning.as_deref(), Some("thinking hard"));
-    assert!(turn
-        .meta
-        .tags
-        .iter()
-        .any(|(k, v)| k == "thinking" && v == "true"));
+    assert!(
+        turn.meta
+            .tags
+            .iter()
+            .any(|(k, v)| k == "thinking" && v == "true")
+    );
     // Empty reasoning is omitted (no tag, no field).
     let turn = assistant_turn("m1", "  ", "just", &[]);
     assert_eq!(turn.content, "just");

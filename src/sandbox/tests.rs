@@ -25,7 +25,10 @@ fn sandbox_config_yaml_parsing() {
     // An empty document yields pure defaults.
     let empty = dir.path().join("empty.yaml");
     std::fs::write(&empty, "").unwrap();
-    assert_eq!(SandboxPolicy::load_from(&[empty.to_path_buf()]).unwrap(), SandboxPolicy::default());
+    assert_eq!(
+        SandboxPolicy::load_from(&[empty.to_path_buf()]).unwrap(),
+        SandboxPolicy::default()
+    );
 
     // A partial file overrides only the keys it names.
     let partial = dir.path().join("partial.yaml");
@@ -40,7 +43,10 @@ fn sandbox_config_yaml_parsing() {
     let defaults = SandboxPolicy::default();
     assert_eq!(policy.symlink_or_ro_bind, defaults.symlink_or_ro_bind);
     assert_eq!(policy.mask_devnull, defaults.mask_devnull);
-    assert_eq!(policy.env.get("PATH").map(String::as_str), Some("/usr/local/bin:/usr/bin:/bin"));
+    assert_eq!(
+        policy.env.get("PATH").map(String::as_str),
+        Some("/usr/local/bin:/usr/bin:/bin")
+    );
 
     // A later file overrides an earlier one, key by key.
     let later = dir.path().join("later.yaml");
@@ -70,11 +76,17 @@ fn sandbox_config_yaml_parsing() {
     assert_eq!(policy.mask_tmpfs, vec!["/etc/ssh".to_string()]);
     assert_eq!(policy.mask_devnull, vec!["/etc/shadow".to_string()]);
     assert_eq!(policy.env.get("PATH").map(String::as_str), Some("/bin"));
-    assert_eq!(policy.extra_args, vec!["--ro-bind-try".to_string(), "/var".to_string()]);
+    assert_eq!(
+        policy.extra_args,
+        vec!["--ro-bind-try".to_string(), "/var".to_string()]
+    );
 
     // Missing files are skipped; invalid YAML is an error.
     let missing = dir.path().join("nope.yaml");
-    assert_eq!(SandboxPolicy::load_from(&[missing]).unwrap(), SandboxPolicy::default());
+    assert_eq!(
+        SandboxPolicy::load_from(&[missing]).unwrap(),
+        SandboxPolicy::default()
+    );
     let bad = dir.path().join("bad.yaml");
     std::fs::write(&bad, "bwrap_path: [unclosed\n").unwrap();
     assert!(SandboxPolicy::load_from(&[bad]).is_err());
@@ -83,7 +95,7 @@ fn sandbox_config_yaml_parsing() {
 #[tokio::test]
 async fn sandbox_allows_workdir_and_loopback() {
     let Some(policy) = sandbox_ready() else {
-        return
+        return;
     };
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("work.txt"), "original\n").unwrap();
@@ -96,14 +108,19 @@ async fn sandbox_allows_workdir_and_loopback() {
         TIMEOUT,
         MAX_OUTPUT,
         "/bin/sh",
-        &["-c", "cat work.txt && echo modified > work.txt && cat work.txt"],
+        &[
+            "-c",
+            "cat work.txt && echo modified > work.txt && cat work.txt",
+        ],
     )
     .await
     .unwrap();
     assert!(out.succeeded(), "output: {}", out.output);
     assert_eq!(out.output.trim(), "original\nmodified");
     assert_eq!(
-        std::fs::read_to_string(dir.path().join("work.txt")).unwrap().trim(),
+        std::fs::read_to_string(dir.path().join("work.txt"))
+            .unwrap()
+            .trim(),
         "modified"
     );
 
@@ -126,17 +143,29 @@ cli.send(b"ping")
 print("LOOPBACK-OK", cli.recv(4))
 t.join()
 "#;
-    let out = run_sandboxed(&policy, dir.path(), false, TIMEOUT, MAX_OUTPUT, "python3", &["-c", py])
-        .await
-        .unwrap();
+    let out = run_sandboxed(
+        &policy,
+        dir.path(),
+        false,
+        TIMEOUT,
+        MAX_OUTPUT,
+        "python3",
+        &["-c", py],
+    )
+    .await
+    .unwrap();
     assert!(out.succeeded(), "output: {}", out.output);
-    assert!(out.output.contains("LOOPBACK-OK b'pong'"), "output: {}", out.output);
+    assert!(
+        out.output.contains("LOOPBACK-OK b'pong'"),
+        "output: {}",
+        out.output
+    );
 }
 
 #[tokio::test]
 async fn sandbox_blocks_host_filesystem_and_secrets() {
     let Some(policy) = sandbox_ready() else {
-        return
+        return;
     };
     let base = TempDir::new().unwrap();
     let work = base.path().join("work");
@@ -153,7 +182,10 @@ async fn sandbox_blocks_host_filesystem_and_secrets() {
         TIMEOUT,
         MAX_OUTPUT,
         "/bin/sh",
-        &["-c", "echo pwn > /usr/pwned 2>/dev/null && echo PWNED || echo BLOCKED"],
+        &[
+            "-c",
+            "echo pwn > /usr/pwned 2>/dev/null && echo PWNED || echo BLOCKED",
+        ],
     )
     .await
     .unwrap();
@@ -202,8 +234,11 @@ async fn sandbox_blocks_host_filesystem_and_secrets() {
         TIMEOUT,
         MAX_OUTPUT,
         "/bin/sh",
-        &["-c", "for v in ANTHROPIC_API_KEY CARGO_MANIFEST_DIR USER TERM PATH HOME; do \
-                eval \"val=\\${$v:-}\"; printf '%s=[%s]\\n' \"$v\" \"$val\"; done"],
+        &[
+            "-c",
+            "for v in ANTHROPIC_API_KEY CARGO_MANIFEST_DIR USER TERM PATH HOME; do \
+                eval \"val=\\${$v:-}\"; printf '%s=[%s]\\n' \"$v\" \"$val\"; done",
+        ],
     )
     .await
     .unwrap();
@@ -215,14 +250,18 @@ async fn sandbox_blocks_host_filesystem_and_secrets() {
             out.output
         );
     }
-    assert!(out.output.contains("PATH=[/usr/local/bin:/usr/bin:/bin]"), "output: {}", out.output);
+    assert!(
+        out.output.contains("PATH=[/usr/local/bin:/usr/bin:/bin]"),
+        "output: {}",
+        out.output
+    );
     assert!(out.output.contains("HOME=[/tmp]"), "output: {}", out.output);
 }
 
 #[tokio::test]
 async fn sandbox_blocks_external_network_and_enforces_timeout() {
     let Some(policy) = sandbox_ready() else {
-        return
+        return;
     };
     let dir = TempDir::new().unwrap();
 
@@ -241,9 +280,17 @@ except OSError as e:
     print("BLOCKED-OK %.2f %s" % (dt, e))
     assert dt < 4.0, "connect hung: network namespace may be shared"
 "#;
-    let out = run_sandboxed(&policy, dir.path(), false, TIMEOUT, MAX_OUTPUT, "python3", &["-c", py])
-        .await
-        .unwrap();
+    let out = run_sandboxed(
+        &policy,
+        dir.path(),
+        false,
+        TIMEOUT,
+        MAX_OUTPUT,
+        "python3",
+        &["-c", py],
+    )
+    .await
+    .unwrap();
     assert!(out.succeeded(), "output: {}", out.output);
     assert!(
         !out.output.contains("CONNECTED-BAD"),
@@ -254,9 +301,17 @@ except OSError as e:
 
     // A long-running command is killed at the deadline.
     let started = Instant::now();
-    let err = run_sandboxed(&policy, dir.path(), false, Duration::from_millis(200), MAX_OUTPUT, "sleep", &["10"])
-        .await
-        .unwrap_err();
+    let err = run_sandboxed(
+        &policy,
+        dir.path(),
+        false,
+        Duration::from_millis(200),
+        MAX_OUTPUT,
+        "sleep",
+        &["10"],
+    )
+    .await
+    .unwrap_err();
     let elapsed = started.elapsed();
     assert!(err.to_string().contains("timed out"), "error: {err}");
     assert!(elapsed < Duration::from_secs(5), "kill took {elapsed:?}");

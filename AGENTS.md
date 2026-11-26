@@ -57,7 +57,11 @@ conversations stored as plain Markdown files inside nested directories.
 - `src/tui.rs` — the `ratatui` interactive UI (streaming, cancel, scrolling).
 
 ## Build & Verification Rules
-- Use `cargo check` and `cargo test` after every module change.
+- Run `cargo fmt` before every commit so all Rust code matches standard
+  `rustfmt` style.
+- Run `cargo clippy --all-targets -- -D warnings` and `cargo test` after every
+  module change, ensuring zero warnings and all passing tests before
+  committing.
 - Keep dependencies minimal and well-maintained.
 
 ## Rust Dependencies

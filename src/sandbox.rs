@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -313,8 +313,7 @@ pub async fn run_sandboxed(
     }
 
     let output = match tokio::time::timeout(timeout, cmd.output()).await {
-        Ok(result) => result
-            .with_context(|| format!("running sandboxed command '{}'", program))?,
+        Ok(result) => result.with_context(|| format!("running sandboxed command '{}'", program))?,
         Err(_) => bail!(
             "sandboxed command '{}' timed out after {:?}",
             program,

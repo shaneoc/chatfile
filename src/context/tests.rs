@@ -47,7 +47,10 @@ fn chain_is_root_first_and_bounded_by_marker() {
     assert_eq!(files[0], root.join(AGENTS_FILE)); // most general first
     assert_eq!(files[1], mid.join(AGENTS_FILE));
     assert_eq!(files[2], leaf.join(AGENTS_FILE)); // most specific last
-    assert_eq!(collect_agents_context(&leaf), "ROOT RULES\n\nMID RULES\n\nLEAF RULES");
+    assert_eq!(
+        collect_agents_context(&leaf),
+        "ROOT RULES\n\nMID RULES\n\nLEAF RULES"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

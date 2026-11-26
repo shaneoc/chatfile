@@ -1,7 +1,7 @@
 use super::*;
 use crate::parser;
-use std::sync::{Arc, Mutex};
 use futures::StreamExt;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -225,7 +225,10 @@ Content-Length: 31\r\n\
     let url = serve_once(raw.to_vec()).await;
 
     let client = Client::new(url, "test-model", None);
-    let err = client.stream_chat(&[Message::user("hi")], None).await.unwrap_err();
+    let err = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("400"), "unexpected error: {msg}");
     assert!(msg.contains("bad req"), "unexpected error: {msg}");
@@ -251,7 +254,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\"only\"}}]}\n\n";
     }
     assert_eq!(
         chunks,
-        vec![StreamDelta::Content("only".into()), StreamDelta::Finished(None)]
+        vec![
+            StreamDelta::Content("only".into()),
+            StreamDelta::Finished(None)
+        ]
     );
 }
 
