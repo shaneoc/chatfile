@@ -8,7 +8,10 @@
 //! Streaming runs on a background tokio task feeding a `tokio::sync::mpsc`
 //! channel, so the UI stays responsive while a reply arrives: `Ctrl+C`
 //! cancels an active stream, and `PageUp`/`PageDown` (or `Ctrl+U`/`Ctrl+D`)
-//! scroll the history at any time.
+//! scroll the history at any time. Typing `/compact` and pressing Enter
+//! appends a `**User** | compact: true` request turn and streams the
+//! model's handoff summary as the next `**Assistant**` turn (context
+//! compaction, §5 of `docs/format.md`).
 
 use std::path::PathBuf;
 
@@ -16,16 +19,16 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Frame, Terminal,
 };
 use tokio::sync::mpsc;
 
@@ -101,6 +104,13 @@ pub struct App {
     pub got_reply: bool,
     /// User message queued by [`App::handle_key`] for the event loop to send.
     pub pending_send: Option<String>,
+    /// A `/compact` command queued by [`App::handle_key`] for the event loop
+    /// to run (persists the `compact: true` request turn, then streams the
+    /// handoff summary).
+    pub pending_compact: bool,
+    /// True while a `/compact` summary is streaming; the reply is persisted
+    /// as an `**Assistant**` turn when the stream ends.
+    pub compacting: bool,
     /// Set by Ctrl+C while streaming; the event loop aborts the task.
     pub cancel_requested: bool,
     /// Set when the user quits (Esc, or Ctrl+C while idle).
@@ -118,8 +128,8 @@ impl App {
     pub fn load(path: PathBuf) -> Result<Self> {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let conv = parser::parse(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let conv =
+            parser::parse(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         let endpoint = conv
             .frontmatter
             .endpoint
@@ -148,6 +158,8 @@ impl App {
             stream_buf: String::new(),
             got_reply: false,
             pending_send: None,
+            pending_compact: false,
+            compacting: false,
             cancel_requested: false,
             quit: false,
             status: String::new(),
@@ -234,16 +246,21 @@ impl App {
             // Newline: Alt+Enter or Ctrl+J.
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => self.insert_str("\n"),
             (KeyCode::Char('j'), KeyModifiers::CONTROL) => self.insert_str("\n"),
-            // Plain Enter sends the input.
+            // Plain Enter sends the input (or runs `/compact`).
             (KeyCode::Enter, m) if m.is_empty() => {
                 let text = self.input.trim().to_string();
                 if !text.is_empty() {
-                    self.pending_send = Some(text);
+                    if text == "/compact" {
+                        self.pending_compact = true;
+                        self.status = "compacting…".into();
+                    } else {
+                        self.pending_send = Some(text);
+                        self.status = "sending…".into();
+                    }
                     self.input.clear();
                     self.cursor = 0;
                     self.scroll = 0;
                     self.stick = true;
-                    self.status = "sending…".into();
                 }
             }
             (KeyCode::Backspace, _) => self.backspace(),
@@ -283,6 +300,7 @@ impl App {
             let meta = parser::TurnMeta {
                 timestamp: Some(parser::now_timestamp()),
                 tags: vec![("model".into(), self.model.clone())],
+                compact: false,
             };
             let reason = (!self.reason_buf.is_empty()).then_some(self.reason_buf.as_str());
             push_turn(
@@ -412,15 +430,9 @@ impl App {
         if s_area.height > 0 {
             let state = if self.streaming {
                 if self.stream_buf.is_empty() && !self.reason_buf.is_empty() {
-                    format!(
-                        "thinking… ({} chars)",
-                        self.reason_buf.chars().count()
-                    )
+                    format!("thinking… ({} chars)", self.reason_buf.chars().count())
                 } else if !self.stream_buf.is_empty() {
-                    format!(
-                        "streaming… ({} chars)",
-                        self.stream_buf.chars().count()
-                    )
+                    format!("streaming… ({} chars)", self.stream_buf.chars().count())
                 } else if !self.status.is_empty() {
                     // Between responses (e.g. a tool just ran).
                     self.status.clone()
@@ -438,7 +450,7 @@ impl App {
                 .and_then(|s| s.to_str())
                 .unwrap_or("?");
             let text = format!(
-                " {} | model: {} | {} | Enter send · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel/quit",
+                " {} | model: {} | {} | Enter send · /compact summarize · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel/quit",
                 name, self.model, state
             );
             frame.render_widget(
@@ -520,7 +532,9 @@ fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
 
 /// Display width of a character (control characters count as one cell).
 fn char_width(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0).max(1)
+    unicode_width::UnicodeWidthChar::width(c)
+        .unwrap_or(0)
+        .max(1)
 }
 
 /// Per-role base color for the history pane.
@@ -573,6 +587,18 @@ async fn event_loop(
             }
         }
 
+        // Queued `/compact`: persist the request turn, then stream the
+        // handoff summary.
+        if app.pending_compact {
+            app.pending_compact = false;
+            match compact(app, &tx).await {
+                Ok(task) => stream_task = Some(task),
+                Err(e) => {
+                    app.status = format!("error: {e}");
+                }
+            }
+        }
+
         // Queued cancel (Ctrl+C while streaming).
         if app.cancel_requested {
             app.cancel_requested = false;
@@ -580,6 +606,7 @@ async fn event_loop(
                 h.abort();
             }
             app.streaming = false;
+            app.compacting = false;
             app.reason_buf.clear();
             app.stream_buf.clear();
             app.got_reply = false;
@@ -629,7 +656,16 @@ async fn event_loop(
                             let _ = h.await;
                         }
                         app.streaming = false;
-                        if !app.got_reply {
+                        if app.compacting {
+                            // The summary streams as one response without a
+                            // ResponseEnd, so persist it now.
+                            app.compacting = false;
+                            match finalize_response(app, &[]) {
+                                Ok(()) if app.got_reply => app.status.clear(),
+                                Ok(()) => app.status = "no summary produced".into(),
+                                Err(e) => app.status = format!("error: {e}"),
+                            }
+                        } else if !app.got_reply {
                             app.status = "no reply produced".into();
                         } else {
                             app.status.clear();
@@ -641,6 +677,7 @@ async fn event_loop(
                             let _ = h.await;
                         }
                         app.streaming = false;
+                        app.compacting = false;
                         app.reason_buf.clear();
                         app.stream_buf.clear();
                         app.got_reply = false;
@@ -667,6 +704,7 @@ async fn submit(
         meta: parser::TurnMeta {
             timestamp: Some(ts),
             tags: vec![],
+            compact: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -681,16 +719,14 @@ async fn submit(
         .filter(|t| t.role == parser::Role::System)
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(&app.path, system_section);
-    let mut messages: Vec<llm::Message> = Vec::new();
-    if !system_prompt.is_empty() {
-        messages.push(llm::Message::system(system_prompt));
-    }
-    // `to_messages` projects persisted turns (assistant tool calls ride on
-    // the assistant message; `**Tool**` turns become `role: "tool"`
-    // messages). `complete_tool_calls` answers any call left dangling by a
+    // `build_api_messages` applies the compaction windowing (§5 of
+    // docs/format.md) and projects the surviving turns; `set_system_prompt`
+    // overlays the hierarchical AGENTS.md prompt on the leading system
+    // message; `complete_tool_calls` answers any call left dangling by a
     // cancelled or interrupted execution, so reloaded histories are valid
     // API payloads.
-    messages.extend(app.conv.to_messages());
+    let mut messages = llm::build_api_messages(&app.conv);
+    llm::set_system_prompt(&mut messages, &system_prompt);
     llm::complete_tool_calls(&mut messages);
 
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
@@ -701,13 +737,15 @@ async fn submit(
         // forwarded to the UI over the channel.
         let res = tools::run_turn(&client, messages, &tool_config, |ev| {
             let ev = match ev {
-                tools::LoopEvent::Reasoning(s) => StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone())),
-                tools::LoopEvent::Content(s) => StreamEvent::Delta(llm::StreamDelta::Content(s.clone())),
-                tools::LoopEvent::ResponseEnd { tool_calls } => {
-                    StreamEvent::ResponseEnd {
-                        tool_calls: tool_calls.clone(),
-                    }
+                tools::LoopEvent::Reasoning(s) => {
+                    StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone()))
                 }
+                tools::LoopEvent::Content(s) => {
+                    StreamEvent::Delta(llm::StreamDelta::Content(s.clone()))
+                }
+                tools::LoopEvent::ResponseEnd { tool_calls } => StreamEvent::ResponseEnd {
+                    tool_calls: tool_calls.clone(),
+                },
                 tools::LoopEvent::ToolResult {
                     id,
                     name,
@@ -732,6 +770,60 @@ async fn submit(
         }
     });
     app.streaming = true;
+    app.reason_buf.clear();
+    app.stream_buf.clear();
+    app.got_reply = false;
+    Ok(task)
+}
+
+/// Persist a `**User** | compact: true` compaction request, then spawn the
+/// streaming task for the model's handoff summary. The summary is a single
+/// response (no tool loop), so it is persisted by the event loop when the
+/// stream ends (see [`StreamEvent::Done`]).
+async fn compact(
+    app: &mut App,
+    tx: &mpsc::UnboundedSender<StreamEvent>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let request = tools::compact_request_turn();
+    tools::append_turn(&app.path, &request)?;
+    app.conv.turns.push(request);
+
+    let system_section = app
+        .conv
+        .turns
+        .first()
+        .filter(|t| t.role == parser::Role::System)
+        .map(|t| t.content.as_str());
+    let system_prompt = context::build_system_prompt(&app.path, system_section);
+    let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
+    let tool_config = tools::ToolConfig::for_file(&app.conv.frontmatter, &app.path);
+    let conv = app.conv.clone();
+    let tx = tx.clone();
+    let task = tokio::spawn(async move {
+        let res = tools::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
+            match ev {
+                tools::LoopEvent::Reasoning(s) => tx
+                    .send(StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone())))
+                    .is_ok(),
+                tools::LoopEvent::Content(s) => tx
+                    .send(StreamEvent::Delta(llm::StreamDelta::Content(s.clone())))
+                    .is_ok(),
+                // run_compact emits only Reasoning/Content deltas.
+                _ => true,
+            }
+        })
+        .await;
+        match res {
+            Ok(_) => {
+                let _ = tx.send(StreamEvent::Done);
+            }
+            Err(e) => {
+                let _ = tx.send(StreamEvent::Failed(e.to_string()));
+            }
+        }
+    });
+    app.streaming = true;
+    app.compacting = true;
     app.reason_buf.clear();
     app.stream_buf.clear();
     app.got_reply = false;

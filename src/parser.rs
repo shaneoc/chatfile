@@ -41,7 +41,7 @@
 //! rule so the round trip is lossless (see [`escape_boundaries`] and
 //! `docs/format.md`).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -115,16 +115,25 @@ pub struct TurnMeta {
     pub timestamp: Option<String>,
     /// Arbitrary `key: value` tags (e.g. `("model", "local-model")`).
     pub tags: Vec<(String, String)>,
+    /// Whether the header carried `compact: true` (a `**User**`-only tag
+    /// marking a context-compaction request; see §2.2 of `docs/format.md`).
+    /// Lifted out of [`TurnMeta::tags`] on parse so it has a stable,
+    /// role-checked position in the rendered header.
+    pub compact: bool,
 }
 
 impl TurnMeta {
     /// The metadata as it appears after the role in a header line — plain
-    /// segments joined by ` | ` (timestamp first, then `key: value` pairs) —
-    /// or `None` when there is none.
+    /// segments joined by ` | ` (timestamp first, then `compact: true` when
+    /// set, then the remaining `key: value` pairs) — or `None` when there is
+    /// none.
     pub fn render(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ts) = &self.timestamp {
             parts.push(ts.clone());
+        }
+        if self.compact {
+            parts.push("compact: true".to_string());
         }
         for (k, v) in &self.tags {
             // Always `key: value` (a bare key would not re-parse); an empty
@@ -336,11 +345,7 @@ pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
     let close_at = close_at?;
     let output = lines[open_at + 1..close_at].join("\n").trim().to_string();
 
-    Some(ToolTurnData {
-        name,
-        id,
-        output,
-    })
+    Some(ToolTurnData { name, id, output })
 }
 
 /// Serialize a tool result into the canonical persisted body: a
@@ -350,9 +355,7 @@ pub fn parse_tool_turn(turn: &Turn) -> Option<ToolTurnData> {
 /// terminate it early.
 pub fn tool_turn_body(output: &str) -> String {
     let fence = "~".repeat(fence_len(output));
-    format!(
-        "<details>\n<summary>Output</summary>\n\n{fence}text\n{output}\n{fence}\n\n</details>"
-    )
+    format!("<details>\n<summary>Output</summary>\n\n{fence}text\n{output}\n{fence}\n\n</details>")
 }
 
 /// The tilde fence length for tool arguments or output:
@@ -418,7 +421,9 @@ pub struct Conversation {
 /// Current local time formatted as `YYYY-MM-DD HH:MM ±HH:MM`, with the
 /// system's numeric UTC offset (e.g. `-05:00`) recorded automatically.
 pub fn now_timestamp() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M %:z").to_string()
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M %:z")
+        .to_string()
 }
 
 /// If `line` consists of `N` leading backslashes followed by `---` and
@@ -479,7 +484,8 @@ fn looks_like_timestamp(s: &str) -> bool {
         && b[7] == b'-'
         && b[10] == b' '
         && b[13] == b':'
-        && b[..16].iter()
+        && b[..16]
+            .iter()
             .enumerate()
             .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit())
 }
@@ -520,9 +526,7 @@ fn validate_timestamp(s: &str) -> Result<()> {
     chrono::NaiveDate::from_ymd_opt(i32::try_from(year).unwrap(), month, day)
         .ok_or_else(|| anyhow!("invalid timestamp '{s}'; not a valid calendar date"))?;
     chrono::NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(|| {
-        anyhow!(
-            "invalid timestamp '{s}'; hour must be 00..=23 and minute 00..=59"
-        )
+        anyhow!("invalid timestamp '{s}'; hour must be 00..=23 and minute 00..=59")
     })?;
     if off_hours > 23 || off_minutes > 59 {
         return Err(anyhow!(
@@ -570,9 +574,8 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
     };
     let rest = t.strip_prefix("**").ok_or_else(bad_role)?;
     let end = rest.find("**").ok_or_else(bad_role)?;
-    let role = Role::parse(&rest[..end]).ok_or_else(|| {
-        line_error(line_no, format!("unknown role in header: {}", &rest[..end]))
-    })?;
+    let role = Role::parse(&rest[..end])
+        .ok_or_else(|| line_error(line_no, format!("unknown role in header: {}", &rest[..end])))?;
     let mut meta = TurnMeta::default();
     let after = &rest[end + 2..];
     if !after.trim().is_empty() {
@@ -610,11 +613,11 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                 validate_timestamp(seg).map_err(|e| line_error(line_no, e.to_string()))?;
                 // Normalize the ambiguous `-00:00` to `+00:00` so a later
                 // serialization never emits it.
-                meta.timestamp = Some(if seg.ends_with("-00:00") {
-                    format!("{}+00:00", &seg[..seg.len() - 6])
-                } else {
-                    seg.to_string()
-                });
+                meta.timestamp = Some(
+                    seg.strip_suffix("-00:00")
+                        .map(|prefix| format!("{prefix}+00:00"))
+                        .unwrap_or_else(|| seg.to_string()),
+                );
             } else if let Some((k, v)) = seg.split_once(':') {
                 let k = k.trim();
                 if k.is_empty() {
@@ -655,6 +658,30 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                 ));
             }
         }
+    }
+    // The `compact` tag is a **User**-only switch marking a context-
+    // compaction request; it must be exactly the lowercase literal `true`.
+    // When present it is lifted out of the free-form tags into
+    // [`TurnMeta::compact`] (rendered right after the timestamp).
+    for (k, v) in &meta.tags {
+        if k == "compact" {
+            if role != Role::User {
+                return Err(line_error(
+                    line_no,
+                    "'compact' metadata is only allowed on **User** headers",
+                ));
+            }
+            if v != "true" {
+                return Err(line_error(
+                    line_no,
+                    "'compact' metadata must be the literal value 'true'",
+                ));
+            }
+        }
+    }
+    if meta.tags.iter().any(|(k, _)| k == "compact") {
+        meta.compact = true;
+        meta.tags.retain(|(k, _)| k != "compact");
     }
     // The `tool_calls` tag is an assistant-only positive integer counting
     // the trailing Tool Call blocks in the body.
@@ -732,7 +759,11 @@ impl FenceTracker {
                 // backticks in their info string.
                 if run >= 3 {
                     let info = &rest[run..];
-                    let ok = if fence_char == '`' { !info.contains('`') } else { true };
+                    let ok = if fence_char == '`' {
+                        !info.contains('`')
+                    } else {
+                        true
+                    };
                     if ok {
                         self.char = Some(fence_char);
                         self.len = run;
@@ -787,7 +818,10 @@ fn split_frontmatter(input: &str) -> Result<(Option<&str>, &str, usize)> {
             }
         }
     }
-    Err(line_error(open_line, "frontmatter block is not closed with a `---` line"))
+    Err(line_error(
+        open_line,
+        "frontmatter block is not closed with a `---` line",
+    ))
 }
 
 /// Parse conversation Markdown into a [`Conversation`].
@@ -895,7 +929,12 @@ pub fn parse(input: &str) -> Result<Conversation> {
                         ));
                     }
                     fence.next_line(lines[i + 1]); // keep the tracker in sync
-                    raw_turns.push((cur_role, cur_meta, std::mem::take(&mut cur_lines), cur_start));
+                    raw_turns.push((
+                        cur_role,
+                        cur_meta,
+                        std::mem::take(&mut cur_lines),
+                        cur_start,
+                    ));
                     cur_role = role;
                     cur_meta = meta;
                     cur_start = i + 2;
@@ -1039,7 +1078,7 @@ pub fn escape_boundaries(content: &str) -> String {
     if let Some(at) = open_fence_at {
         // Unclosed opening fence: prepend one backslash (`0 -> 1`).
         let mut s = out[at].clone();
-        s.insert_str(0, "\\");
+        s.insert(0, '\\');
         out[at] = s;
     }
     out.concat()
@@ -1225,7 +1264,10 @@ fn details_tags_in_line(line: &str) -> Vec<(usize, bool, usize)> {
             if let Some(gt) = line[i + 8..].find('>') {
                 let between = &line[i + 8..i + 8 + gt];
                 if between.is_empty()
-                    || between.bytes().next().map_or(false, |c| c.is_ascii_whitespace())
+                    || between
+                        .bytes()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_whitespace())
                 {
                     out.push((i, false, backslash_run(line, i)));
                     i += 8;
@@ -1357,7 +1399,11 @@ fn finalize_thinking_turn(
     // restoration. `first_line + close_at + 1` is the 1-based file line of
     // the first answer line.
     let reasoning = restore_boundaries(&reason_lines, first_line + s + 2)?;
-    Ok((reasoning, raw_lines[close_at + 1..].to_vec(), first_line + close_at + 1))
+    Ok((
+        reasoning,
+        raw_lines[close_at + 1..].to_vec(),
+        first_line + close_at + 1,
+    ))
 }
 
 /// Extract the trailing `n` tool call blocks from the raw body lines of an
@@ -1461,11 +1507,7 @@ fn extract_one_tool_call_block(
             "malformed tool call block; expected a tilde-fenced arguments block",
         ));
     };
-    let open_len = lines[o]
-        .trim()
-        .chars()
-        .take_while(|&ch| ch == '~')
-        .count();
+    let open_len = lines[o].trim().chars().take_while(|&ch| ch == '~').count();
     if open_len > close_len {
         return Err(line_error(
             first_line + c,
@@ -1524,8 +1566,8 @@ fn finalize_tool_turn(lines: &[String], first_line: usize) -> Result<String> {
     // 3. Opening fence: the first non-blank line below the summary must be a
     // tilde fence (info string `text` or empty).
     let mut o: Option<usize> = None;
-    for i in (s + 1)..lines.len() {
-        let t = lines[i].trim();
+    for (i, line) in lines.iter().enumerate().skip(s + 1) {
+        let t = line.trim();
         if t.is_empty() {
             continue;
         }
@@ -1546,15 +1588,11 @@ fn finalize_tool_turn(lines: &[String], first_line: usize) -> Result<String> {
             "expected a tilde-fenced output block in the tool turn body",
         ));
     };
-    let open_len = lines[o]
-        .trim()
-        .chars()
-        .take_while(|&c| c == '~')
-        .count();
+    let open_len = lines[o].trim().chars().take_while(|&c| c == '~').count();
     // 4. Closing fence: a bare tilde run at least as long as the opener.
     let mut c: Option<usize> = None;
-    for i in (o + 1)..lines.len() {
-        let t = lines[i].trim();
+    for (i, line) in lines.iter().enumerate().skip(o + 1) {
+        let t = line.trim();
         let run = t.chars().take_while(|&ch| ch == '~').count();
         if run >= open_len && t.len() == run {
             c = Some(i);
@@ -1579,8 +1617,8 @@ fn finalize_tool_turn(lines: &[String], first_line: usize) -> Result<String> {
             "expected a bare '</details>' line to close the tool output block",
         ));
     }
-    for i in (c + 1)..(e - 1) {
-        if !lines[i].trim().is_empty() {
+    for (i, line) in lines.iter().enumerate().take(e - 1).skip(c + 1) {
+        if !line.trim().is_empty() {
             return Err(line_error(
                 first_line + i,
                 "expected a bare '</details>' line to close the tool output block",
@@ -1688,7 +1726,12 @@ pub fn to_markdown(conv: &Conversation) -> String {
 /// verbatim; their tilde fences are sized by [`fence_len`].
 pub fn render_turn_body(t: &Turn) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(r) = t.reasoning.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    if let Some(r) = t
+        .reasoning
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         let escaped_r = escape_boundaries(&escape_details_tags(r));
         parts.push(format!(
             "<details>\n<summary>Thinking</summary>\n\n{escaped_r}\n\n</details>"
@@ -1727,10 +1770,18 @@ impl Conversation {
     /// messages — see [`crate::llm::complete_tool_calls`] for the
     /// request-prep step that answers dangling tool calls.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {
+        self.project_turns(0..self.turns.len())
+    }
+
+    /// Project a range of sections into OpenAI wire-format messages with the
+    /// same rules as [`Conversation::to_messages`] (System sections skipped,
+    /// `**Tool**` turns answered, assistant tool calls attached). Used by
+    /// [`crate::llm::build_api_messages`] to window the history.
+    pub(crate) fn project_turns(&self, range: std::ops::Range<usize>) -> Vec<crate::llm::Message> {
         use crate::llm::{Message, ToolCall, ToolFunction};
 
         let mut messages: Vec<Message> = Vec::new();
-        for turn in &self.turns {
+        for turn in &self.turns[range] {
             match turn.role {
                 Role::System => {}
                 Role::Tool => {

@@ -13,13 +13,13 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use serde_json::{json, Value as Json};
+use serde_json::{Value as Json, json};
 
 use crate::context;
 use crate::llm::{
-    AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
+    self, AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
 };
 use crate::parser;
 use crate::sandbox::{self, SandboxPolicy};
@@ -77,9 +77,9 @@ pub fn resolve_safe_path(work_dir: &Path, user_path: &str) -> Result<PathBuf> {
         canon_base.join(remainder)
     };
 
-    let canon_work = work_dir.canonicalize().with_context(|| {
-        format!("working directory {} does not exist", work_dir.display())
-    })?;
+    let canon_work = work_dir
+        .canonicalize()
+        .with_context(|| format!("working directory {} does not exist", work_dir.display()))?;
     if !resolved.starts_with(&canon_work) {
         bail!("path escapes the working directory: {user}");
     }
@@ -274,15 +274,15 @@ pub fn tool_schemas(config: &ToolConfig) -> Vec<Json> {
     v
 }
 
-fn schema(
-    name: &str,
-    description: &str,
-    parameters: Json,
-    required: &[&str],
-) -> Json {
+fn schema(name: &str, description: &str, parameters: Json, required: &[&str]) -> Json {
     let mut params = parameters;
     if !required.is_empty() {
-        params["required"] = Json::Array(required.iter().map(|s| Json::String((*s).to_string())).collect());
+        params["required"] = Json::Array(
+            required
+                .iter()
+                .map(|s| Json::String((*s).to_string()))
+                .collect(),
+        );
     }
     json!({
         "type": "function",
@@ -469,7 +469,8 @@ fn edit_file(args: &Json, config: &ToolConfig) -> String {
         Err(e) => return format!("Error: reading {path_s}: {e}"),
     };
     match text.matches(old).count() {
-        0 => "Error: 'old_text' not found in file; re-read the file to see its exact content".to_string(),
+        0 => "Error: 'old_text' not found in file; re-read the file to see its exact content"
+            .to_string(),
         1 => {
             let updated = text.replacen(old, new, 1);
             match std::fs::write(&path, &updated) {
@@ -568,12 +569,52 @@ async fn fetch_url(args: &Json, config: &ToolConfig) -> String {
 
 /// HTML block-level tag prefixes that become line breaks when stripped.
 const BLOCK_TAGS: &[&str] = &[
-    "<p", "</p", "<div", "</div", "<br", "<li", "</li", "<ul", "</ul", "<ol", "</ol",
-    "<h1", "</h1", "<h2", "</h2", "<h3", "</h3", "<h4", "</h4", "<h5", "</h5", "<h6",
-    "</h6", "<tr", "</tr", "<table", "</table", "<pre", "</pre", "<blockquote",
-    "</blockquote", "<hr", "<section", "</section", "<article", "</article",
-    "<header", "</header", "<footer", "</footer", "<main", "</main", "<nav", "</nav",
-    "<form", "</form",
+    "<p",
+    "</p",
+    "<div",
+    "</div",
+    "<br",
+    "<li",
+    "</li",
+    "<ul",
+    "</ul",
+    "<ol",
+    "</ol",
+    "<h1",
+    "</h1",
+    "<h2",
+    "</h2",
+    "<h3",
+    "</h3",
+    "<h4",
+    "</h4",
+    "<h5",
+    "</h5",
+    "<h6",
+    "</h6",
+    "<tr",
+    "</tr",
+    "<table",
+    "</table",
+    "<pre",
+    "</pre",
+    "<blockquote",
+    "</blockquote",
+    "<hr",
+    "<section",
+    "</section",
+    "<article",
+    "</article",
+    "<header",
+    "</header",
+    "<footer",
+    "</footer",
+    "<main",
+    "</main",
+    "<nav",
+    "</nav",
+    "<form",
+    "</form",
 ];
 
 /// Strip HTML down to readable text: drop `<script>`/`<style>` blocks
@@ -590,8 +631,7 @@ fn strip_html(html: &str) -> String {
                 let tag: String = chars[i..i + end_rel + 1].iter().collect();
                 let lower = tag.to_ascii_lowercase();
                 let is_open = lower.starts_with("<script") || lower.starts_with("<style");
-                let is_close =
-                    lower.starts_with("</script") || lower.starts_with("</style");
+                let is_close = lower.starts_with("</script") || lower.starts_with("</style");
                 if skip_depth > 0 {
                     if is_close {
                         skip_depth -= 1;
@@ -701,6 +741,7 @@ pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
                 ("tool".to_string(), name.to_string()),
                 ("id".to_string(), id.to_string()),
             ],
+            compact: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -734,6 +775,7 @@ pub fn assistant_turn(
         meta: parser::TurnMeta {
             timestamp: Some(parser::now_timestamp()),
             tags,
+            compact: false,
         },
         reasoning: has_reasoning.then(|| reasoning.trim().to_string()),
         tool_calls: tool_calls
@@ -901,6 +943,80 @@ pub async fn run_turn(
         }
     }
     bail!("no final reply after {MAX_TOOL_ITERATIONS} tool iterations")
+}
+
+// ---------------------------------------------------------------------------
+// Context compaction
+// ---------------------------------------------------------------------------
+
+/// The body of the `**User** | compact: true` turn that a compaction
+/// appends: it asks the model for a handoff summary (without tool calls)
+/// that replaces the pre-checkpoint history in all future requests (§5 of
+/// `docs/format.md`).
+pub const COMPACT_INSTRUCTION: &str = "\
+The conversation above is being compacted to keep its context small. \
+Write a handoff summary of it; your reply will be kept while the older \
+turns are dropped from future requests. Do not call any tools. Cover, in \
+order: **Goal** — what the user asked for; **Key decisions** — technical \
+choices made and why; **Files** — files created or modified, with a one-\
+line note each; **Current state** — what is done and just verified; \
+**Next steps** — what remains, in order.";
+
+/// The `**User** | <timestamp> | compact: true` turn that requests a
+/// compaction of the conversation so far.
+pub fn compact_request_turn() -> parser::Turn {
+    parser::Turn {
+        role: parser::Role::User,
+        content: COMPACT_INSTRUCTION.to_string(),
+        meta: parser::TurnMeta {
+            timestamp: Some(parser::now_timestamp()),
+            tags: Vec::new(),
+            compact: true,
+        },
+        reasoning: None,
+        tool_calls: Vec::new(),
+    }
+}
+
+/// Drive one context compaction: build the windowed request (the §5
+/// compaction rule, the hierarchical system prompt overlaid, and the tool
+/// schemas preserved so the server's KV-cache prefix stays warm), stream a
+/// single assistant summary, and report its deltas through `on_event`
+/// (returning `false` stops early). No tool loop runs: the summary
+/// instruction forbids tool calls, so any stray call is ignored. Returns
+/// the assembled response; the caller persists it as an `**Assistant**`
+/// turn via [`assistant_turn`].
+///
+/// `conv` must already end with the appended `compact: true` request turn
+/// (see [`compact_request_turn`]).
+pub async fn run_compact(
+    client: &Client,
+    conv: &parser::Conversation,
+    system_prompt: &str,
+    config: &ToolConfig,
+    mut on_event: impl FnMut(&LoopEvent) -> bool,
+) -> Result<AssistantTurn> {
+    let mut messages = llm::build_api_messages(conv);
+    llm::set_system_prompt(&mut messages, system_prompt);
+    llm::complete_tool_calls(&mut messages);
+    let schemas = tool_schemas(config);
+    let mut stream = client
+        .stream_chat(&messages, (!schemas.is_empty()).then_some(&schemas))
+        .await?;
+    let mut turn = AssistantTurn::default();
+    while let Some(delta) = stream.next().await {
+        let delta = delta.context("stream error")?;
+        let stop = match &delta {
+            StreamDelta::Reasoning(s) => !on_event(&LoopEvent::Reasoning(s.clone())),
+            StreamDelta::Content(s) => !on_event(&LoopEvent::Content(s.clone())),
+            _ => false,
+        };
+        turn.push(&delta);
+        if stop {
+            return Ok(turn);
+        }
+    }
+    Ok(turn)
 }
 
 #[cfg(test)]

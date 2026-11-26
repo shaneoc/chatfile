@@ -168,9 +168,10 @@ Each non-timestamp segment is `key: value`:
 - Tag order is preserved. Well-known tags: `model` (which model produced the
   turn), `thinking` (assistant-only switch for the collapsible reasoning
   block — see below and §3.4), `tool_calls` (assistant-only count of the
-  trailing Tool Call blocks — see below and §3.3), and `tool` (the tool
-  name) / `id` (the tool call id), which are **`**Tool**`-only** and required
-  there (§3.3.2).
+  trailing Tool Call blocks — see below and §3.3), `compact` (**`**User**`-only**
+  context-compaction switch — see below and §5), and `tool` (the tool name) /
+  `id` (the tool call id), which are **`**Tool**`-only** and required there
+  (§3.3.2).
 
 The `thinking` tag is special:
 
@@ -192,6 +193,22 @@ The `tool_calls` tag is special:
 - The tag is emitted only when the turn carries at least one tool call; the
   canonical tag order is `model`, then `thinking`, then `tool_calls`.
 
+The `compact` tag is special:
+
+- It is **only allowed on `**User**` headers**; on any other role it is a
+  header-format error (§4.3).
+- Its value must be **exactly the lowercase literal `true`**; anything else
+  (`false`, `True`, empty, …) is a header-format error (§4.3).
+- It marks the turn as a *context-compaction checkpoint*: requests built
+  from the file start their history at the **last** such turn (its
+  `**Assistant**` summary plus everything after it), dropping the turns
+  between the system message and the checkpoint (§5). A trailing unanswered
+  `compact: true` turn at the end of the file is a *request* to compact, not
+  a checkpoint.
+- It is rendered right after the timestamp (before any other tags) and only
+  when set; parsing lifts it out of the free-form tag list, so its position
+  among the other tags is not significant.
+
 ### 2.3 Whitespace handling
 
 - Leading whitespace before the opening `**` is ignored; trailing whitespace
@@ -211,6 +228,7 @@ The `tool_calls` tag is special:
 **Assistant** | 2026-11-23 22:42 +00:00 | model: local-model ← valid (canonical form)
 **Assistant** | model: m1 | thinking: true | tool_calls: 2 ← valid
 **Tool** | 2026-11-23 22:42 +00:00 | tool: bash | id: call_1 ← valid
+**User** | 2026-11-23 22:42 +00:00 | compact: true           ← valid (compaction checkpoint)
 
 **User** · *2026-11-23 22:42 +00:00*                  ← INVALID: '·' separator
 **User** - 2026-11-23 22:42 +00:00                    ← INVALID: '-' separator
@@ -223,6 +241,8 @@ The `tool_calls` tag is special:
 **User** | 2026-11-23 22:42Z                          ← INVALID: 'Z' suffix
 **User** | 2026-11-23 22:42 +25:00                    ← INVALID: out-of-range offset
 **User** | : value                                    ← INVALID: empty key
+**Assistant** | 2026-11-23 22:42 +00:00 | compact: true ← INVALID: 'compact' is **User**-only
+**User** | compact: false                             ← INVALID: must be the literal 'true'
 ```
 
 ---
@@ -568,6 +588,8 @@ content and never triggers them.
 | `line N: unknown role in header: <text>` | Defensive: the bolded text is not one of System/User/Assistant/Tool. (Same reachability note.) | — |
 | `line N: 'thinking' metadata is only allowed on **Assistant** headers` | A `thinking:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| thinking: true` |
 | `line N: 'thinking' metadata must be the literal value 'true'` | The `thinking` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| thinking: false` |
+| `line N: 'compact' metadata is only allowed on **User** headers` | A `compact:` tag appears on a `**System**`, `**Assistant**`, or `**Tool**` header (§2.2). | `**Assistant** \| compact: true` |
+| `line N: 'compact' metadata must be the literal value 'true'` | The `compact` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**User** \| compact: false` |
 | `line N: 'tool_calls' metadata is only allowed on **Assistant** headers` | A `tool_calls:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tool_calls: 1` |
 | `line N: 'tool_calls' metadata must be a positive integer` | The `tool_calls` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tool_calls: 0` |
 | `line N: duplicate metadata key '<key>' in header` | The same `key:` appears more than once in one header (keys are case-sensitive; timestamps are not keys and have their own duplicate check). | `**Assistant** \| model: a \| model: b` |
@@ -602,3 +624,86 @@ All of these apply to a `**Assistant**` section whose header carries
 - **`<details>` blocks in an assistant body whose header lacks `tool_calls:`** — verbatim content; no Tool Call extraction happens and no §3.3.1 error fires (the same applies to a literal example block ahead of the real trailing ones, §3.3.1).
 - **Empty section content** — empty assistant turns are sent as `content: null`; other non-system roles send an empty string.
 - **Trailing whitespace** on header lines, and CRLF line endings in general.
+
+---
+
+## 5. Context compaction (`compact: true`)
+
+Long conversations outgrow a model's useful context window. Compaction
+replaces the early history with a model-written handoff summary while the
+file itself stays complete: `parse()` and `to_markdown()` never drop
+anything (UI viewers keep the full history), and only the *API message list*
+is windowed.
+
+### 5.1 Checkpoints and requests
+
+A `**User**` section may carry `compact: true` (§2.2). Two kinds of such
+turns exist:
+
+- A **checkpoint**: a `compact: true` turn that is not the file's last
+  section. Every request built from the file starts its history at the
+  **last** checkpoint, so the turns between the system message and the
+  checkpoint are sent to no one and cost no context. In practice a
+  checkpoint is a request the model has already answered with its handoff
+  summary.
+- A **request**: a `compact: true` turn that is the file's last section —
+  the output of `chatfile compact <file>` or the TUI's `/compact`, which
+  appends it and asks the model to write the summary. Being the last section
+  is exactly what excludes it from the checkpoint search (§5.2), so a
+  freshly appended request never truncates the conversation being summarized.
+
+### 5.2 API message reconstruction
+
+Every outgoing `/v1/chat/completions` request (`run`, the TUI, and
+`compact`) builds its `messages` array with this exact algorithm
+(`llm::build_api_messages`):
+
+1. **System first.** If the file's first section is `**System**`, send it as
+   the leading `role: "system"` message, unchanged. Callers then replace its
+   content with the hierarchical prompt (the system section plus every
+   `AGENTS.md` from the file's directory up to the vault root), so the wire
+   message is identical to what pre-compaction requests sent.
+2. **Find the checkpoint.** Among all sections *before* a trailing
+   unanswered `**User**` turn at the end of the file, take the **last**
+   `**User**` section with `compact: true`. Excluding the trailing turn is
+   what keeps a freshly appended compaction *request* from truncating the
+   very conversation being summarized. If no such section exists, the window
+   starts at the first non-`System` section (i.e. everything after the
+   system message).
+3. **Window and append.** Send every section from the window start through
+   the end of the file, projected to wire format as usual (`**Tool**` turns
+   answered, assistant tool calls attached). A trailing unanswered `**User**`
+   turn — including a new `compact: true` request — is therefore always the
+   last message.
+
+Dangling tool calls are then repaired (`llm::complete_tool_calls`) exactly
+as for unwindowed requests.
+
+Example. For a file with sections `System`, `U1`, `A1`, `U2 (compact)`,
+`A2 (summary)`, `U3`, `A3`:
+
+| Request built for | Sections sent after the system message |
+| ----------------- | -------------------------------------- |
+| a normal turn (appending `U4`) | `U2, A2, U3, A3, U4` (`U1, A1` omitted) |
+| `compact` (appending `U4 (compact)`) | `U2, A2, U3, A3, U4 (compact)` — the model's reply `A4` becomes the new checkpoint for all future requests |
+| a file with no `compact: true` turns | every section after the system message (no windowing) |
+
+### 5.3 `chatfile compact` and `/compact`
+
+`chatfile compact <file.chat.md>` (CLI) and `/compact` (TUI, typed into the
+input box and sent with Enter) do the same thing:
+
+1. Append a `**User** | <timestamp> | compact: true` turn whose body is a
+   fixed handoff instruction: summarize the goal, key technical decisions,
+   modified files, current state, and remaining next steps; do not call any
+   tools.
+2. Build the request with the §5.2 algorithm — preserving the existing
+   system prompt and tool definitions so the server's KV-cache prefix stays
+   warm — and stream one assistant response (no tool loop).
+3. Append the reply as an `**Assistant** | <timestamp> | model: <model>`
+   turn (`thinking: true` when reasoning was streamed), saving the file.
+
+The request turn is persisted *before* the model is called, so a failed run
+leaves a well-formed file whose trailing unanswered request the next `run`
+(or `compact`) simply answers. The file always keeps its full history; only
+the sent messages are windowed.

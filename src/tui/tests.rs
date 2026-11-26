@@ -26,6 +26,8 @@ fn test_app() -> App {
         stream_buf: String::new(),
         got_reply: false,
         pending_send: None,
+        pending_compact: false,
+        compacting: false,
         cancel_requested: false,
         quit: false,
         status: String::new(),
@@ -55,7 +57,10 @@ fn render_80x24_shows_history_and_status() {
     let app = test_app();
     let screen = render(&app, 80, 24).join("\n");
     assert!(screen.contains("User"), "missing User role: {screen}");
-    assert!(screen.contains("Assistant"), "missing Assistant role: {screen}");
+    assert!(
+        screen.contains("Assistant"),
+        "missing Assistant role: {screen}"
+    );
     assert!(screen.contains("Hello there!"));
     assert!(screen.contains("Hi, how can I help?"));
     assert!(screen.contains("test.chat.md"));
@@ -101,6 +106,7 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
         meta: parser::TurnMeta {
             timestamp: Some("2026-11-23 00:00 +00:00".into()),
             tags: vec![("thinking".into(), "true".into())],
+            compact: false,
         },
         reasoning: Some("because 6*9".into()),
         tool_calls: Vec::new(),
@@ -140,10 +146,7 @@ fn cursor_movement_and_backspace() {
 fn alt_enter_and_ctrl_j_insert_newline() {
     let mut app = test_app();
     app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE));
-    app.handle_key(key(
-        KeyCode::Enter,
-        KeyModifiers::ALT,
-    ));
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT));
     assert_eq!(app.input, "a\n");
     assert!(app.pending_send.is_none());
 

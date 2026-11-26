@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser;
 use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -240,7 +241,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\"only\"}}]}\n\n";
     let url = serve_once(raw.to_vec()).await;
 
     let client = Client::new(url, "test-model", None);
-    let mut stream = client.stream_chat(&[Message::user("hi")], None).await.unwrap();
+    let mut stream = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap();
     let mut chunks = Vec::new();
     while let Some(chunk) = stream.next().await {
         chunks.push(chunk.unwrap());
@@ -319,7 +323,10 @@ data: [DONE]\n\n";
     let url = serve_once(raw.to_vec()).await;
 
     let client = Client::new(url, "test-model", None);
-    let mut stream = client.stream_chat(&[Message::user("hi")], None).await.unwrap();
+    let mut stream = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap();
     let mut turn = AssistantTurn::default();
     while let Some(delta) = stream.next().await {
         turn.push(&delta.unwrap());
@@ -373,10 +380,182 @@ data: [DONE]\n\n";
     let (url, bodies) = serve_multi(vec![raw.to_vec()]).await;
 
     let client = Client::new(url, "test-model", None);
-    let mut stream = client.stream_chat(&[Message::user("hi")], None).await.unwrap();
+    let mut stream = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap();
     while stream.next().await.is_some() {}
 
     let body = &bodies.lock().unwrap()[0];
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
     assert!(v.get("tools").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// build_api_messages: the compaction windowing (§5 of docs/format.md)
+// ---------------------------------------------------------------------------
+
+fn conv(md: &str) -> parser::Conversation {
+    parser::parse(md).unwrap()
+}
+
+/// The `(role, content)` pairs of a built message list.
+fn pairs(messages: &[Message]) -> Vec<(&str, &str)> {
+    messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.content.as_deref().unwrap_or("")))
+        .collect()
+}
+
+#[test]
+fn build_api_messages_without_checkpoint_sends_everything() {
+    let c = conv(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m\n\na1\n\n---\n\
+**User**\n\nq2\n",
+    );
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![
+            ("system", "be terse"),
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+        ]
+    );
+}
+
+#[test]
+fn build_api_messages_checkpoint_windows_history() {
+    let c = conv(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize\n\n---\n\
+**Assistant** | model: m\n\nsummary\n\n---\n\
+**User**\n\nq3\n\n---\n\
+**Assistant** | model: m\n\na3\n",
+    );
+    // q1/a1 (before the checkpoint) are omitted; the window starts at the
+    // checkpoint user turn itself.
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![
+            ("system", "be terse"),
+            ("user", "summarize"),
+            ("assistant", "summary"),
+            ("user", "q3"),
+            ("assistant", "a3"),
+        ]
+    );
+}
+
+#[test]
+fn build_api_messages_last_checkpoint_wins() {
+    let c = conv(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize 1\n\n---\n\
+**Assistant** | model: m\n\nsummary 1\n\n---\n\
+**User**\n\nq3\n\n---\n\
+**Assistant** | model: m\n\na3\n\n---\n\
+**User** | compact: true\n\nsummarize 2\n\n---\n\
+**Assistant** | model: m\n\nsummary 2\n\n---\n\
+**User**\n\nq5\n",
+    );
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![
+            ("system", "be terse"),
+            ("user", "summarize 2"),
+            ("assistant", "summary 2"),
+            ("user", "q5"),
+        ]
+    );
+}
+
+#[test]
+fn build_api_messages_trailing_compact_request_is_not_a_checkpoint() {
+    let c = conv(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize 1\n\n---\n\
+**Assistant** | model: m\n\nsummary 1\n\n---\n\
+**User** | compact: true\n\nsummarize 2\n",
+    );
+    // The trailing unanswered `compact: true` request is the prompt being
+    // answered, not a checkpoint: it is sent last, the prior active turns
+    // (the first checkpoint and its summary) are still sent, and the turns
+    // before the previous checkpoint (q1/a1) are omitted.
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![
+            ("system", "be terse"),
+            ("user", "summarize 1"),
+            ("assistant", "summary 1"),
+            ("user", "summarize 2"),
+        ]
+    );
+}
+
+#[test]
+fn build_api_messages_without_system_section() {
+    let c = conv("**User**\n\nq1\n\n---\n**Assistant** | model: m\n\na1\n\n---\n**User**\n\nq2\n");
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![("user", "q1"), ("assistant", "a1"), ("user", "q2")]
+    );
+}
+
+#[test]
+fn build_api_messages_checkpoint_without_system_section() {
+    let c = conv(
+        "\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize\n\n---\n\
+**Assistant** | model: m\n\nsummary\n\n---\n\
+**User**\n\nq3\n",
+    );
+    assert_eq!(
+        pairs(&build_api_messages(&c)),
+        vec![
+            ("user", "summarize"),
+            ("assistant", "summary"),
+            ("user", "q3")
+        ]
+    );
+}
+
+#[test]
+fn set_system_prompt_replaces_leading_system_message() {
+    let mut messages = build_api_messages(&conv("**System**\n\nold\n\n---\n**User**\n\nq\n"));
+    set_system_prompt(&mut messages, "new prompt");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[0].content.as_deref(), Some("new prompt"));
+}
+
+#[test]
+fn set_system_prompt_inserts_when_no_system_message() {
+    let mut messages = build_api_messages(&conv("**User**\n\nq\n"));
+    set_system_prompt(&mut messages, "new prompt");
+    assert_eq!(
+        pairs(&messages),
+        vec![("system", "new prompt"), ("user", "q")]
+    );
+}
+
+#[test]
+fn set_system_prompt_empty_is_noop() {
+    let mut messages = build_api_messages(&conv("**User**\n\nq\n"));
+    set_system_prompt(&mut messages, "");
+    assert_eq!(pairs(&messages), vec![("user", "q")]);
 }

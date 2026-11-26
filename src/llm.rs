@@ -6,7 +6,7 @@
 //! reasoning in a separate `reasoning_content` field before the answer
 //! starts; both are surfaced as [`StreamDelta`] variants.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -118,8 +118,8 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
             j += 1;
         }
         for call in messages[i].tool_calls.clone() {
-            let answered = (i + 1..j)
-                .any(|k| messages[k].tool_call_id.as_deref() == Some(call.id.as_str()));
+            let answered =
+                (i + 1..j).any(|k| messages[k].tool_call_id.as_deref() == Some(call.id.as_str()));
             if !answered {
                 messages.insert(
                     j,
@@ -129,6 +129,67 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
             }
         }
         i = j;
+    }
+}
+
+/// Rebuild the API message list for an outgoing request from a parsed
+/// conversation, applying the context-compaction windowing rule (see §5 of
+/// `docs/format.md`):
+///
+/// 1. The original `**System**` section (index 0, when present) is sent
+///    first, unchanged.
+/// 2. Let the *checkpoint* be the last `**User**` section carrying
+///    `compact: true` among the sections **before** a trailing unanswered
+///    `**User**` turn at the end of the file (a freshly appended compaction
+///    request therefore never truncates the conversation being summarized).
+///    When a checkpoint exists, the sections between the system message and
+///    the checkpoint are omitted; the window starts at the checkpoint
+///    itself (whose `**Assistant**` summary follows it). Without a
+///    checkpoint the window starts at the first non-system section.
+/// 3. Every section from the window start through the end of the file is
+///    projected to wire format (`**Tool**` turns answered, assistant tool
+///    calls attached), so a trailing unanswered `**User**` turn — including
+///    a new `compact: true` request — is appended last.
+///
+/// The leading system message carries only the file's `**System**` section
+/// content; callers overlay the hierarchical `AGENTS.md` prompt with
+/// [`set_system_prompt`] before sending, and repair dangling tool calls
+/// with [`complete_tool_calls`].
+pub fn build_api_messages(conv: &crate::parser::Conversation) -> Vec<Message> {
+    let turns = &conv.turns;
+    let n = turns.len();
+    let mut messages: Vec<Message> = Vec::new();
+    if n > 0 && turns[0].role == crate::parser::Role::System {
+        messages.push(Message::system(turns[0].content.clone()));
+    }
+    // A trailing **User** turn has no **Assistant** reply after it, so it is
+    // the prompt being answered (possibly a new `compact: true` request) and
+    // is excluded from the checkpoint search.
+    let trailing_user = n > 0 && turns[n - 1].role == crate::parser::Role::User;
+    let search_end = n - usize::from(trailing_user);
+    let checkpoint = (0..search_end)
+        .rev()
+        .find(|&i| turns[i].role == crate::parser::Role::User && turns[i].meta.compact);
+    let start = match checkpoint {
+        Some(i) => i,
+        None => usize::from(n > 0 && turns[0].role == crate::parser::Role::System),
+    };
+    messages.extend(conv.project_turns(start..n));
+    messages
+}
+
+/// Insert or replace the leading `role: "system"` message with
+/// `system_prompt` (the hierarchical `AGENTS.md` prompt assembled by
+/// [`crate::context::build_system_prompt`]). A no-op when `system_prompt`
+/// is empty.
+pub fn set_system_prompt(messages: &mut Vec<Message>, system_prompt: &str) {
+    if system_prompt.is_empty() {
+        return;
+    }
+    let msg = Message::system(system_prompt.to_string());
+    match messages.first_mut() {
+        Some(m) if m.role == "system" => *m = msg,
+        _ => messages.insert(0, msg),
     }
 }
 
@@ -302,10 +363,7 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tcs {
                 ev.tool_calls.push(ToolCallDelta {
-                    index: tc
-                        .get("index")
-                        .and_then(|i| i.as_u64())
-                        .unwrap_or(0) as usize,
+                    index: tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize,
                     id: tc.get("id").and_then(|i| i.as_str()).map(str::to_string),
                     name: tc
                         .get("function")
@@ -468,7 +526,7 @@ impl Stream for SseStream {
                         continue;
                     }
                     Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Some(Err(anyhow::anyhow!("stream error: {e}"))))
+                        return Poll::Ready(Some(Err(anyhow::anyhow!("stream error: {e}"))));
                     }
                     Poll::Ready(None) => {
                         // Flush a trailing line without a final newline.

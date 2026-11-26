@@ -56,6 +56,7 @@ exit code 0
         TurnMeta {
             timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
+            compact: false,
         }
     );
     assert_eq!(conv.turns[2].role, Role::Assistant);
@@ -65,6 +66,7 @@ exit code 0
         TurnMeta {
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![("model".into(), "local-model".into())],
+            compact: false,
         }
     );
     assert_eq!(conv.turns[3].role, Role::Tool);
@@ -103,7 +105,10 @@ fn parse_header_rejects_wrong_separators() {
     // The legacy `·` separator is no longer a header.
     for (input, at) in [
         ("**User** · *2026-11-22 14:30 +00:00*\n\nhi\n", "line 1"),
-        ("**User**\n\nhi\n\n---\n**Assistant** - 2026-11-22 14:31 +00:00\n\nlate\n", "line 6"),
+        (
+            "**User**\n\nhi\n\n---\n**Assistant** - 2026-11-22 14:31 +00:00\n\nlate\n",
+            "line 6",
+        ),
         // Missing the spaces around `|`.
         ("**User**| 2026-11-22 14:30 +00:00\n\nhi\n", "line 1"),
     ] {
@@ -142,8 +147,9 @@ fn parse_header_requires_key_prefix_after_timestamp() {
     );
 
     // Same violation in a later section: the line number tracks it.
-    let err = parse("**User**\n\nhi\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00 | model\n\nlate\n")
-        .unwrap_err();
+    let err =
+        parse("**User**\n\nhi\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00 | model\n\nlate\n")
+            .unwrap_err();
     assert!(err.to_string().contains("line 6"), "{err}");
 
     // An empty key is rejected too.
@@ -159,7 +165,8 @@ fn parse_header_timestamp_must_be_first_segment() {
     assert!(msg.contains("first metadata segment"), "{msg}");
 
     // A second timestamp is rejected as well.
-    let err = parse("**User** | 2026-11-22 14:30 +00:00 | 2026-11-22 14:31 +00:00\n\nhi\n").unwrap_err();
+    let err =
+        parse("**User** | 2026-11-22 14:30 +00:00 | 2026-11-22 14:31 +00:00\n\nhi\n").unwrap_err();
     assert!(err.to_string().contains("duplicate timestamp"), "{err}");
 }
 
@@ -175,6 +182,7 @@ fn parse_header_tags_without_timestamp_ok() {
                 ("model".into(), "m1".into()),
                 ("endpoint".into(), "local".into()),
             ],
+            compact: false,
         }
     );
 }
@@ -191,7 +199,10 @@ line two
 ";
     let conv = parse(input).unwrap();
     assert_eq!(conv.turns.len(), 1);
-    assert_eq!(conv.turns[0].content, "line one\nline two\n\n  indented line");
+    assert_eq!(
+        conv.turns[0].content,
+        "line one\nline two\n\n  indented line"
+    );
 }
 
 #[test]
@@ -222,6 +233,7 @@ fn parse_metadata_optional_variants() {
         TurnMeta {
             timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
+            compact: false,
         }
     );
 
@@ -231,7 +243,11 @@ fn parse_metadata_optional_variants() {
         conv.turns[0].meta,
         TurnMeta {
             timestamp: None,
-            tags: vec![("model".into(), "m1".into()), ("endpoint".into(), "local".into())],
+            tags: vec![
+                ("model".into(), "m1".into()),
+                ("endpoint".into(), "local".into())
+            ],
+            compact: false,
         }
     );
 
@@ -248,6 +264,7 @@ fn parse_metadata_optional_variants() {
                 ("model".into(), "unsloth/Qwen:Q8".into()),
                 ("note".into(), "a: b".into()),
             ],
+            compact: false,
         }
     );
 }
@@ -267,7 +284,10 @@ fn parse_role_line_without_hr_is_content() {
     let input = "**User**\n\nbefore\n**Assistant**\n\nnot a section\n";
     let conv = parse(input).unwrap();
     assert_eq!(conv.turns.len(), 1);
-    assert_eq!(conv.turns[0].content, "before\n**Assistant**\n\nnot a section");
+    assert_eq!(
+        conv.turns[0].content,
+        "before\n**Assistant**\n\nnot a section"
+    );
 }
 
 #[test]
@@ -371,6 +391,7 @@ fn serialize_canonical_form() {
                 meta: TurnMeta {
                     timestamp: Some("2026-11-22 14:30 +00:00".into()),
                     tags: vec![],
+                    compact: false,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -475,7 +496,10 @@ fn escape_boundaries_leaves_non_collisions_alone() {
     // The hr is the last line: nothing follows it.
     assert_eq!(escape_boundaries("text\n---"), "text\n---");
     // An unknown role still collides (the rule keys off `**`, not the role).
-    assert_eq!(escape_boundaries("---\n**Narrator**"), "\\---\n**Narrator**");
+    assert_eq!(
+        escape_boundaries("---\n**Narrator**"),
+        "\\---\n**Narrator**"
+    );
 }
 
 #[test]
@@ -543,7 +567,10 @@ fn escaped_collision_round_trips_as_content() {
     let back = parse(&once).unwrap();
     assert_eq!(back.turns.len(), 1);
     assert_eq!(back.turns[0].role, Role::User);
-    assert_eq!(back.turns[0].content, "---\n**Assistant** | 2026-11-22 14:31 +00:00");
+    assert_eq!(
+        back.turns[0].content,
+        "---\n**Assistant** | 2026-11-22 14:31 +00:00"
+    );
     assert_eq!(to_markdown(&back), once);
 }
 
@@ -662,14 +689,20 @@ fn parse_rejects_even_backslash_counts() {
     let err = parse(&input).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 3"), "{msg}");
-    assert!(msg.contains("even number of backslashes before '---'"), "{msg}");
+    assert!(
+        msg.contains("even number of backslashes before '---'"),
+        "{msg}"
+    );
 
     // Even k before a code fence.
     let input = format!("**User**\n\n{}```rust\nfn main() {{\n", "\\".repeat(2));
     let err = parse(&input).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 3"), "{msg}");
-    assert!(msg.contains("even number of backslashes before a code fence"), "{msg}");
+    assert!(
+        msg.contains("even number of backslashes before a code fence"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -759,6 +792,7 @@ fn turn_meta_render() {
     let meta = TurnMeta {
         timestamp: Some("2026-11-22 14:30 +00:00".into()),
         tags: vec![("model".into(), "m".into()), ("flag".into(), String::new())],
+        compact: false,
     };
     // Empty values keep the `key: ` prefix (a bare key would not re-parse).
     assert_eq!(
@@ -851,9 +885,9 @@ fn parse_header_rejects_offsetless_timestamp() {
 #[test]
 fn parse_header_rejects_invalid_timestamps() {
     for ts in [
-        "2026-11-25 20:26",     // no offset
-        "2026-11-25 20:26Z",    // `Z` suffix
-        "2026-11-25 20:26 EST", // timezone abbreviation
+        "2026-11-25 20:26",        // no offset
+        "2026-11-25 20:26Z",       // `Z` suffix
+        "2026-11-25 20:26 EST",    // timezone abbreviation
         "2026-11-25 20:26 +24:00", // offset hours out of range
         "2026-11-25 20:26 -05:60", // offset minutes out of range
         "2026-02-30 20:26 +00:00", // not a calendar date
@@ -896,6 +930,7 @@ fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
                 meta: TurnMeta {
                     timestamp: None,
                     tags: vec![("thinking".into(), "true".into())],
+                    compact: false,
                 },
                 reasoning: Some(reasoning.to_string()),
                 tool_calls: Vec::new(),
@@ -1155,10 +1190,8 @@ fn tool_turn_fixture(name: &str, id: &str, output: &str) -> Turn {
         content: tool_turn_body(output),
         meta: TurnMeta {
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
-            tags: vec![
-                ("tool".into(), name.into()),
-                ("id".into(), id.into()),
-            ],
+            tags: vec![("tool".into(), name.into()), ("id".into(), id.into())],
+            compact: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1235,7 +1268,10 @@ fn tool_turn_output_with_long_tilde_run_round_trips() {
         ..Default::default()
     };
     let once = to_markdown(&conv);
-    assert!(once.contains("~~~~~~text"), "fence must exceed the embedded run:\n{once}");
+    assert!(
+        once.contains("~~~~~~text"),
+        "fence must exceed the embedded run:\n{once}"
+    );
     let back = parse(&once).unwrap();
     let data = parse_tool_turn(&back.turns[1]).expect("well-formed tool turn");
     assert_eq!(data.output, output);
@@ -1250,6 +1286,7 @@ fn parse_tool_turn_rejects_malformed() {
         meta: TurnMeta {
             timestamp: None,
             tags: vec![("tool".into(), "bash".into())],
+            compact: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1270,10 +1307,8 @@ fn parse_tool_turn_rejects_malformed() {
         content: "just some text".into(),
         meta: TurnMeta {
             timestamp: None,
-            tags: vec![
-                ("tool".into(), "bash".into()),
-                ("id".into(), "c1".into()),
-            ],
+            tags: vec![("tool".into(), "bash".into()), ("id".into(), "c1".into())],
+            compact: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1488,6 +1523,7 @@ fn assistant_turn_fixture(content: &str, calls: &[AssistantToolCall]) -> Turn {
         meta: TurnMeta {
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags,
+            compact: false,
         },
         reasoning: None,
         tool_calls: calls.to_vec(),
@@ -1586,6 +1622,7 @@ fn tool_call_with_thinking_and_content_round_trips() {
                         ("thinking".to_string(), "true".to_string()),
                         ("tool_calls".to_string(), "2".to_string()),
                     ],
+                    compact: false,
                 },
                 reasoning: Some("Let me think.".into()),
                 tool_calls: calls.clone(),
@@ -1626,6 +1663,7 @@ fn tool_call_with_thinking_without_content_round_trips() {
                         ("thinking".to_string(), "true".to_string()),
                         ("tool_calls".to_string(), "1".to_string()),
                     ],
+                    compact: false,
                 },
                 reasoning: Some("Quick check.".into()),
                 tool_calls: vec![call.clone()],
@@ -1654,7 +1692,10 @@ fn tool_call_extraction_ignores_fake_example_in_content() {
         arguments: r#"{"path": "b.md"}"#.into(),
     };
     let conv = Conversation {
-        turns: vec![user_turn_fixture("Show me."), assistant_turn_fixture(&content, &[real.clone()])],
+        turns: vec![
+            user_turn_fixture("Show me."),
+            assistant_turn_fixture(&content, &[real.clone()]),
+        ],
         ..Default::default()
     };
     let once = to_markdown(&conv);
@@ -1683,7 +1724,7 @@ fn tool_call_block_fence_grows_with_embedded_tilde_runs() {
 
 #[test]
 fn to_messages_is_pure_and_request_layer_recovers_dangling_calls() {
-    use crate::llm::{complete_tool_calls, CANCELLED_TOOL_OUTPUT};
+    use crate::llm::{CANCELLED_TOOL_OUTPUT, complete_tool_calls};
 
     let calls = vec![
         AssistantToolCall {
@@ -1747,11 +1788,99 @@ fn tool_calls_non_integer_rejected() {
 #[test]
 fn tool_calls_on_non_assistant_header_rejected() {
     let input = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n**User** | tool_calls: 1\n\nhi\n";
-    let err = parse(&input).unwrap_err();
+    let err = parse(input).unwrap_err();
     assert_eq!(
         err.to_string(),
         "line 6: 'tool_calls' metadata is only allowed on **Assistant** headers"
     );
+}
+
+#[test]
+fn compact_round_trip_with_timestamp() {
+    let input = "**User** | 2026-11-22 14:30 +00:00 | compact: true\n\nsummarize so far\n";
+    let conv = parse(input).unwrap();
+    assert_eq!(conv.turns.len(), 1);
+    assert_eq!(conv.turns[0].role, Role::User);
+    // The tag is lifted out of `tags` into the dedicated field.
+    assert_eq!(
+        conv.turns[0].meta,
+        TurnMeta {
+            timestamp: Some("2026-11-22 14:30 +00:00".into()),
+            tags: vec![],
+            compact: true,
+        }
+    );
+    // It is rendered right after the timestamp.
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**User** | 2026-11-22 14:30 +00:00 | compact: true\n"),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn compact_round_trip_without_timestamp() {
+    let input = "**User** | compact: true\n\nsummarize so far\n";
+    let conv = parse(input).unwrap();
+    assert!(conv.turns[0].meta.compact);
+    assert!(conv.turns[0].meta.timestamp.is_none());
+    let once = to_markdown(&conv);
+    assert!(once.contains("**User** | compact: true\n"), "{once}");
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn compact_renders_before_other_tags() {
+    let input = "**User** | 2026-11-22 14:30 +00:00 | compact: true | model: m\n\nq\n";
+    let conv = parse(input).unwrap();
+    assert!(conv.turns[0].meta.compact);
+    assert_eq!(conv.turns[0].meta.tags, vec![("model".into(), "m".into())]);
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**User** | 2026-11-22 14:30 +00:00 | compact: true | model: m\n"),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn compact_on_non_user_header_rejected() {
+    // System on line 1.
+    let err = parse("**System** | compact: true\n\nbe terse\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: 'compact' metadata is only allowed on **User** headers"
+    );
+
+    // Assistant on line 6.
+    let input = format!("{USER_PREAMBLE}**Assistant** | compact: true\n\na\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'compact' metadata is only allowed on **User** headers"
+    );
+
+    // Tool on line 11.
+    let input = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00\n\na\n\n---\n**Tool** | compact: true\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: 'compact' metadata is only allowed on **User** headers"
+    );
+}
+
+#[test]
+fn compact_non_true_value_rejected() {
+    for v in ["false", "TRUE", "1"] {
+        let input = format!("{USER_PREAMBLE}**User** | compact: {v}\n\nhi\n");
+        let err = parse(&input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 6: 'compact' metadata must be the literal value 'true'",
+            "value: {v:?}"
+        );
+    }
 }
 
 #[test]
@@ -1766,7 +1895,10 @@ fn tool_calls_empty_body_rejected() {
 
 #[test]
 fn tool_calls_fewer_blocks_than_tag_rejected() {
-    let input = format!("{USER_PREAMBLE}**Assistant** | tool_calls: 2\n\n{}", tc_block("a", "c1", "{}"));
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | tool_calls: 2\n\n{}",
+        tc_block("a", "c1", "{}")
+    );
     let err = parse(&input).unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -1843,21 +1975,30 @@ fn tool_call_block_invalid_summary_rejected() {
 fn duplicate_metadata_key_rejected() {
     let input = "**User** | model: a | model: b\n\nhi\n";
     let err = parse(input).unwrap_err();
-    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'model' in header");
+    assert_eq!(
+        err.to_string(),
+        "line 1: duplicate metadata key 'model' in header"
+    );
 }
 
 #[test]
 fn duplicate_metadata_key_non_adjacent_rejected() {
     let input = "**User** | model: a | note: x | model: b\n\nhi\n";
     let err = parse(input).unwrap_err();
-    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'model' in header");
+    assert_eq!(
+        err.to_string(),
+        "line 1: duplicate metadata key 'model' in header"
+    );
 }
 
 #[test]
 fn duplicate_metadata_key_on_tool_header_rejected() {
     let input = "**User**\n\nq\n\n---\n**Tool** | tool: a | id: c1 | tool: b\n\n";
     let err = parse(input).unwrap_err();
-    assert_eq!(err.to_string(), "line 6: duplicate metadata key 'tool' in header");
+    assert_eq!(
+        err.to_string(),
+        "line 6: duplicate metadata key 'tool' in header"
+    );
 }
 
 #[test]
@@ -1865,12 +2006,19 @@ fn duplicate_thinking_key_rejected() {
     // The header error fires before any body validation.
     let input = "**Assistant** | thinking: true | thinking: true\n\nhi\n";
     let err = parse(input).unwrap_err();
-    assert_eq!(err.to_string(), "line 1: duplicate metadata key 'thinking' in header");
+    assert_eq!(
+        err.to_string(),
+        "line 1: duplicate metadata key 'thinking' in header"
+    );
 }
 
 #[test]
 fn tool_tag_on_non_tool_header_rejected() {
-    for header in ["**User** | tool: bash", "**Assistant** | tool: bash", "**System** | tool: bash"] {
+    for header in [
+        "**User** | tool: bash",
+        "**Assistant** | tool: bash",
+        "**System** | tool: bash",
+    ] {
         let input = format!("{header}\n\nhi\n");
         let err = parse(&input).unwrap_err();
         assert_eq!(
@@ -1883,7 +2031,11 @@ fn tool_tag_on_non_tool_header_rejected() {
 
 #[test]
 fn id_tag_on_non_tool_header_rejected() {
-    for header in ["**User** | id: c1", "**Assistant** | id: c1", "**System** | id: c1"] {
+    for header in [
+        "**User** | id: c1",
+        "**Assistant** | id: c1",
+        "**System** | id: c1",
+    ] {
         let input = format!("{header}\n\nhi\n");
         let err = parse(&input).unwrap_err();
         assert_eq!(
@@ -1896,7 +2048,10 @@ fn id_tag_on_non_tool_header_rejected() {
 
 #[test]
 fn tool_turn_missing_tool_tag_rejected() {
-    let input = format!("{USER_PREAMBLE}**Tool** | id: c1\n\n{}", tool_turn_body("out"));
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | id: c1\n\n{}",
+        tool_turn_body("out")
+    );
     let err = parse(&input).unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -1906,7 +2061,10 @@ fn tool_turn_missing_tool_tag_rejected() {
 
 #[test]
 fn tool_turn_missing_id_tag_rejected() {
-    let input = format!("{USER_PREAMBLE}**Tool** | tool: bash\n\n{}", tool_turn_body("out"));
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: bash\n\n{}",
+        tool_turn_body("out")
+    );
     let err = parse(&input).unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -1916,7 +2074,10 @@ fn tool_turn_missing_id_tag_rejected() {
 
 #[test]
 fn tool_turn_empty_tool_tag_rejected() {
-    let input = format!("{USER_PREAMBLE}**Tool** | tool: | id: c1\n\n{}", tool_turn_body("out"));
+    let input = format!(
+        "{USER_PREAMBLE}**Tool** | tool: | id: c1\n\n{}",
+        tool_turn_body("out")
+    );
     let err = parse(&input).unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -2041,6 +2202,7 @@ fn tool_turn_body_with_extra_blanks_round_trips() {
                         ("tool".to_string(), "bash".to_string()),
                         ("id".to_string(), "c1".to_string()),
                     ],
+                    compact: false,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),
