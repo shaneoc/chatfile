@@ -60,10 +60,23 @@ conversations stored as plain Markdown files inside nested directories.
 - Keep dependencies minimal and well-maintained.
 
 ## Rust Dependencies
-- Only use crates available as `librust-*-dev` packages in Debian (installed in
-  `/usr/share/cargo/registry`).
+- It is possible that cargo may have been configured to only use Rust crates
+  provided by Debian project, which are located in `/usr/share/cargo/registry`.
 - Before adding any new dependency to `Cargo.toml`, check if it exists in
-  Debian via `apt-cache search librust-<name>-dev`. If the package exists as a
-  Debian package however it has not been installed to
-  `/usr/share/cargo/registry`, then temporarily stop your work and inform the
-  user that the package needs to be installed.
+  `/usr/share/cargo/registry`, and if does not, then temporarily stop your work
+  and inform the user that the corresponding Debian package needs to be
+  installed.
+
+## Git Commit Attribution
+- When creating Git commits, always append an `Assisted-by:` trailer at the
+  very bottom of the commit message (separated by a blank line) using the
+  format:
+
+```text
+Assisted-by: <client-tool-name> (<active-model-id>)
+```
+
+- Substitute `<client-tool-name>` with the actual coding agent/client you are
+  running inside (for example, OpenCode or chatfile).
+- Substitute `<active-model-id>` with the exact model identifier currently
+  active in your session.
