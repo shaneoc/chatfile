@@ -86,11 +86,12 @@ allow_shell: false   # allow the bash tool (default false)
 ### Turn headers
 
 Each section starts with a bold role, optionally followed by plain metadata
-segments separated by ` | ` — a bare timestamp first, then `key: value` pairs
-(all optional):
+segments separated by ` | ` — a bare timestamp first (with an explicit numeric
+UTC offset, `YYYY-MM-DD HH:MM ±HH:MM`), then `key: value` pairs (all
+optional):
 
 ```markdown
-**Assistant** | 2026-11-23 22:42 | model: unsloth/Qwen3.8-27B-GGUF:Q8_K_XL
+**Assistant** | 2026-11-23 22:42 +00:00 | model: unsloth/Qwen3.8-27B-GGUF:Q8_K_XL
 ```
 
 The first section of the body must be `**System**` or `**User**`; a

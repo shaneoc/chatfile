@@ -8,7 +8,7 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 /// A minimal app with a short conversation, no file I/O.
 fn test_app() -> App {
     let conv = parser::parse(
-        "---\nmodel: test-model\n---\n**User** | 2026-11-22 14:30\n\nHello there!\n\n---\n**Assistant** | 2026-11-22 14:31 | model: test-model\n\nHi, how can I help?\n",
+        "---\nmodel: test-model\n---\n**User** | 2026-11-22 14:30 +00:00\n\nHello there!\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00 | model: test-model\n\nHi, how can I help?\n",
     )
     .unwrap();
     App {
@@ -99,7 +99,7 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
         role: parser::Role::Assistant,
         content: "54".into(),
         meta: parser::TurnMeta {
-            timestamp: Some("2026-11-23 00:00".into()),
+            timestamp: Some("2026-11-23 00:00 +00:00".into()),
             tags: vec![("thinking".into(), "true".into())],
         },
         reasoning: Some("because 6*9".into()),

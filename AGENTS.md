@@ -7,7 +7,8 @@ conversations stored as plain Markdown files inside nested directories.
    YAML frontmatter (`model`, `endpoint`, `tools`) and explicit role markers
    in bold lines (`**User**`, `**Assistant**`, `**Tool**`), optionally
    followed by plain metadata segments separated by ` | ` (a bare timestamp
-   first, then `key: value` pairs — e.g. `**Assistant** | 2026-11-23 22:42 |
+   with an explicit numeric UTC offset, `YYYY-MM-DD HH:MM ±HH:MM`, first,
+   then `key: value` pairs — e.g. `**Assistant** | 2026-11-23 22:42 +00:00 |
    model: local-model`). The first section after the frontmatter must be
    `**System**` or `**User**` (the frontmatter's closing fence serves as its
    leading horizontal rule); every later section is preceded by a `---`

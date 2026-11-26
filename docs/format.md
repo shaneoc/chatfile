@@ -16,12 +16,12 @@ endpoint: http://localhost:9000/v1/chat/completions
 You are terse.
 
 ---
-**User** | 2026-11-22 14:30
+**User** | 2026-11-22 14:30 +00:00
 
 Hello!
 
 ---
-**Assistant** | 2026-11-22 14:31 | model: local-model
+**Assistant** | 2026-11-22 14:31 +00:00 | model: local-model
 
 Hi there.
 ```
@@ -131,15 +131,25 @@ Every section starts with a header line:
 
 ### 2.1 Timestamps
 
-A timestamp is exactly 16 characters of the form `YYYY-MM-DD HH:MM`: ASCII
-digits everywhere except `-` at positions 5 and 8, a space at position 11, and
-`:` at position 14 (1-based). Examples: `2026-11-23 22:42`.
+A timestamp is exactly 23 characters of the form `YYYY-MM-DD HH:MM ±HH:MM`:
+ASCII digits everywhere except `-` at positions 5 and 8, spaces at positions
+11 and 17, `:` at positions 14 and 21, and `'+'` or `'-'` at position 18
+(1-based). Examples: `2026-11-23 22:42 +00:00`, `2026-11-25 20:26 -05:00`.
+
+The prefix must be a valid calendar date and time (month `01..=12`, day valid
+for the month and year, hour `00..=23`, minute `00..=59`), followed by a
+single ASCII space and a **numeric** UTC offset: `'+'` or `'-'`, hours
+`00..=23`, minutes `00..=59`. Bare timestamps without an offset
+(`2026-11-23 22:42`), `Z` suffixes, timezone abbreviations (`EST`), and
+out-of-range offsets (`+25:00`, `-05:75`) are all header-format errors (§4.3).
 
 Rules:
 
 - At most **one** timestamp per header.
 - It must be the **first** metadata segment (immediately after the role).
 - It is optional; headers may carry only `key: value` pairs.
+- Both `-00:00` and `+00:00` are accepted on parse, but serialization
+  normalizes the ambiguous `-00:00` to `+00:00`.
 
 ### 2.2 Metadata tags
 
@@ -196,19 +206,22 @@ The `tool_calls` tag is special:
 ```markdown
 **User**                                              ← valid (no metadata)
 **System**                                            ← valid (first section only)
-**User** | 2026-11-23 22:42                           ← valid (timestamp only)
+**User** | 2026-11-23 22:42 +00:00                    ← valid (timestamp only)
 **User** | model: m1                                  ← valid (tags, no timestamp)
-**Assistant** | 2026-11-23 22:42 | model: local-model ← valid (canonical form)
+**Assistant** | 2026-11-23 22:42 +00:00 | model: local-model ← valid (canonical form)
 **Assistant** | model: m1 | thinking: true | tool_calls: 2 ← valid
-**Tool** | 2026-11-23 22:42 | tool: bash | id: call_1 ← valid
+**Tool** | 2026-11-23 22:42 +00:00 | tool: bash | id: call_1 ← valid
 
-**User** · *2026-11-23 22:42*                         ← INVALID: '·' separator
-**User** - 2026-11-23 22:42                           ← INVALID: '-' separator
-**User**| 2026-11-23 22:42                            ← INVALID: missing spaces
-**User** | *2026-11-23 22:42*                         ← INVALID: italicized segment
-**User** | 2026-11-23 22:42 | note                    ← INVALID: no 'key: ' prefix
-**User** | model: m | 2026-11-23 22:42                ← INVALID: timestamp not first
-**User** | 2026-11-23 22:42 | 2026-11-23 22:43        ← INVALID: duplicate timestamp
+**User** · *2026-11-23 22:42 +00:00*                  ← INVALID: '·' separator
+**User** - 2026-11-23 22:42 +00:00                    ← INVALID: '-' separator
+**User**| 2026-11-23 22:42 +00:00                     ← INVALID: missing spaces
+**User** | *2026-11-23 22:42 +00:00*                  ← INVALID: italicized segment
+**User** | 2026-11-23 22:42 +00:00 | note             ← INVALID: no 'key: ' prefix
+**User** | model: m | 2026-11-23 22:42 +00:00         ← INVALID: timestamp not first
+**User** | 2026-11-23 22:42 +00:00 | 2026-11-23 22:43 +00:00 ← INVALID: duplicate timestamp
+**User** | 2026-11-23 22:42                           ← INVALID: no UTC offset
+**User** | 2026-11-23 22:42Z                          ← INVALID: 'Z' suffix
+**User** | 2026-11-23 22:42 +25:00                    ← INVALID: out-of-range offset
 **User** | : value                                    ← INVALID: empty key
 ```
 
@@ -242,7 +255,7 @@ Here is an example:
 
 ```markdown
 ---
-**Assistant** | 2026-11-22 14:31
+**Assistant** | 2026-11-22 14:31 +00:00
 
 this is just text in a fence
 ```
@@ -313,7 +326,7 @@ Canonical form — reasoning block first (when present), then the visible
 answer, then the blocks; adjacent pieces separated by a single blank line:
 
 ```markdown
-**Assistant** | 2026-11-23 22:42 | model: local-model | thinking: true | tool_calls: 2
+**Assistant** | 2026-11-23 22:42 +00:00 | model: local-model | thinking: true | tool_calls: 2
 
 <details>
 <summary>Thinking</summary>
@@ -387,7 +400,7 @@ required `tool:` and `id:` tags — the call's name and id, which live **only**
 in the header, never in the body — and whose body has this exact shape:
 
 ```markdown
-**Tool** | 2026-11-23 22:42 | tool: bash | id: call_42
+**Tool** | 2026-11-23 22:42 +00:00 | tool: bash | id: call_42
 
 <details>
 <summary>Output</summary>
@@ -436,7 +449,7 @@ is verbatim content**, even if it looks exactly like a wrapper.
 Canonical form (reasoning followed by a visible answer):
 
 ```markdown
-**Assistant** | 2026-11-23 22:42 | model: local-model | thinking: true
+**Assistant** | 2026-11-23 22:42 +00:00 | model: local-model | thinking: true
 
 <details>
 <summary>Thinking</summary>
@@ -544,12 +557,13 @@ content and never triggers them.
 
 | Error message | Condition | Example (invalid) |
 | ------------- | --------- | ----------------- |
-| `line N: invalid header metadata separator; expected ' \| '` | Content follows the bold role but does not begin with exactly ` | ` — e.g. the legacy `·` separator, `-`, a tab, or missing/doubled spaces around the pipe. **Or** a metadata segment contains a stray `\|` (such as a dangling trailing pipe). | `**User** · *2026-11-23 22:42*` / `**User**| 2026-11-23 22:42` / `**User** \| 2026-11-23 22:42 \|` |
-| `line N: header metadata must be plain text; bold/italic markers are not allowed` | Any metadata segment contains a `*`. | `**User** \| *2026-11-23 22:42*` / `**User** \| 2026-11-23 22:42 \| *model: m*` |
-| `line N: duplicate timestamp in header` | Two segments both match the timestamp shape. | `**User** \| 2026-11-23 22:42 \| 2026-11-23 22:43` |
-| `line N: timestamp must be the first metadata segment after the role` | A timestamp-shaped segment appears after a `key: value` segment. | `**User** \| model: m \| 2026-11-23 22:42` |
+| `line N: invalid header metadata separator; expected ' \| '` | Content follows the bold role but does not begin with exactly ` | ` — e.g. the legacy `·` separator, `-`, a tab, or missing/doubled spaces around the pipe. **Or** a metadata segment contains a stray `\|` (such as a dangling trailing pipe). | `**User** · *2026-11-23 22:42 +00:00*` / `**User**| 2026-11-23 22:42 +00:00` / `**User** \| 2026-11-23 22:42 +00:00 \|` |
+| `line N: header metadata must be plain text; bold/italic markers are not allowed` | Any metadata segment contains a `*`. | `**User** \| *2026-11-23 22:42 +00:00*` / `**User** \| 2026-11-23 22:42 +00:00 \| *model: m*` |
+| `line N: duplicate timestamp in header` | Two segments both match the timestamp shape. | `**User** \| 2026-11-23 22:42 +00:00 \| 2026-11-23 22:43 +00:00` |
+| `line N: timestamp must be the first metadata segment after the role` | A timestamp-shaped segment appears after a `key: value` segment. | `**User** \| model: m \| 2026-11-23 22:42 +00:00` |
+| `line N: invalid timestamp '<segment>'; …` | A segment that begins with a `YYYY-MM-DD HH:MM` prefix fails strict validation (§2.1): wrong length or structure (a missing offset, a `Z` suffix, a timezone abbreviation like `EST`, a missing space), an invalid calendar date or time, or an out-of-range offset (`+25:00`, `-05:75`). The message names the specific violation. | `**User** \| 2026-11-23 22:42` / `**User** \| 2026-11-23 22:42Z` / `**User** \| 2026-02-30 22:42 +00:00` / `**User** \| 2026-11-23 22:42 +25:00` |
 | `line N: invalid header metadata; 'key: value' requires a non-empty key` | A segment has a colon but the text before it is empty (after trimming). | `**User** \| : value` |
-| `line N: invalid header metadata; expected a timestamp or 'key: value'` | A segment is neither timestamp-shaped nor contains a colon — a bare word without a key prefix. | `**User** \| 2026-11-23 22:42 \| note` |
+| `line N: invalid header metadata; expected a timestamp or 'key: value'` | A segment is neither timestamp-shaped nor contains a colon — a bare word without a key prefix. | `**User** \| 2026-11-23 22:42 +00:00 \| note` |
 | `line N: invalid header; expected a bold role like **User**` | Defensive: a line in header position lacks the opening or closing `**`. (Unreachable through `parse()`, which pre-checks the role prefix, but part of the strict parser's contract.) | — |
 | `line N: unknown role in header: <text>` | Defensive: the bolded text is not one of System/User/Assistant/Tool. (Same reachability note.) | — |
 | `line N: 'thinking' metadata is only allowed on **Assistant** headers` | A `thinking:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| thinking: true` |

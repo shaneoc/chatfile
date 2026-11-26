@@ -11,20 +11,21 @@
 //! You are terse.
 //!
 //! ---
-//! **User** | 2026-11-22 14:30
+//! **User** | 2026-11-22 14:30 +00:00
 //!
 //! Hello!
 //!
 //! ---
-//! **Assistant** | 2026-11-22 14:31 | model: local-model
+//! **Assistant** | 2026-11-22 14:31 +00:00 | model: local-model
 //!
 //! Hi there.
 //! ```
 //!
 //! Sections are introduced by the role in bold, optionally followed by plain
 //! (unitalicized) metadata segments separated by ` | `:
-//! `**<role>** | YYYY-MM-DD HH:MM | key: value | ...`. The first metadata
-//! segment may be a bare timestamp; every later segment must be `key: value`.
+//! `**<role>** | YYYY-MM-DD HH:MM ±HH:MM | key: value | ...`. The first
+//! metadata segment may be a bare timestamp with an explicit numeric UTC
+//! offset; every later segment must be `key: value`.
 //! All metadata is optional. The first section
 //! must be `**System**` or `**User**`; the frontmatter's closing fence (or
 //! the start of the file, when there is no frontmatter) serves as its
@@ -109,7 +110,8 @@ impl fmt::Display for Role {
 /// Metadata attached to a turn boundary line.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TurnMeta {
-    /// Timestamp in `YYYY-MM-DD HH:MM` form, if present.
+    /// Timestamp in `YYYY-MM-DD HH:MM ±HH:MM` form, if present (an
+    /// ambiguous `-00:00` offset is normalized to `+00:00` on parse).
     pub timestamp: Option<String>,
     /// Arbitrary `key: value` tags (e.g. `("model", "local-model")`).
     pub tags: Vec<(String, String)>,
@@ -413,9 +415,10 @@ pub struct Conversation {
     pub turns: Vec<Turn>,
 }
 
-/// Current local time formatted as `YYYY-MM-DD HH:MM`.
+/// Current local time formatted as `YYYY-MM-DD HH:MM ±HH:MM`, with the
+/// system's numeric UTC offset (e.g. `-05:00`) recorded automatically.
 pub fn now_timestamp() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M %:z").to_string()
 }
 
 /// If `line` consists of `N` leading backslashes followed by `---` and
@@ -463,17 +466,70 @@ fn restore_backslashes(line: &str, k: usize) -> String {
     format!("{}{}", "\\".repeat((k - 1) / 2), &line[k..])
 }
 
-/// True when `s` looks like a `YYYY-MM-DD HH:MM` timestamp.
+/// True when `s` begins with a `YYYY-MM-DD HH:MM` prefix — i.e. it is
+/// attempting to be a timestamp. The strict form (`YYYY-MM-DD HH:MM ±HH:MM`)
+/// is checked by [`validate_timestamp`]; matching this loose shape keeps
+/// malformed attempts (a missing offset, a `Z` suffix, a timezone
+/// abbreviation) out of the `key: value` fallback so they fail with a
+/// descriptive timestamp error instead of parsing as a tag.
 fn looks_like_timestamp(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 16
+    b.len() >= 16
         && b[4] == b'-'
         && b[7] == b'-'
         && b[10] == b' '
         && b[13] == b':'
-        && b.iter()
+        && b[..16].iter()
             .enumerate()
             .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13) || c.is_ascii_digit())
+}
+
+/// Strictly validate a timestamp segment: exactly 23 characters of the form
+/// `YYYY-MM-DD HH:MM ±HH:MM` — a valid calendar date and time, a single
+/// ASCII space, a `'+'` or `'-'` sign, then offset hours in `00..=23` and
+/// offset minutes in `00..=59`. Both `-00:00` and `+00:00` are accepted;
+/// serialization prefers `+00:00` (see [`parse_header_line`]).
+fn validate_timestamp(s: &str) -> Result<()> {
+    let b = s.as_bytes();
+    let bad = || {
+        anyhow!(
+            "invalid timestamp '{s}'; expected 'YYYY-MM-DD HH:MM ±HH:MM' \
+             (a valid date/time, one space, then a numeric UTC offset like +05:30)"
+        )
+    };
+    if b.len() != 23
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b' '
+        || b[13] != b':'
+        || b[16] != b' '
+        || !(b[17] == b'+' || b[17] == b'-')
+        || b[20] != b':'
+    {
+        return Err(bad());
+    }
+    let two = |i: usize| -> Result<u32> {
+        if !b[i].is_ascii_digit() || !b[i + 1].is_ascii_digit() {
+            return Err(bad());
+        }
+        Ok(u32::from(b[i] - b'0') * 10 + u32::from(b[i + 1] - b'0'))
+    };
+    let (year, month, day) = (two(0)?, two(5)?, two(8)?);
+    let (hour, minute) = (two(11)?, two(14)?);
+    let (off_hours, off_minutes) = (two(18)?, two(21)?);
+    chrono::NaiveDate::from_ymd_opt(i32::try_from(year).unwrap(), month, day)
+        .ok_or_else(|| anyhow!("invalid timestamp '{s}'; not a valid calendar date"))?;
+    chrono::NaiveTime::from_hms_opt(hour, minute, 0).ok_or_else(|| {
+        anyhow!(
+            "invalid timestamp '{s}'; hour must be 00..=23 and minute 00..=59"
+        )
+    })?;
+    if off_hours > 23 || off_minutes > 59 {
+        return Err(anyhow!(
+            "invalid timestamp '{s}'; offset hours must be 00..=23 and offset minutes 00..=59"
+        ));
+    }
+    Ok(())
 }
 
 /// True when the line begins with a bold recognized role (`**User**`, ...),
@@ -493,14 +549,17 @@ fn is_role_header_line(line: &str) -> bool {
 
 /// Strictly parse a section header line: `**<role>**` optionally followed by
 /// plain (unitalicized) metadata segments separated by exactly ` | ` — an
-/// optional bare `YYYY-MM-DD HH:MM` timestamp first, then `key: value`
-/// pairs.
+/// optional bare `YYYY-MM-DD HH:MM ±HH:MM` timestamp first, then `key: value`
+/// pairs. A segment that begins with a `YYYY-MM-DD HH:MM` prefix is
+/// validated strictly ([`validate_timestamp`]); an ambiguous `-00:00`
+/// offset is normalized to `+00:00` so serialization never emits it.
 ///
 /// Every deviation is a parse error reported with the 1-based line number
 /// via [`line_error`]: a different separator (`·`, `-`, missing spaces),
 /// bold/italic markers anywhere in the metadata, a pipe inside a segment, a
-/// timestamp that is not the first segment, or a non-timestamp segment
-/// without a `key: ` prefix.
+/// timestamp that is not the first segment or that fails strict validation
+/// (missing offset, `Z` suffix, timezone abbreviation, out-of-range date,
+/// time, or offset), or a non-timestamp segment without a `key: ` prefix.
 fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
     let t = line.trim();
     let bad_role = || {
@@ -548,7 +607,14 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                         "timestamp must be the first metadata segment after the role",
                     ));
                 }
-                meta.timestamp = Some(seg.to_string());
+                validate_timestamp(seg).map_err(|e| line_error(line_no, e.to_string()))?;
+                // Normalize the ambiguous `-00:00` to `+00:00` so a later
+                // serialization never emits it.
+                meta.timestamp = Some(if seg.ends_with("-00:00") {
+                    format!("{}+00:00", &seg[..seg.len() - 6])
+                } else {
+                    seg.to_string()
+                });
             } else if let Some((k, v)) = seg.split_once(':') {
                 let k = k.trim();
                 if k.is_empty() {

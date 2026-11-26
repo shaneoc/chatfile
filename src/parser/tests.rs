@@ -16,17 +16,17 @@ tools:
 Be terse.
 
 ---
-**User** | 2026-11-22 14:30
+**User** | 2026-11-22 14:30 +00:00
 
 Hello!
 
 ---
-**Assistant** | 2026-11-22 14:31 | model: local-model
+**Assistant** | 2026-11-22 14:31 +00:00 | model: local-model
 
 Hi there.
 
 ---
-**Tool** | 2026-11-22 14:31 | tool: bash | id: call_1
+**Tool** | 2026-11-22 14:31 +00:00 | tool: bash | id: call_1
 
 <details>
 <summary>Output</summary>
@@ -54,7 +54,7 @@ exit code 0
     assert_eq!(
         conv.turns[1].meta,
         TurnMeta {
-            timestamp: Some("2026-11-22 14:30".into()),
+            timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
         }
     );
@@ -63,7 +63,7 @@ exit code 0
     assert_eq!(
         conv.turns[2].meta,
         TurnMeta {
-            timestamp: Some("2026-11-22 14:31".into()),
+            timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![("model".into(), "local-model".into())],
         }
     );
@@ -102,10 +102,10 @@ fn parse_system_only_allowed_as_first_section() {
 fn parse_header_rejects_wrong_separators() {
     // The legacy `·` separator is no longer a header.
     for (input, at) in [
-        ("**User** · *2026-11-22 14:30*\n\nhi\n", "line 1"),
-        ("**User**\n\nhi\n\n---\n**Assistant** - 2026-11-22 14:31\n\nlate\n", "line 6"),
+        ("**User** · *2026-11-22 14:30 +00:00*\n\nhi\n", "line 1"),
+        ("**User**\n\nhi\n\n---\n**Assistant** - 2026-11-22 14:31 +00:00\n\nlate\n", "line 6"),
         // Missing the spaces around `|`.
-        ("**User**| 2026-11-22 14:30\n\nhi\n", "line 1"),
+        ("**User**| 2026-11-22 14:30 +00:00\n\nhi\n", "line 1"),
     ] {
         let err = parse(input).unwrap_err();
         let msg = err.to_string();
@@ -120,20 +120,20 @@ fn parse_header_rejects_wrong_separators() {
 #[test]
 fn parse_header_rejects_italicized_metadata() {
     // The legacy italic block around the metadata.
-    let err = parse("**User** | *2026-11-22 14:30*\n\nhi\n").unwrap_err();
+    let err = parse("**User** | *2026-11-22 14:30 +00:00*\n\nhi\n").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 1"), "{msg}");
     assert!(msg.contains("plain text"), "{msg}");
 
     // Italicized key: value segment.
-    let err = parse("**User** | 2026-11-22 14:30 | *model: m*\n\nhi\n").unwrap_err();
+    let err = parse("**User** | 2026-11-22 14:30 +00:00 | *model: m*\n\nhi\n").unwrap_err();
     assert!(err.to_string().contains("plain text"), "{err}");
 }
 
 #[test]
 fn parse_header_requires_key_prefix_after_timestamp() {
     // A bare word after the timestamp is not `key: value`.
-    let err = parse("**User** | 2026-11-22 14:30 | note\n\nhi\n").unwrap_err();
+    let err = parse("**User** | 2026-11-22 14:30 +00:00 | note\n\nhi\n").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 1"), "{msg}");
     assert!(
@@ -142,7 +142,7 @@ fn parse_header_requires_key_prefix_after_timestamp() {
     );
 
     // Same violation in a later section: the line number tracks it.
-    let err = parse("**User**\n\nhi\n\n---\n**Assistant** | 2026-11-22 14:31 | model\n\nlate\n")
+    let err = parse("**User**\n\nhi\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00 | model\n\nlate\n")
         .unwrap_err();
     assert!(err.to_string().contains("line 6"), "{err}");
 
@@ -153,13 +153,13 @@ fn parse_header_requires_key_prefix_after_timestamp() {
 
 #[test]
 fn parse_header_timestamp_must_be_first_segment() {
-    let err = parse("**User** | model: m | 2026-11-22 14:30\n\nhi\n").unwrap_err();
+    let err = parse("**User** | model: m | 2026-11-22 14:30 +00:00\n\nhi\n").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 1"), "{msg}");
     assert!(msg.contains("first metadata segment"), "{msg}");
 
     // A second timestamp is rejected as well.
-    let err = parse("**User** | 2026-11-22 14:30 | 2026-11-22 14:31\n\nhi\n").unwrap_err();
+    let err = parse("**User** | 2026-11-22 14:30 +00:00 | 2026-11-22 14:31 +00:00\n\nhi\n").unwrap_err();
     assert!(err.to_string().contains("duplicate timestamp"), "{err}");
 }
 
@@ -216,11 +216,11 @@ fn parse_metadata_optional_variants() {
     assert_eq!(conv.turns[0].meta, TurnMeta::default());
 
     // Timestamp only (model tag missing).
-    let conv = parse("**User** | 2026-11-22 14:30\n\nhi\n").unwrap();
+    let conv = parse("**User** | 2026-11-22 14:30 +00:00\n\nhi\n").unwrap();
     assert_eq!(
         conv.turns[0].meta,
         TurnMeta {
-            timestamp: Some("2026-11-22 14:30".into()),
+            timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
         }
     );
@@ -237,13 +237,13 @@ fn parse_metadata_optional_variants() {
 
     // Timestamp plus several tags; tag values may contain colons.
     let conv = parse(
-        "**User**\n\nhello\n\n---\n**Assistant** | 2026-11-22 14:31 | model: unsloth/Qwen:Q8 | note: a: b\n\nhi\n",
+        "**User**\n\nhello\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00 | model: unsloth/Qwen:Q8 | note: a: b\n\nhi\n",
     )
     .unwrap();
     assert_eq!(
         conv.turns[1].meta,
         TurnMeta {
-            timestamp: Some("2026-11-22 14:31".into()),
+            timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![
                 ("model".into(), "unsloth/Qwen:Q8".into()),
                 ("note".into(), "a: b".into()),
@@ -277,7 +277,7 @@ fn parse_boundary_inside_code_block_ignored() {
 
 ```markdown
 ---
-**Assistant** | 2026-11-22 14:31
+**Assistant** | 2026-11-22 14:31 +00:00
 
 this is just text in a fence
 ```
@@ -289,7 +289,7 @@ still user content
     assert_eq!(conv.turns[0].role, Role::User);
     assert_eq!(
         conv.turns[0].content,
-        "```markdown\n---\n**Assistant** | 2026-11-22 14:31\n\nthis is just text in a fence\n```\n\nstill user content"
+        "```markdown\n---\n**Assistant** | 2026-11-22 14:31 +00:00\n\nthis is just text in a fence\n```\n\nstill user content"
     );
 }
 
@@ -297,7 +297,7 @@ still user content
 fn parse_opening_fence_requires_closing_fence() {
     // A file that starts with `---` claims to have frontmatter; without a
     // closing fence that is a format error pointing at the opening line.
-    let err = parse("---\n**User** | 2026-11-22 14:30\n\nHello\n").unwrap_err();
+    let err = parse("---\n**User** | 2026-11-22 14:30 +00:00\n\nHello\n").unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("line 1"), "{msg}");
     assert!(msg.contains("not closed"), "{msg}");
@@ -334,12 +334,12 @@ model: local-model
 Be terse.
 
 ---
-**User** | 2026-11-22 14:30
+**User** | 2026-11-22 14:30 +00:00
 
 Hello!
 
 ---
-**Assistant** | 2026-11-22 14:31 | model: local-model
+**Assistant** | 2026-11-22 14:31 +00:00 | model: local-model
 
 Hi there.
 ";
@@ -369,7 +369,7 @@ fn serialize_canonical_form() {
                 role: Role::User,
                 content: "Hello!".into(),
                 meta: TurnMeta {
-                    timestamp: Some("2026-11-22 14:30".into()),
+                    timestamp: Some("2026-11-22 14:30 +00:00".into()),
                     tags: vec![],
                 },
                 reasoning: None,
@@ -380,7 +380,7 @@ fn serialize_canonical_form() {
     let md = to_markdown(&conv);
     assert_eq!(
         md,
-        "---\nmodel: m\n---\n**System**\n\nBe terse.\n\n---\n**User** | 2026-11-22 14:30\n\nHello!\n"
+        "---\nmodel: m\n---\n**System**\n\nBe terse.\n\n---\n**User** | 2026-11-22 14:30 +00:00\n\nHello!\n"
     );
 }
 
@@ -450,8 +450,8 @@ fn escape_boundaries_escapes_unfenced_collision() {
     // `1 -> 3`, `2 -> 5`).
     let b = |n: usize| "\\".repeat(n);
     assert_eq!(
-        escape_boundaries("look at this:\n---\n**User** | 2026-11-22 14:30\n\nand more"),
-        "look at this:\n\\---\n**User** | 2026-11-22 14:30\n\nand more"
+        escape_boundaries("look at this:\n---\n**User** | 2026-11-22 14:30 +00:00\n\nand more"),
+        "look at this:\n\\---\n**User** | 2026-11-22 14:30 +00:00\n\nand more"
     );
     assert_eq!(
         escape_boundaries(&format!("note:\n{}---\n**User**", b(1))),
@@ -469,8 +469,8 @@ fn escape_boundaries_leaves_non_collisions_alone() {
     assert_eq!(escape_boundaries("---\nplain text"), "---\nplain text");
     // Role line without a preceding hr.
     assert_eq!(
-        escape_boundaries("**User** | 2026-11-22 14:30"),
-        "**User** | 2026-11-22 14:30"
+        escape_boundaries("**User** | 2026-11-22 14:30 +00:00"),
+        "**User** | 2026-11-22 14:30 +00:00"
     );
     // The hr is the last line: nothing follows it.
     assert_eq!(escape_boundaries("text\n---"), "text\n---");
@@ -480,7 +480,7 @@ fn escape_boundaries_leaves_non_collisions_alone() {
 
 #[test]
 fn escape_boundaries_skips_fenced_content() {
-    let content = "```\n---\n**User** | 2026-11-22 14:30\n```\nreal text";
+    let content = "```\n---\n**User** | 2026-11-22 14:30 +00:00\n```\nreal text";
     assert_eq!(escape_boundaries(content), content);
 }
 
@@ -531,7 +531,7 @@ fn escaped_collision_round_trips_as_content() {
     let conv = Conversation {
         turns: vec![Turn {
             role: Role::User,
-            content: "---\n**Assistant** | 2026-11-22 14:31".into(),
+            content: "---\n**Assistant** | 2026-11-22 14:31 +00:00".into(),
             meta: TurnMeta::default(),
             reasoning: None,
             tool_calls: Vec::new(),
@@ -543,7 +543,7 @@ fn escaped_collision_round_trips_as_content() {
     let back = parse(&once).unwrap();
     assert_eq!(back.turns.len(), 1);
     assert_eq!(back.turns[0].role, Role::User);
-    assert_eq!(back.turns[0].content, "---\n**Assistant** | 2026-11-22 14:31");
+    assert_eq!(back.turns[0].content, "---\n**Assistant** | 2026-11-22 14:31 +00:00");
     assert_eq!(to_markdown(&back), once);
 }
 
@@ -576,7 +576,7 @@ fn boundary_collision_round_trips_losslessly() {
 fn closed_fence_with_boundary_collision_round_trips() {
     // A valid closed fenced code block containing the raw boundary pattern
     // is left untouched by serialization and parses back byte-exactly.
-    let content = "```\n---\n**User** | 2026-11-22 14:30\n```\nreal text";
+    let content = "```\n---\n**User** | 2026-11-22 14:30 +00:00\n```\nreal text";
     let conv = Conversation {
         turns: vec![Turn {
             role: Role::User,
@@ -757,29 +757,121 @@ fn unclosed_fence_round_trips_without_lingering_backslash() {
 fn turn_meta_render() {
     assert_eq!(TurnMeta::default().render(), None);
     let meta = TurnMeta {
-        timestamp: Some("2026-11-22 14:30".into()),
+        timestamp: Some("2026-11-22 14:30 +00:00".into()),
         tags: vec![("model".into(), "m".into()), ("flag".into(), String::new())],
     };
     // Empty values keep the `key: ` prefix (a bare key would not re-parse).
     assert_eq!(
         meta.render().as_deref(),
-        Some("2026-11-22 14:30 | model: m | flag: ")
+        Some("2026-11-22 14:30 +00:00 | model: m | flag: ")
     );
 }
 
 #[test]
 fn looks_like_timestamp_validation() {
-    assert!(looks_like_timestamp("2026-11-22 14:30"));
+    // The loose detector matches the `YYYY-MM-DD HH:MM` prefix, so both
+    // well-formed timestamps and malformed attempts are classified as
+    // timestamps (strict validation happens in parse_header_line).
+    assert!(looks_like_timestamp("2026-11-22 14:30 +00:00"));
+    assert!(looks_like_timestamp("2026-11-22 14:30 -05:00"));
+    assert!(looks_like_timestamp("2026-11-22 14:30")); // offset-less attempt
+    assert!(looks_like_timestamp("2026-11-22 14:30Z")); // `Z` suffix attempt
     assert!(!looks_like_timestamp("2026/11/22 14:30"));
     assert!(!looks_like_timestamp("2026-11-22 14:3"));
-    assert!(!looks_like_timestamp("2026-11-22 14:30:59"));
     assert!(!looks_like_timestamp("model: m"));
+}
+
+#[test]
+fn validate_timestamp_ranges() {
+    // Valid: UTC, negative, and positive (non-whole-hour) offsets.
+    for ts in [
+        "2026-11-25 20:26 +00:00",
+        "2026-11-25 20:26 -05:00",
+        "2026-11-25 20:26 +05:30",
+        "2024-02-29 23:59 -00:00", // leap day; `-00:00` is accepted on parse
+    ] {
+        assert!(validate_timestamp(ts).is_ok(), "{ts}");
+    }
+    // Invalid: offset-less, `Z` suffix, abbreviation, out-of-range offsets.
+    for ts in [
+        "2026-11-25 20:26",
+        "2026-11-25 20:26Z",
+        "2026-11-25 20:26 EST",
+        "2026-11-25 20:26 +24:00",
+        "2026-11-25 20:26 -05:60",
+        "2026-11-25 20:26 +25:00",
+        "2026-11-25 20:26 -05:75",
+        "2026-11-25 20:26 +5:30",
+        "2026-11-25 20:2605:30", // missing space before the offset
+    ] {
+        assert!(validate_timestamp(ts).is_err(), "{ts}");
+    }
+    // Invalid: bad calendar dates and times.
+    for ts in [
+        "2026-13-25 20:26 +00:00", // month 13
+        "2026-00-25 20:26 +00:00", // month 0
+        "2026-02-30 20:26 +00:00", // Feb 30
+        "2026-11-25 24:26 +00:00", // hour 24
+        "2026-11-25 20:60 +00:00", // minute 60
+    ] {
+        assert!(validate_timestamp(ts).is_err(), "{ts}");
+    }
+}
+
+#[test]
+fn parse_header_timestamp_with_offset() {
+    // Valid positive, negative, and UTC offsets.
+    for ts in [
+        "2026-11-25 20:26 +00:00",
+        "2026-11-25 20:26 -05:00",
+        "2026-11-25 20:26 +05:30",
+    ] {
+        let conv = parse(&format!("**User** | {ts}\n\nhi\n")).unwrap();
+        assert_eq!(conv.turns[0].meta.timestamp.as_deref(), Some(ts), "{ts}");
+    }
+    // `-00:00` parses but is normalized to `+00:00` so serialization never
+    // emits the ambiguous form.
+    let conv = parse("**User** | 2026-11-25 20:26 -00:00\n\nhi\n").unwrap();
+    assert_eq!(
+        conv.turns[0].meta.timestamp.as_deref(),
+        Some("2026-11-25 20:26 +00:00")
+    );
+    let md = to_markdown(&conv);
+    assert!(md.contains("**User** | 2026-11-25 20:26 +00:00"), "{md}");
+}
+
+#[test]
+fn parse_header_rejects_offsetless_timestamp() {
+    let err = parse("**User** | 2026-11-25 20:26\n\nhi\n").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("line 1"), "{msg}");
+    assert!(msg.contains("invalid timestamp"), "{msg}");
+}
+
+#[test]
+fn parse_header_rejects_invalid_timestamps() {
+    for ts in [
+        "2026-11-25 20:26",     // no offset
+        "2026-11-25 20:26Z",    // `Z` suffix
+        "2026-11-25 20:26 EST", // timezone abbreviation
+        "2026-11-25 20:26 +24:00", // offset hours out of range
+        "2026-11-25 20:26 -05:60", // offset minutes out of range
+        "2026-02-30 20:26 +00:00", // not a calendar date
+    ] {
+        let err = parse(&format!("**User** | {ts}\n\nhi\n")).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("line 1"), "{ts}: {msg}");
+        assert!(msg.contains("invalid timestamp"), "{ts}: {msg}");
+    }
 }
 
 #[test]
 fn now_timestamp_shape() {
     let ts = now_timestamp();
     assert!(looks_like_timestamp(&ts), "bad timestamp shape: {ts}");
+    // The generated form must pass strict validation, including the
+    // explicit numeric UTC offset.
+    assert!(validate_timestamp(&ts).is_ok(), "bad timestamp: {ts}");
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1074,7 @@ fn no_thinking_tag_wrapper_stays_content() {
 }
 
 /// A user preamble so the tested assistant section is not the first one.
-const USER_PREAMBLE: &str = "**User** | 2026-11-22 14:30\n\nq\n\n---\n";
+const USER_PREAMBLE: &str = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n";
 
 #[test]
 fn thinking_tag_rejects_non_true_value() {
@@ -1062,7 +1154,7 @@ fn tool_turn_fixture(name: &str, id: &str, output: &str) -> Turn {
         role: Role::Tool,
         content: tool_turn_body(output),
         meta: TurnMeta {
-            timestamp: Some("2026-11-22 14:31".into()),
+            timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![
                 ("tool".into(), name.into()),
                 ("id".into(), id.into()),
@@ -1103,7 +1195,7 @@ fn tool_turn_round_trips() {
 fn tool_turn_output_with_details_and_backticks_round_trips() {
     // The output contains a literal `</details>` and a triple-backtick
     // fence; the tilde fence must outlast both.
-    let output = "look:\n```\n---\n**User** | 2026-11-22 14:30\n```\nand </details> inside";
+    let output = "look:\n```\n---\n**User** | 2026-11-22 14:30 +00:00\n```\nand </details> inside";
     let conv = Conversation {
         turns: vec![
             Turn {
@@ -1394,7 +1486,7 @@ fn assistant_turn_fixture(content: &str, calls: &[AssistantToolCall]) -> Turn {
         role: Role::Assistant,
         content: content.to_string(),
         meta: TurnMeta {
-            timestamp: Some("2026-11-22 14:31".into()),
+            timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags,
         },
         reasoning: None,
@@ -1429,7 +1521,7 @@ fn tool_call_single_round_trips() {
     };
     let once = to_markdown(&conv);
     assert!(
-        once.contains("**Assistant** | 2026-11-22 14:31 | model: m1 | tool_calls: 1"),
+        once.contains("**Assistant** | 2026-11-22 14:31 +00:00 | model: m1 | tool_calls: 1"),
         "{once}"
     );
     let back = parse(&once).unwrap();
@@ -1488,7 +1580,7 @@ fn tool_call_with_thinking_and_content_round_trips() {
                 role: Role::Assistant,
                 content: "Here you go.".into(),
                 meta: TurnMeta {
-                    timestamp: Some("2026-11-22 14:31".into()),
+                    timestamp: Some("2026-11-22 14:31 +00:00".into()),
                     tags: vec![
                         ("model".to_string(), "m1".to_string()),
                         ("thinking".to_string(), "true".to_string()),
@@ -1504,7 +1596,7 @@ fn tool_call_with_thinking_and_content_round_trips() {
     let once = to_markdown(&conv);
     assert!(
         once.contains(
-            "**Assistant** | 2026-11-22 14:31 | model: m1 | thinking: true | tool_calls: 2"
+            "**Assistant** | 2026-11-22 14:31 +00:00 | model: m1 | thinking: true | tool_calls: 2"
         ),
         "{once}"
     );
@@ -1529,7 +1621,7 @@ fn tool_call_with_thinking_without_content_round_trips() {
                 role: Role::Assistant,
                 content: String::new(),
                 meta: TurnMeta {
-                    timestamp: Some("2026-11-22 14:31".into()),
+                    timestamp: Some("2026-11-22 14:31 +00:00".into()),
                     tags: vec![
                         ("thinking".to_string(), "true".to_string()),
                         ("tool_calls".to_string(), "1".to_string()),
@@ -1654,7 +1746,7 @@ fn tool_calls_non_integer_rejected() {
 
 #[test]
 fn tool_calls_on_non_assistant_header_rejected() {
-    let input = "**User** | 2026-11-22 14:30\n\nq\n\n---\n**User** | tool_calls: 1\n\nhi\n";
+    let input = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n**User** | tool_calls: 1\n\nhi\n";
     let err = parse(&input).unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -1944,7 +2036,7 @@ fn tool_turn_body_with_extra_blanks_round_trips() {
                 role: Role::Tool,
                 content: content.into(),
                 meta: TurnMeta {
-                    timestamp: Some("2026-11-22 14:31".into()),
+                    timestamp: Some("2026-11-22 14:31 +00:00".into()),
                     tags: vec![
                         ("tool".to_string(), "bash".to_string()),
                         ("id".to_string(), "c1".to_string()),
