@@ -383,6 +383,24 @@ data: [DONE]\n\n";
 const FINAL_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Done writing.\"}}]}\n\n\
 data: [DONE]\n\n";
 
+const STOP_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"All good.\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: [DONE]\n\n";
+
+const CONTENT_FILTERED_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Some answer.\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n\
+data: [DONE]\n\n";
+
+const UNKNOWN_FINISH_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Odd end.\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop_with_tools\"}]}\n\n\
+data: [DONE]\n\n";
+
+/// A response cut off at the output-token limit mid-stream: partial content
+/// and a tool call whose id and arguments are both incomplete.
+const LENGTH_TRUNCATED_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Partial answ\",\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\": \\\"x.txt\\\"\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+data: [DONE]\n\n";
+
 #[tokio::test]
 async fn run_turn_executes_tool_call_then_finalizes() {
     let dir = TempDir::new().unwrap();
@@ -500,6 +518,97 @@ async fn run_turn_stops_when_callback_returns_false() {
     assert!(seen >= 1);
 }
 
+#[tokio::test]
+async fn run_turn_reports_finish_reasons_on_response_end() {
+    let dir = TempDir::new().unwrap();
+    let (url, _) = mock_server(vec![
+        sse(STOP_RESPONSE),
+        sse(CONTENT_FILTERED_RESPONSE),
+        sse(UNKNOWN_FINISH_RESPONSE),
+    ])
+    .await;
+    let client = Client::new(url, "test-model", None);
+    let cfg = config(dir.path());
+
+    // One plain response per run_turn: collect the finish each ResponseEnd
+    // reports.
+    let mut finishes = Vec::new();
+    for prompt in ["one", "two", "three"] {
+        run_turn(&client, vec![Message::user(prompt)], &cfg, |ev| {
+            if let LoopEvent::ResponseEnd { finish, .. } = ev {
+                finishes.push(finish.clone());
+            }
+            true
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(finishes[0], FinishReason::Stop);
+    assert_eq!(finishes[1], FinishReason::ContentFilter);
+    assert_eq!(finishes[2], FinishReason::Unknown("stop_with_tools".into()));
+    // The unknown value is a non-fatal warning, not an error.
+    assert!(finishes[2].warning().is_some());
+    assert!(FinishReason::Stop.warning().is_none());
+    assert!(FinishReason::ContentFilter.warning().is_none());
+}
+
+#[tokio::test]
+async fn run_turn_length_finish_does_not_execute_partial_calls() {
+    let dir = TempDir::new().unwrap();
+    let (url, bodies) = mock_server(vec![sse(LENGTH_TRUNCATED_RESPONSE)]).await;
+    let client = Client::new(url, "test-model", None);
+    let cfg = config(dir.path());
+
+    let mut events = Vec::new();
+    run_turn(&client, vec![Message::user("go")], &cfg, |ev| {
+        events.push(format!("{ev:?}"));
+        true
+    })
+    .await
+    .unwrap();
+
+    // The partial call is reported on ResponseEnd with the Length finish...
+    let end = events
+        .iter()
+        .find(|e| e.contains("ResponseEnd"))
+        .expect("a ResponseEnd event");
+    assert!(end.contains("Length"), "{end}");
+    assert!(end.contains("call_9"), "{end}");
+    // ...but it must not be executed: no ToolResult event, the file was
+    // never written, and no follow-up request was made.
+    assert!(!events.iter().any(|e| e.contains("ToolResult")));
+    assert!(!dir.path().join("x.txt").exists());
+    assert_eq!(bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn run_turn_sends_max_tokens_when_set() {
+    let dir = TempDir::new().unwrap();
+    let (url, bodies) = mock_server(vec![sse(STOP_RESPONSE)]).await;
+    let client = Client::new(url, "test-model", None).with_max_output_tokens(Some(123));
+    let cfg = config(dir.path());
+
+    run_turn(&client, vec![Message::user("hi")], &cfg, |_| true)
+        .await
+        .unwrap();
+    let v: Json = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+    assert_eq!(v["max_tokens"], 123);
+}
+
+#[tokio::test]
+async fn run_turn_omits_max_tokens_when_unset() {
+    let dir = TempDir::new().unwrap();
+    let (url, bodies) = mock_server(vec![sse(STOP_RESPONSE)]).await;
+    let client = Client::new(url, "test-model", None);
+    let cfg = config(dir.path());
+
+    run_turn(&client, vec![Message::user("hi")], &cfg, |_| true)
+        .await
+        .unwrap();
+    let v: Json = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+    assert!(v.get("max_tokens").is_none());
+}
+
 // -----------------------------------------------------------------------
 // Persistence helpers
 // -----------------------------------------------------------------------
@@ -523,7 +632,7 @@ fn tool_turn_helper_builds_persistable_turn() {
 
 #[test]
 fn assistant_turn_helper_sets_reasoning_field() {
-    let turn = assistant_turn("m1", "thinking hard", "the answer", &[]);
+    let turn = assistant_turn("m1", "thinking hard", "the answer", &[], false, false);
     assert_eq!(turn.role, parser::Role::Assistant);
     assert_eq!(turn.content, "the answer");
     assert_eq!(turn.reasoning.as_deref(), Some("thinking hard"));
@@ -534,10 +643,39 @@ fn assistant_turn_helper_sets_reasoning_field() {
             .any(|(k, v)| k == "thinking" && v == "true")
     );
     // Empty reasoning is omitted (no tag, no field).
-    let turn = assistant_turn("m1", "  ", "just", &[]);
+    let turn = assistant_turn("m1", "  ", "just", &[], false, false);
     assert_eq!(turn.content, "just");
     assert_eq!(turn.reasoning, None);
     assert!(!turn.meta.tags.iter().any(|(k, _)| k == "thinking"));
+}
+
+#[test]
+fn assistant_turn_helper_sets_finish_flags() {
+    // Both flags set: they land in the meta (not the free-form tags) and
+    // render right after the timestamp.
+    let turn = assistant_turn("m1", "", "cut short", &[], true, true);
+    assert!(turn.meta.length_limit_reached);
+    assert!(turn.meta.content_filtered);
+    assert!(
+        !turn
+            .meta
+            .tags
+            .iter()
+            .any(|(k, _)| { k == "length_limit_reached" || k == "content_filtered" })
+    );
+    // The flags render right after the timestamp, before the other tags.
+    let rendered = turn.meta.render().expect("metadata");
+    let parts: Vec<&str> = rendered.split(" | ").collect();
+    assert_eq!(parts[1], "length_limit_reached: true");
+    assert_eq!(parts[2], "content_filtered: true");
+    assert_eq!(parts[3], "model: m1");
+    // Unset flags are omitted from the header entirely.
+    let turn = assistant_turn("m1", "", "fine", &[], false, false);
+    assert!(!turn.meta.length_limit_reached);
+    assert!(!turn.meta.content_filtered);
+    let rendered = turn.meta.render().expect("metadata");
+    assert!(!rendered.contains("length_limit_reached"));
+    assert!(!rendered.contains("content_filtered"));
 }
 
 #[test]
@@ -554,7 +692,7 @@ fn assistant_turn_helper_carries_tool_calls() {
             arguments: r#"{"command": "ls"}"#.into(),
         },
     ];
-    let turn = assistant_turn("m1", "", "checking", &calls);
+    let turn = assistant_turn("m1", "", "checking", &calls, false, false);
     assert_eq!(turn.tool_calls.len(), 2);
     assert_eq!(
         turn.meta.tags,
@@ -564,7 +702,7 @@ fn assistant_turn_helper_carries_tool_calls() {
         ]
     );
     // No calls: no tag, no field.
-    let turn = assistant_turn("m1", "", "plain", &[]);
+    let turn = assistant_turn("m1", "", "plain", &[], false, false);
     assert!(!turn.meta.tags.iter().any(|(k, _)| k == "tool_calls"));
     assert!(turn.tool_calls.is_empty());
 }
@@ -579,7 +717,7 @@ fn append_turn_appends_and_round_trips() {
     )
     .unwrap();
 
-    let a = assistant_turn("m", "", "hi there", &[]);
+    let a = assistant_turn("m", "", "hi there", &[], false, false);
     append_turn(&path, &a).unwrap();
     let t = tool_turn("list_files", "c1", "x.md  1");
     append_turn(&path, &t).unwrap();

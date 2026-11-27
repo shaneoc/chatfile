@@ -20,7 +20,8 @@ use serde_json::{Value as Json, json};
 use crate::config::{AppConfig, SandboxConfig};
 use crate::context;
 use crate::llm::{
-    AssistantTurn, Client, CompletedToolCall, Message, StreamDelta, ToolCall, ToolFunction,
+    AssistantTurn, Client, CompletedToolCall, FinishReason, Message, StreamDelta, ToolCall,
+    ToolFunction,
 };
 use crate::parser;
 use crate::sandbox;
@@ -784,6 +785,8 @@ pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
                 ("id".to_string(), id.to_string()),
             ],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -793,15 +796,19 @@ pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
 /// Build the persisted form of an assistant response: the visible answer,
 /// plus — when there is reasoning — a `thinking: true` header tag and the
 /// reasoning carried in [`parser::Turn::reasoning`] (serialized as a
-/// collapsible `<details><summary>Thinking</summary>` block), and — when
-/// tool calls were issued — a `tool_calls: <N>` header tag and the calls
-/// carried in [`parser::Turn::tool_calls`] (serialized as trailing Tool
-/// Call blocks).
+/// collapsible `<details><summary>Thinking</summary>` block), — when tool
+/// calls were issued — a `tool_calls: <N>` header tag and the calls carried
+/// in [`parser::Turn::tool_calls`] (serialized as trailing Tool Call
+/// blocks), and — when set — the `length_limit_reached: true` /
+/// `content_filtered: true` header tags recording how the response ended
+/// (§2.5 of `docs/format.md`).
 pub fn assistant_turn(
     model: &str,
     reasoning: &str,
     content: &str,
     tool_calls: &[CompletedToolCall],
+    length_limit_reached: bool,
+    content_filtered: bool,
 ) -> parser::Turn {
     let has_reasoning = !reasoning.trim().is_empty();
     let mut tags = vec![("model".to_string(), model.to_string())];
@@ -818,6 +825,8 @@ pub fn assistant_turn(
             timestamp: Some(parser::now_timestamp()),
             tags,
             compact: false,
+            length_limit_reached,
+            content_filtered,
         },
         reasoning: has_reasoning.then(|| reasoning.trim().to_string()),
         tool_calls: tool_calls
@@ -877,6 +886,12 @@ pub enum LoopEvent {
         /// can persist them on the assistant turn even when execution is
         /// interrupted before every result arrives.
         tool_calls: Vec<CompletedToolCall>,
+        /// How the response ended, mapped from the server's
+        /// `finish_reason` (§2.5 of `docs/format.md`). When it is
+        /// [`FinishReason::Length`], the calls are incomplete and were
+        /// **not** executed; the caller persists them on the turn with the
+        /// `length_limit_reached` flag.
+        finish: FinishReason,
     },
     /// A tool call has been executed; the fields describe the persisted
     /// result.
@@ -902,6 +917,13 @@ pub enum LoopEvent {
 /// The function returns when the final response has been fully streamed; its
 /// content is whatever `Content` events were emitted after the last
 /// `ResponseEnd`.
+///
+/// A response that ends with `finish_reason: "length"` (§2.5 of
+/// `docs/format.md`) is truncated: its `ResponseEnd` carries
+/// [`FinishReason::Length`] and any calls it carried are **not** executed —
+/// the caller persists them on the assistant turn with the
+/// `length_limit_reached` flag, and [`crate::llm::complete_tool_calls`]
+/// answers them synthetically on the next request.
 pub async fn run_turn(
     client: &Client,
     mut messages: Vec<Message>,
@@ -945,12 +967,23 @@ pub async fn run_turn(
                 arguments: c.arguments.clone(),
             })
             .collect();
+        let finish = turn.finish();
         if !on_event(&LoopEvent::ResponseEnd {
             tool_calls: calls.clone(),
+            finish: finish.clone(),
         }) {
             return Ok(());
         }
         if calls.is_empty() {
+            return Ok(());
+        }
+        // `finish_reason: "length"` means the response was cut off at the
+        // output-token limit, mid-stream: any tool calls it carried (even
+        // partially streamed ones) are incomplete and must not be executed.
+        // The caller persists them on the assistant turn with the
+        // `length_limit_reached` flag; `complete_tool_calls` answers them
+        // synthetically on the next request.
+        if finish.is_length() {
             return Ok(());
         }
 

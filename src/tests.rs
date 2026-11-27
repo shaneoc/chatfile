@@ -85,7 +85,9 @@ data: [DONE]\n\n";
     )
     .unwrap();
 
-    compact(&file, &config::AppConfig::default()).await.unwrap();
+    compact(&file, None, &config::AppConfig::default())
+        .await
+        .unwrap();
 
     // The request carried the hierarchical system prompt (AGENTS.md + the
     // System section), every section of the file (no prior checkpoint), and
@@ -120,6 +122,62 @@ data: [DONE]\n\n";
     assert_eq!(model_tag, Some("test-model"));
     // The file still round-trips exactly (parse/serialize stay bijective).
     assert_eq!(parser::to_markdown(&conv), after);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn run_sends_max_tokens_from_flag_or_frontmatter_and_omits_it_when_unset() {
+    let dir = std::env::temp_dir().join(format!("chatfile-runmax-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Bound the AGENTS.md walk to this directory.
+    std::fs::write(dir.join(".chatfile"), "").unwrap();
+
+    let raw = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"the reply\"}}]}\n\n\
+data: [DONE]\n\n";
+    let (endpoint, bodies) = mock_completions(raw.to_vec()).await;
+
+    let write_conv = |name: &str, extra: &str| {
+        let file = dir.join(name);
+        std::fs::write(
+            &file,
+            format!(
+                "---\nmodel: test-model\nendpoint: {endpoint}\ntools: false\n{extra}---\n\
+                 **User**\n\nq\n"
+            ),
+        )
+        .unwrap();
+        file
+    };
+
+    // The CLI flag lands in the request body.
+    let file = write_conv("conv1.chat.md", "");
+    run(&file, Some(777), &config::AppConfig::default())
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
+    assert_eq!(v["max_tokens"], 777);
+
+    // A frontmatter value applies when the CLI flag is absent.
+    let file = write_conv("conv2.chat.md", "max_output_tokens: 512\n");
+    run(&file, None, &config::AppConfig::default())
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[1]).unwrap();
+    assert_eq!(v["max_tokens"], 512);
+
+    // Nothing set anywhere: the key is omitted from the request.
+    let file = write_conv("conv3.chat.md", "");
+    run(&file, None, &config::AppConfig::default())
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[2]).unwrap();
+    assert!(v.get("max_tokens").is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

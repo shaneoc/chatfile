@@ -63,6 +63,7 @@ Supported fields (in serialization order):
 | ------------- | ------ | -------- | --------------------------------------------------------------------- |
 | `model`       | string | *(none)* | Model name to request.                                                |
 | `endpoint`    | string | *(none)* | Full `/v1/chat/completions` URL.                                      |
+| `max_output_tokens` | positive integer | *(none)* | Cap on the model's output per response; sent as `max_tokens` in the API request (omitted when unset, leaving the endpoint's default in effect). `0` and non-integers are frontmatter errors (§4.1). |
 | `tools`       | bool   | `true`   | Enable built-in tools. **Lenient deserialization**: any non-boolean YAML value (e.g. the legacy free-form `tools:` list) reads as `true`. |
 | `scope`       | string | `folder` | `folder` or `vault`: which directory file tools operate in.           |
 | `network`     | bool   | `false`  | Allow `fetch_url` and shared-net sandboxed bash.                      |
@@ -169,9 +170,10 @@ Each non-timestamp segment is `key: value`:
   turn), `thinking` (assistant-only switch for the collapsible reasoning
   block — see below and §3.4), `tool_calls` (assistant-only count of the
   trailing Tool Call blocks — see below and §3.3), `compact` (**`**User**`-only**
-  context-compaction switch — see below and §5), and `tool` (the tool name) /
-  `id` (the tool call id), which are **`**Tool**`-only** and required there
-  (§3.3.2).
+  context-compaction switch — see below and §5), `length_limit_reached` /
+  `content_filtered` (assistant-only flags recording how the response ended
+  — see below and §2.5), and `tool` (the tool name) / `id` (the tool call
+  id), which are **`**Tool**`-only** and required there (§3.3.2).
 
 The `thinking` tag is special:
 
@@ -209,6 +211,21 @@ The `compact` tag is special:
   when set; parsing lifts it out of the free-form tag list, so its position
   among the other tags is not significant.
 
+The `length_limit_reached` and `content_filtered` tags are special:
+
+- They are **only allowed on `**Assistant**` headers**; on any other role it
+  is a header-format error (§4.3).
+- Their values must be **exactly the lowercase literal `true`**; anything
+  else (`false`, `True`, empty, …) is a header-format error (§4.3).
+- They record how the response ended, derived from the server's
+  `finish_reason` (§2.5): `length_limit_reached` for `"length"` (the reply
+  was cut off at the output-token limit; any tool calls it carried are
+  incomplete and were **not** executed) and `content_filtered` for
+  `"content_filter"` (the provider's safety filter cut the reply).
+- Each is emitted only when set, rendered right after the timestamp (before
+  any other tags); parsing lifts them out of the free-form tag list, so
+  their position among the other tags is not significant.
+
 ### 2.3 Whitespace handling
 
 - Leading whitespace before the opening `**` is ignored; trailing whitespace
@@ -229,6 +246,8 @@ The `compact` tag is special:
 **Assistant** | model: m1 | thinking: true | tool_calls: 2 ← valid
 **Tool** | 2026-11-23 22:42 +00:00 | tool: bash | id: call_1 ← valid
 **User** | 2026-11-23 22:42 +00:00 | compact: true           ← valid (compaction checkpoint)
+**Assistant** | 2026-11-23 22:42 +00:00 | length_limit_reached: true | model: m ← valid (truncated response)
+**Assistant** | model: m | content_filtered: true            ← valid (provider filter)
 
 **User** · *2026-11-23 22:42 +00:00*                  ← INVALID: '·' separator
 **User** - 2026-11-23 22:42 +00:00                    ← INVALID: '-' separator
@@ -243,7 +262,28 @@ The `compact` tag is special:
 **User** | : value                                    ← INVALID: empty key
 **Assistant** | 2026-11-23 22:42 +00:00 | compact: true ← INVALID: 'compact' is **User**-only
 **User** | compact: false                             ← INVALID: must be the literal 'true'
+**User** | length_limit_reached: true                 ← INVALID: 'length_limit_reached' is **Assistant**-only
+**Assistant** | content_filtered: false               ← INVALID: must be the literal 'true'
 ```
+
+### 2.5 Finish reasons and their metadata tags
+
+Every assistant response ends with the server's `finish_reason` for the
+choice (chatfile reads it from the final SSE chunk of the streamed
+response). It is mapped as follows:
+
+| `finish_reason`        | Effect on the persisted `**Assistant**` turn                                   | Tool calls issued by the response |
+| ---------------------- | ------------------------------------------------------------------------------ | --------------------------------- |
+| `"stop"`               | No extra metadata.                                                               | Executed normally.                |
+| `"tool_calls"`         | No extra metadata.                                                               | Executed normally.                |
+| `"length"`             | Header tag `length_limit_reached: true`.                                         | **Not executed** — the response was cut off mid-stream, so any calls it carried (even partially streamed ones) are incomplete. They are persisted verbatim on the turn and answered synthetically by `complete_tool_calls` on the next request. |
+| `"content_filter"`     | Header tag `content_filtered: true`.                                             | Executed normally.                |
+| missing or unknown     | No extra metadata. A **non-fatal warning** is reported (CLI: stderr, TUI: status bar); all streamed content is preserved. | Executed normally.                |
+
+Only `"length"` suppresses tool execution: a truncated response's calls may
+be missing ids or carry incomplete JSON arguments, so running them would be
+wrong. The reply text that did stream is persisted as-is (with the flag), so
+nothing is lost; the next user turn simply continues the conversation.
 
 ---
 
@@ -590,6 +630,10 @@ content and never triggers them.
 | `line N: 'thinking' metadata must be the literal value 'true'` | The `thinking` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| thinking: false` |
 | `line N: 'compact' metadata is only allowed on **User** headers` | A `compact:` tag appears on a `**System**`, `**Assistant**`, or `**Tool**` header (§2.2). | `**Assistant** \| compact: true` |
 | `line N: 'compact' metadata must be the literal value 'true'` | The `compact` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**User** \| compact: false` |
+| `line N: 'length_limit_reached' metadata is only allowed on **Assistant** headers` | A `length_limit_reached:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| length_limit_reached: true` |
+| `line N: 'length_limit_reached' metadata must be the literal value 'true'` | The `length_limit_reached` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| length_limit_reached: false` |
+| `line N: 'content_filtered' metadata is only allowed on **Assistant** headers` | A `content_filtered:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**Tool** \| content_filtered: true` |
+| `line N: 'content_filtered' metadata must be the literal value 'true'` | The `content_filtered` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| content_filtered: True` |
 | `line N: 'tool_calls' metadata is only allowed on **Assistant** headers` | A `tool_calls:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tool_calls: 1` |
 | `line N: 'tool_calls' metadata must be a positive integer` | The `tool_calls` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tool_calls: 0` |
 | `line N: duplicate metadata key '<key>' in header` | The same `key:` appears more than once in one header (keys are case-sensitive; timestamps are not keys and have their own duplicate check). | `**Assistant** \| model: a \| model: b` |

@@ -40,6 +40,8 @@ fn test_app() -> App {
         cancel_requested: false,
         quit: false,
         status: String::new(),
+        max_output_tokens: None,
+        last_finish: None,
     }
 }
 
@@ -116,6 +118,8 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
             timestamp: Some("2026-11-23 00:00 +00:00".into()),
             tags: vec![("thinking".into(), "true".into())],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: Some("because 6*9".into()),
         tool_calls: Vec::new(),

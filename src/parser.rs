@@ -120,12 +120,23 @@ pub struct TurnMeta {
     /// Lifted out of [`TurnMeta::tags`] on parse so it has a stable,
     /// role-checked position in the rendered header.
     pub compact: bool,
+    /// Whether the header carried `length_limit_reached: true` (an
+    /// `**Assistant**`-only tag recording that the response was cut off at
+    /// the model's output-token limit; see §2.5 of `docs/format.md`). Lifted
+    /// out of [`TurnMeta::tags`] on parse like [`TurnMeta::compact`].
+    pub length_limit_reached: bool,
+    /// Whether the header carried `content_filtered: true` (an
+    /// `**Assistant**`-only tag recording that the provider's content filter
+    /// cut the response; see §2.5 of `docs/format.md`). Lifted out of
+    /// [`TurnMeta::tags`] on parse like [`TurnMeta::compact`].
+    pub content_filtered: bool,
 }
 
 impl TurnMeta {
     /// The metadata as it appears after the role in a header line — plain
-    /// segments joined by ` | ` (timestamp first, then `compact: true` when
-    /// set, then the remaining `key: value` pairs) — or `None` when there is
+    /// segments joined by ` | ` (timestamp first, then `compact: true`,
+    /// `length_limit_reached: true`, and `content_filtered: true` when set,
+    /// then the remaining `key: value` pairs) — or `None` when there is
     /// none.
     pub fn render(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
@@ -134,6 +145,12 @@ impl TurnMeta {
         }
         if self.compact {
             parts.push("compact: true".to_string());
+        }
+        if self.length_limit_reached {
+            parts.push("length_limit_reached: true".to_string());
+        }
+        if self.content_filtered {
+            parts.push("content_filtered: true".to_string());
         }
         for (k, v) in &self.tags {
             // Always `key: value` (a bare key would not re-parse); an empty
@@ -194,6 +211,23 @@ where
     })
 }
 
+/// Deserialize an optional positive integer: `0` (like any non-integer or
+/// negative value) is a type error, so the frontmatter rejects useless caps.
+/// An explicit YAML null reads as unset.
+fn opt_positive_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<u32>::deserialize(deserializer)?;
+    if v == Some(0) {
+        return Err(serde::de::Error::invalid_value(
+            serde::de::Unexpected::Unsigned(0),
+            &"a positive integer",
+        ));
+    }
+    Ok(v)
+}
+
 /// YAML frontmatter fields. Unknown keys are ignored on parse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Frontmatter {
@@ -203,6 +237,15 @@ pub struct Frontmatter {
     /// The full `/v1/chat/completions` endpoint URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Cap on the model's output per response, sent as `max_tokens` in the
+    /// API request; `None` leaves the endpoint's default in effect. Must be
+    /// a positive integer when present.
+    #[serde(
+        default,
+        deserialize_with = "opt_positive_u32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<u32>,
     /// Whether built-in tools are enabled (default `true`).
     #[serde(
         default = "default_true",
@@ -226,6 +269,7 @@ impl Default for Frontmatter {
         Self {
             model: None,
             endpoint: None,
+            max_output_tokens: None,
             tools: true,
             scope: Scope::Folder,
             network: false,
@@ -240,6 +284,7 @@ impl Frontmatter {
     pub fn is_empty(&self) -> bool {
         self.model.is_none()
             && self.endpoint.is_none()
+            && self.max_output_tokens.is_none()
             && self.scope == Scope::Folder
             && !self.network
             && !self.allow_shell
@@ -682,6 +727,35 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
     if meta.tags.iter().any(|(k, _)| k == "compact") {
         meta.compact = true;
         meta.tags.retain(|(k, _)| k != "compact");
+    }
+    // The `length_limit_reached` and `content_filtered` tags are
+    // assistant-only switches recording how the response ended (§2.5); each
+    // must be exactly the lowercase literal `true`. When present they are
+    // lifted out of the free-form tags into [`TurnMeta`] (rendered right
+    // after the timestamp).
+    for (k, v) in &meta.tags {
+        if k == "length_limit_reached" || k == "content_filtered" {
+            if role != Role::Assistant {
+                return Err(line_error(
+                    line_no,
+                    format!("'{k}' metadata is only allowed on **Assistant** headers"),
+                ));
+            }
+            if v != "true" {
+                return Err(line_error(
+                    line_no,
+                    format!("'{k}' metadata must be the literal value 'true'"),
+                ));
+            }
+        }
+    }
+    if meta.tags.iter().any(|(k, _)| k == "length_limit_reached") {
+        meta.length_limit_reached = true;
+        meta.tags.retain(|(k, _)| k != "length_limit_reached");
+    }
+    if meta.tags.iter().any(|(k, _)| k == "content_filtered") {
+        meta.content_filtered = true;
+        meta.tags.retain(|(k, _)| k != "content_filtered");
     }
     // The `tool_calls` tag is an assistant-only positive integer counting
     // the trailing Tool Call blocks in the body.
@@ -1649,6 +1723,9 @@ pub fn to_markdown(conv: &Conversation) -> String {
         }
         if let Some(v) = &conv.frontmatter.endpoint {
             mapping.insert(key("endpoint"), serde_yaml::Value::String(v.clone()));
+        }
+        if let Some(v) = &conv.frontmatter.max_output_tokens {
+            mapping.insert(key("max_output_tokens"), serde_yaml::Value::from(*v));
         }
         // Booleans/enums are written only when they differ from the
         // defaults, keeping files clean.

@@ -47,9 +47,11 @@ enum StreamEvent {
     /// A streamed delta: reasoning (thinking) text or answer content.
     Delta(llm::StreamDelta),
     /// The current assistant response has ended (before tool execution, or
-    /// as the final response of the turn), with the calls it issued.
+    /// as the final response of the turn), with the calls it issued and how
+    /// the response ended (§2.5 of `docs/format.md`).
     ResponseEnd {
         tool_calls: Vec<crate::llm::CompletedToolCall>,
+        finish: crate::llm::FinishReason,
     },
     /// A tool call has been executed; the fields describe the persisted
     /// result (the call's arguments live on the issuing assistant turn).
@@ -79,6 +81,10 @@ pub struct App {
     pub endpoint: String,
     /// API key, when configured via the environment.
     pub api_key: Option<String>,
+    /// Per-response output-token limit (CLI `--max-output-tokens` >
+    /// frontmatter `max_output_tokens` > active profile), sent as
+    /// `max_tokens` on every request; `None` omits the field.
+    pub max_output_tokens: Option<u32>,
     /// Tool configuration for this conversation (frontmatter over the
     /// active profile from config.toml).
     pub tool_config: tools::ToolConfig,
@@ -115,6 +121,10 @@ pub struct App {
     pub cancel_requested: bool,
     /// Set when the user quits (Esc, or Ctrl+C while idle).
     pub quit: bool,
+    /// The finish reason of the most recent response that ended this turn
+    /// (cleared when the turn completes); drives the status-bar truncation
+    /// notice and non-fatal warnings (§2.5 of `docs/format.md`).
+    pub last_finish: Option<llm::FinishReason>,
     /// Short message shown in the status bar.
     pub status: String,
 }
@@ -123,9 +133,15 @@ impl App {
     /// Load a conversation file and prepare an app for it. The endpoint,
     /// model, and API key are resolved from the frontmatter, the
     /// environment, and the active profile (see
-    /// [`config::AppConfig::resolve_llm`]); the tool configuration and the
-    /// compaction prompt come from the config.
-    pub fn load(path: PathBuf, app_config: &config::AppConfig) -> Result<Self> {
+    /// [`config::AppConfig::resolve_llm`]); the output-token limit from the
+    /// CLI flag, the frontmatter, and the active profile (see
+    /// [`config::AppConfig::resolve_max_output_tokens`]); the tool
+    /// configuration and the compaction prompt come from the config.
+    pub fn load(
+        path: PathBuf,
+        cli_max_output_tokens: Option<u32>,
+        app_config: &config::AppConfig,
+    ) -> Result<Self> {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let conv =
@@ -134,6 +150,8 @@ impl App {
             conv.frontmatter.endpoint.as_deref(),
             conv.frontmatter.model.as_deref(),
         );
+        let max_output_tokens = app_config
+            .resolve_max_output_tokens(cli_max_output_tokens, conv.frontmatter.max_output_tokens);
         let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, &path, app_config);
         let compact_prompt = app_config.prompts.compact.clone();
         Ok(Self {
@@ -142,6 +160,7 @@ impl App {
             endpoint,
             model,
             api_key,
+            max_output_tokens,
             tool_config,
             compact_prompt,
             input: String::new(),
@@ -157,6 +176,7 @@ impl App {
             compacting: false,
             cancel_requested: false,
             quit: false,
+            last_finish: None,
             status: String::new(),
         })
     }
@@ -315,6 +335,8 @@ impl App {
                 timestamp: Some(parser::now_timestamp()),
                 tags: vec![("model".into(), self.model.clone())],
                 compact: false,
+                length_limit_reached: false,
+                content_filtered: false,
             };
             let reason = (!self.reason_buf.is_empty()).then_some(self.reason_buf.as_str());
             push_turn(
@@ -564,9 +586,15 @@ fn role_style(role: parser::Role) -> Style {
 
 /// Run the interactive TUI for `path` (the file must exist). When `mouse`
 /// is true, mouse capture is enabled so the scroll wheel scrolls the
-/// history.
-pub async fn run_tui(path: PathBuf, mouse: bool, config: &config::AppConfig) -> Result<()> {
-    let mut app = App::load(path, config)?;
+/// history. `cli_max_output_tokens` is the `--max-output-tokens` flag value,
+/// which overrides the frontmatter and the active profile.
+pub async fn run_tui(
+    path: PathBuf,
+    mouse: bool,
+    cli_max_output_tokens: Option<u32>,
+    config: &config::AppConfig,
+) -> Result<()> {
+    let mut app = App::load(path, cli_max_output_tokens, config)?;
     enable_raw_mode().context("failed to enable raw terminal mode")?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -662,8 +690,17 @@ async fn event_loop(
                     // Tool-call fragments and finish markers are consumed by
                     // the loop itself; they never reach the UI.
                     Some(StreamEvent::Delta(_)) => {}
-                    Some(StreamEvent::ResponseEnd { tool_calls }) => {
-                        finalize_response(app, &tool_calls)?;
+                    Some(StreamEvent::ResponseEnd {
+                        tool_calls,
+                        finish,
+                    }) => {
+                        finalize_response(
+                            app,
+                            &tool_calls,
+                            finish.is_length(),
+                            finish.is_content_filter(),
+                        )?;
+                        app.last_finish = Some(finish);
                     }
                     Some(StreamEvent::ToolResult {
                         id,
@@ -681,20 +718,26 @@ async fn event_loop(
                             let _ = h.await;
                         }
                         app.streaming = false;
-                        if app.compacting {
-                            // The summary streams as one response without a
-                            // ResponseEnd, so persist it now.
-                            app.compacting = false;
-                            match finalize_response(app, &[]) {
-                                Ok(()) if app.got_reply => app.status.clear(),
-                                Ok(()) => app.status = "no summary produced".into(),
-                                Err(e) => app.status = format!("error: {e}"),
-                            }
-                        } else if !app.got_reply {
-                            app.status = "no reply produced".into();
+                        let compacting = app.compacting;
+                        app.compacting = false;
+                        // The status reflects whether anything was persisted,
+                        // and — when a response was — how it ended (§2.5):
+                        // the truncation notice for "length", or the
+                        // non-fatal warning for a missing/unknown
+                        // finish_reason.
+                        app.status = if !app.got_reply {
+                            (if compacting {
+                                "no summary produced"
+                            } else {
+                                "no reply produced"
+                            })
+                            .into()
                         } else {
-                            app.status.clear();
-                        }
+                            app.last_finish
+                                .take()
+                                .map(finish_status)
+                                .unwrap_or_default()
+                        };
                         app.got_reply = false;
                     }
                     Some(StreamEvent::Failed(e)) => {
@@ -706,6 +749,7 @@ async fn event_loop(
                         app.reason_buf.clear();
                         app.stream_buf.clear();
                         app.got_reply = false;
+                        app.last_finish = None;
                         app.status = format!("error: {e}");
                     }
                     None => {} // sender dropped (task aborted or finished)
@@ -730,6 +774,8 @@ async fn submit(
             timestamp: Some(ts),
             tags: vec![],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -754,7 +800,8 @@ async fn submit(
     llm::set_system_prompt(&mut messages, &system_prompt);
     llm::complete_tool_calls(&mut messages);
 
-    let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
+    let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone())
+        .with_max_output_tokens(app.max_output_tokens);
     let tool_config = app.tool_config.clone();
     let tx = tx.clone();
     let task = tokio::spawn(async move {
@@ -768,8 +815,9 @@ async fn submit(
                 tools::LoopEvent::Content(s) => {
                     StreamEvent::Delta(llm::StreamDelta::Content(s.clone()))
                 }
-                tools::LoopEvent::ResponseEnd { tool_calls } => StreamEvent::ResponseEnd {
+                tools::LoopEvent::ResponseEnd { tool_calls, finish } => StreamEvent::ResponseEnd {
                     tool_calls: tool_calls.clone(),
+                    finish: finish.clone(),
                 },
                 tools::LoopEvent::ToolResult {
                     id,
@@ -820,7 +868,8 @@ async fn compact(
         .filter(|t| t.role == parser::Role::System)
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(&app.path, system_section);
-    let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone());
+    let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone())
+        .with_max_output_tokens(app.max_output_tokens);
     let tool_config = app.tool_config.clone();
     let conv = app.conv.clone();
     let tx = tx.clone();
@@ -839,7 +888,14 @@ async fn compact(
         })
         .await;
         match res {
-            Ok(_) => {
+            Ok(turn) => {
+                // The summary is one response; report it like any other
+                // ResponseEnd so its finish reason is persisted on the turn
+                // and surfaced in the status bar (§2.5).
+                let _ = tx.send(StreamEvent::ResponseEnd {
+                    tool_calls: Vec::new(),
+                    finish: turn.finish(),
+                });
                 let _ = tx.send(StreamEvent::Done);
             }
             Err(e) => {
@@ -857,9 +913,16 @@ async fn compact(
 
 /// Persist the assistant response that just ended (reasoning in a
 /// collapsible Thinking block ahead of the answer, tool calls as trailing
-/// blocks) and push it into the in-memory conversation. A response with
-/// neither text, reasoning, nor tool calls is skipped.
-fn finalize_response(app: &mut App, tool_calls: &[crate::llm::CompletedToolCall]) -> Result<()> {
+/// blocks, and the `length_limit_reached` / `content_filtered` header tags
+/// when set — §2.5 of `docs/format.md`) and push it into the in-memory
+/// conversation. A response with neither text, reasoning, nor tool calls is
+/// skipped.
+fn finalize_response(
+    app: &mut App,
+    tool_calls: &[crate::llm::CompletedToolCall],
+    length_limit_reached: bool,
+    content_filtered: bool,
+) -> Result<()> {
     let reply = app.stream_buf.trim_end().to_string();
     let reasoning = app.reason_buf.trim_end().to_string();
     app.reason_buf.clear();
@@ -867,11 +930,32 @@ fn finalize_response(app: &mut App, tool_calls: &[crate::llm::CompletedToolCall]
     if reply.is_empty() && reasoning.is_empty() && tool_calls.is_empty() {
         return Ok(());
     }
-    let turn = tools::assistant_turn(&app.model, &reasoning, &reply, tool_calls);
+    let turn = tools::assistant_turn(
+        &app.model,
+        &reasoning,
+        &reply,
+        tool_calls,
+        length_limit_reached,
+        content_filtered,
+    );
     tools::append_turn(&app.path, &turn)?;
     app.conv.turns.push(turn);
     app.got_reply = true;
     Ok(())
+}
+
+/// The status-bar message for a finished response, from its finish reason
+/// (§2.5 of `docs/format.md`): the truncation notice for `"length"`, the
+/// non-fatal warning for a missing or unrecognized value, or empty for the
+/// known values.
+fn finish_status(finish: llm::FinishReason) -> String {
+    if finish.is_length() {
+        "response truncated at the output-token limit; tool calls not executed".into()
+    } else if let Some(w) = finish.warning() {
+        format!("warning: {w}")
+    } else {
+        String::new()
+    }
 }
 
 #[cfg(test)]

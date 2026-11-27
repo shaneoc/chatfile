@@ -19,7 +19,8 @@
 //! Resolution precedence for LLM settings: `.chat.md` frontmatter >
 //! `CHATFILE_*` environment variables > the active profile (the
 //! `default_profile` entry of `[profiles]`) > standard `OPENAI_*` variables
-//! > built-in defaults.
+//! > built-in defaults. The per-response output-token limit resolves as CLI
+//! > flag > frontmatter > active profile (no environment-variable layer).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -191,6 +192,12 @@ impl AppConfig {
         })
     }
 
+    /// Resolve the per-response output-token limit (see
+    /// [`resolve_max_output_tokens`] for the precedence rules).
+    pub fn resolve_max_output_tokens(&self, cli: Option<u32>, fm: Option<u32>) -> Option<u32> {
+        resolve_max_output_tokens(self, cli, fm)
+    }
+
     /// Cross-field validation of the merged config.
     fn validate(&self) -> Result<()> {
         if let Some(name) = &self.default_profile {
@@ -208,6 +215,9 @@ impl AppConfig {
                     );
                 }
             }
+            if profile.max_output_tokens == Some(0) {
+                anyhow::bail!("profiles.{name}.max_output_tokens must be a positive integer");
+            }
         }
         Ok(())
     }
@@ -223,6 +233,9 @@ pub struct ProfileConfig {
     /// Name of the environment variable holding the API key (the value is
     /// read at request time, so keys never live in config files).
     pub api_key_env: Option<String>,
+    /// Cap on the model's output per response (sent as `max_tokens`);
+    /// `None` leaves the endpoint's default in effect.
+    pub max_output_tokens: Option<u32>,
     /// Default tool scope: `"folder"` or `"vault"`.
     pub scope: Option<String>,
     /// Built-in tools enabled for conversations that use this profile; names
@@ -373,6 +386,25 @@ pub fn resolve_llm(
     (endpoint, model, api_key)
 }
 
+/// Resolve the per-response output-token limit from layered sources.
+/// Precedence, highest first:
+///
+/// 1. the CLI `--max-output-tokens` flag (`cli`),
+/// 2. the `.chat.md` frontmatter's `max_output_tokens` (`fm`),
+/// 3. the active profile's `max_output_tokens`.
+///
+/// Unlike endpoint/model there is no environment-variable layer; `None`
+/// means the field is omitted from the request and the endpoint's default
+/// applies.
+pub fn resolve_max_output_tokens(
+    config: &AppConfig,
+    cli: Option<u32>,
+    fm: Option<u32>,
+) -> Option<u32> {
+    cli.or(fm)
+        .or_else(|| config.active_profile().and_then(|p| p.max_output_tokens))
+}
+
 // ---------------------------------------------------------------------------
 // Wire format (one config file, every field optional)
 // ---------------------------------------------------------------------------
@@ -411,6 +443,7 @@ struct ProfileOverrides {
     endpoint: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
+    max_output_tokens: Option<u32>,
     scope: Option<String>,
     tools: Option<Vec<String>>,
 }
@@ -425,6 +458,9 @@ impl ProfileOverrides {
         }
         if let Some(v) = self.api_key_env {
             profile.api_key_env = Some(v);
+        }
+        if let Some(v) = self.max_output_tokens {
+            profile.max_output_tokens = Some(v);
         }
         if let Some(v) = self.scope {
             profile.scope = Some(v);

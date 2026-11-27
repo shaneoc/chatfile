@@ -128,6 +128,75 @@ fn assistant_turn_plain_text_does_not_want_tools() {
     assert_eq!(turn.content, "hello");
 }
 
+// ---------------------------------------------------------------------------
+// FinishReason: the finish_reason mapping (§2.5 of docs/format.md)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn finish_reason_parses_known_values() {
+    assert_eq!(FinishReason::parse(Some("stop")), FinishReason::Stop);
+    assert_eq!(
+        FinishReason::parse(Some("tool_calls")),
+        FinishReason::ToolCalls
+    );
+    assert_eq!(FinishReason::parse(Some("length")), FinishReason::Length);
+    assert_eq!(
+        FinishReason::parse(Some("content_filter")),
+        FinishReason::ContentFilter
+    );
+}
+
+#[test]
+fn finish_reason_missing_or_unknown() {
+    assert_eq!(FinishReason::parse(None), FinishReason::Missing);
+    assert_eq!(
+        FinishReason::parse(Some("stop_with_tools")),
+        FinishReason::Unknown("stop_with_tools".into())
+    );
+}
+
+#[test]
+fn finish_reason_flags_and_warning() {
+    // Only "length" suppresses tool execution; only "content_filter" sets
+    // the filter flag.
+    assert!(FinishReason::Length.is_length());
+    assert!(!FinishReason::Stop.is_length());
+    assert!(!FinishReason::ToolCalls.is_length());
+    assert!(!FinishReason::ContentFilter.is_length());
+    assert!(FinishReason::ContentFilter.is_content_filter());
+    assert!(!FinishReason::Length.is_content_filter());
+    // Known values carry no warning; missing and unknown do.
+    assert_eq!(FinishReason::Stop.warning(), None);
+    assert_eq!(FinishReason::ToolCalls.warning(), None);
+    assert_eq!(FinishReason::Length.warning(), None);
+    assert_eq!(FinishReason::ContentFilter.warning(), None);
+    let missing = FinishReason::Missing.warning().expect("a warning");
+    assert!(missing.contains("finish_reason"), "{missing}");
+    let unknown = FinishReason::Unknown("weird".into())
+        .warning()
+        .expect("a warning");
+    assert!(unknown.contains("weird"), "{unknown}");
+}
+
+#[test]
+fn assistant_turn_finish_maps_streamed_reason() {
+    let mut turn = AssistantTurn::default();
+    turn.push(&StreamDelta::Finished(Some("length".into())));
+    assert_eq!(turn.finish(), FinishReason::Length);
+    let mut turn = AssistantTurn::default();
+    turn.push(&StreamDelta::Finished(None));
+    assert_eq!(turn.finish(), FinishReason::Missing);
+}
+
+#[test]
+fn client_max_output_tokens_builder_and_accessor() {
+    // Unset by default: the key is omitted from requests.
+    let c = Client::new("http://x", "m", None);
+    assert_eq!(c.max_output_tokens(), None);
+    let c = c.with_max_output_tokens(Some(99));
+    assert_eq!(c.max_output_tokens(), Some(99));
+}
+
 /// Spawn a one-shot TCP server that replies with `raw_response`.
 async fn serve_once(raw_response: Vec<u8>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

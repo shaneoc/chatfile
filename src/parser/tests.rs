@@ -57,6 +57,8 @@ exit code 0
             timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
     assert_eq!(conv.turns[2].role, Role::Assistant);
@@ -67,6 +69,8 @@ exit code 0
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![("model".into(), "local-model".into())],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
     assert_eq!(conv.turns[3].role, Role::Tool);
@@ -183,6 +187,8 @@ fn parse_header_tags_without_timestamp_ok() {
                 ("endpoint".into(), "local".into()),
             ],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
 }
@@ -234,6 +240,8 @@ fn parse_metadata_optional_variants() {
             timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
 
@@ -248,6 +256,8 @@ fn parse_metadata_optional_variants() {
                 ("endpoint".into(), "local".into())
             ],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
 
@@ -265,6 +275,8 @@ fn parse_metadata_optional_variants() {
                 ("note".into(), "a: b".into()),
             ],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
 }
@@ -392,6 +404,8 @@ fn serialize_canonical_form() {
                     timestamp: Some("2026-11-22 14:30 +00:00".into()),
                     tags: vec![],
                     compact: false,
+                    length_limit_reached: false,
+                    content_filtered: false,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -793,6 +807,8 @@ fn turn_meta_render() {
         timestamp: Some("2026-11-22 14:30 +00:00".into()),
         tags: vec![("model".into(), "m".into()), ("flag".into(), String::new())],
         compact: false,
+        length_limit_reached: false,
+        content_filtered: false,
     };
     // Empty values keep the `key: ` prefix (a bare key would not re-parse).
     assert_eq!(
@@ -931,6 +947,8 @@ fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
                     timestamp: None,
                     tags: vec![("thinking".into(), "true".into())],
                     compact: false,
+                    length_limit_reached: false,
+                    content_filtered: false,
                 },
                 reasoning: Some(reasoning.to_string()),
                 tool_calls: Vec::new(),
@@ -1192,6 +1210,8 @@ fn tool_turn_fixture(name: &str, id: &str, output: &str) -> Turn {
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags: vec![("tool".into(), name.into()), ("id".into(), id.into())],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1287,6 +1307,8 @@ fn parse_tool_turn_rejects_malformed() {
             timestamp: None,
             tags: vec![("tool".into(), "bash".into())],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1309,6 +1331,8 @@ fn parse_tool_turn_rejects_malformed() {
             timestamp: None,
             tags: vec![("tool".into(), "bash".into()), ("id".into(), "c1".into())],
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1488,6 +1512,7 @@ fn frontmatter_defaults_are_omitted() {
     assert!(!md.contains("scope:"), "{md}");
     assert!(!md.contains("network:"), "{md}");
     assert!(!md.contains("allow_shell:"), "{md}");
+    assert!(!md.contains("max_output_tokens:"), "{md}");
     let back = parse(&md).unwrap();
     assert_eq!(back.frontmatter, Frontmatter::default());
 }
@@ -1497,6 +1522,42 @@ fn frontmatter_legacy_tools_list_reads_as_enabled() {
     let md = "---\ntools:\n  - name: shell\n---\n**User**\n\nhi\n";
     let conv = parse(md).unwrap();
     assert!(conv.frontmatter.tools);
+}
+
+#[test]
+fn frontmatter_max_output_tokens_round_trip() {
+    let conv = Conversation {
+        frontmatter: Frontmatter {
+            max_output_tokens: Some(512),
+            ..Default::default()
+        },
+        had_frontmatter: true,
+        turns: vec![Turn {
+            role: Role::User,
+            content: "hi".into(),
+            meta: TurnMeta::default(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+        }],
+    };
+    let md = to_markdown(&conv);
+    assert!(md.contains("max_output_tokens: 512"), "{md}");
+    let back = parse(&md).unwrap();
+    assert_eq!(back.frontmatter, conv.frontmatter);
+}
+
+#[test]
+fn frontmatter_max_output_tokens_zero_rejected() {
+    // A zero cap is useless, so the deserializer rejects it like any
+    // non-positive value. (`{:#}` shows the full anyhow error chain.)
+    let md = "---\nmax_output_tokens: 0\n---\n**User**\n\nhi\n";
+    let err = format!("{:#}", parse(md).unwrap_err());
+    assert!(err.contains("invalid YAML frontmatter"), "{err}");
+    assert!(err.contains("positive integer"), "{err}");
+
+    // Negative values fail too (as a u32 type error).
+    let md = "---\nmax_output_tokens: -4\n---\n**User**\n\nhi\n";
+    assert!(parse(md).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,6 +1585,8 @@ fn assistant_turn_fixture(content: &str, calls: &[AssistantToolCall]) -> Turn {
             timestamp: Some("2026-11-22 14:31 +00:00".into()),
             tags,
             compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: calls.to_vec(),
@@ -1623,6 +1686,8 @@ fn tool_call_with_thinking_and_content_round_trips() {
                         ("tool_calls".to_string(), "2".to_string()),
                     ],
                     compact: false,
+                    length_limit_reached: false,
+                    content_filtered: false,
                 },
                 reasoning: Some("Let me think.".into()),
                 tool_calls: calls.clone(),
@@ -1664,6 +1729,8 @@ fn tool_call_with_thinking_without_content_round_trips() {
                         ("tool_calls".to_string(), "1".to_string()),
                     ],
                     compact: false,
+                    length_limit_reached: false,
+                    content_filtered: false,
                 },
                 reasoning: Some("Quick check.".into()),
                 tool_calls: vec![call.clone()],
@@ -1808,6 +1875,8 @@ fn compact_round_trip_with_timestamp() {
             timestamp: Some("2026-11-22 14:30 +00:00".into()),
             tags: vec![],
             compact: true,
+            length_limit_reached: false,
+            content_filtered: false,
         }
     );
     // It is rendered right after the timestamp.
@@ -1880,6 +1949,85 @@ fn compact_non_true_value_rejected() {
             "line 6: 'compact' metadata must be the literal value 'true'",
             "value: {v:?}"
         );
+    }
+}
+
+#[test]
+fn finish_flags_round_trip() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | 2026-11-23 22:42 +00:00 | \
+         length_limit_reached: true | content_filtered: true | model: m\n\ncut short\n"
+    );
+    let conv = parse(&input).unwrap();
+    let meta = &conv.turns[1].meta;
+    assert!(meta.length_limit_reached);
+    assert!(meta.content_filtered);
+    // Lifted out of the free-form tags, which keep only the model tag.
+    assert_eq!(meta.tags, vec![("model".into(), "m".into())]);
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains(
+            "**Assistant** | 2026-11-23 22:42 +00:00 | \
+             length_limit_reached: true | content_filtered: true | model: m\n"
+        ),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn finish_flags_round_trip_without_timestamp() {
+    let input = format!("{USER_PREAMBLE}**Assistant** | length_limit_reached: true\n\ncut short\n");
+    let conv = parse(&input).unwrap();
+    assert!(conv.turns[1].meta.length_limit_reached);
+    assert!(!conv.turns[1].meta.content_filtered);
+    assert!(conv.turns[1].meta.timestamp.is_none());
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**Assistant** | length_limit_reached: true\n"),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn finish_flags_on_non_assistant_header_rejected() {
+    // System on line 1.
+    let err = parse("**System** | length_limit_reached: true\n\nbe terse\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: 'length_limit_reached' metadata is only allowed on **Assistant** headers"
+    );
+
+    // User on line 6.
+    let input = format!("{USER_PREAMBLE}**User** | content_filtered: true\n\nhi\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'content_filtered' metadata is only allowed on **Assistant** headers"
+    );
+
+    // Tool on line 11.
+    let input = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00\n\na\n\n---\n**Tool** | length_limit_reached: true\n";
+    let err = parse(input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: 'length_limit_reached' metadata is only allowed on **Assistant** headers"
+    );
+}
+
+#[test]
+fn finish_flags_non_true_value_rejected() {
+    for k in ["length_limit_reached", "content_filtered"] {
+        for v in ["false", "TRUE", "1"] {
+            let input = format!("{USER_PREAMBLE}**Assistant** | {k}: {v}\n\na\n");
+            let err = parse(&input).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("line 6: '{k}' metadata must be the literal value 'true'"),
+                "value: {v:?}"
+            );
+        }
     }
 }
 
@@ -2203,6 +2351,8 @@ fn tool_turn_body_with_extra_blanks_round_trips() {
                         ("id".to_string(), "c1".to_string()),
                     ],
                     compact: false,
+                    length_limit_reached: false,
+                    content_filtered: false,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),

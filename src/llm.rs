@@ -236,6 +236,8 @@ pub fn compact_request_turn(custom_prompt: Option<&str>) -> parser::Turn {
             timestamp: Some(parser::now_timestamp()),
             tags: Vec::new(),
             compact: true,
+            length_limit_reached: false,
+            content_filtered: false,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -286,12 +288,77 @@ pub async fn run_compact(
 /// Default llama.cpp endpoint.
 pub const DEFAULT_ENDPOINT: &str = "http://localhost:9000/v1/chat/completions";
 
+/// The terminal state of one response, mapped from the server's
+/// `finish_reason` string (see §2.5 of `docs/format.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishReason {
+    /// `"stop"` — a normal, complete response.
+    Stop,
+    /// `"tool_calls"` — the response issued tool calls.
+    ToolCalls,
+    /// `"length"` — the response was cut off at the output-token limit; any
+    /// tool calls it carried are incomplete and must not be executed.
+    Length,
+    /// `"content_filter"` — the provider's safety filter cut the response.
+    ContentFilter,
+    /// No `finish_reason` was sent (some servers omit it).
+    Missing,
+    /// An unrecognized `finish_reason` value; reported as a non-fatal
+    /// warning, with all streamed content preserved.
+    Unknown(String),
+}
+
+impl FinishReason {
+    /// Map a raw `finish_reason` string (or its absence) to a variant.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("stop") => FinishReason::Stop,
+            Some("tool_calls") => FinishReason::ToolCalls,
+            Some("length") => FinishReason::Length,
+            Some("content_filter") => FinishReason::ContentFilter,
+            Some(other) => FinishReason::Unknown(other.to_string()),
+            None => FinishReason::Missing,
+        }
+    }
+
+    /// True when the response was cut off at the output-token limit
+    /// (`"length"`).
+    pub fn is_length(&self) -> bool {
+        matches!(self, FinishReason::Length)
+    }
+
+    /// True when the provider's content filter cut the response
+    /// (`"content_filter"`).
+    pub fn is_content_filter(&self) -> bool {
+        matches!(self, FinishReason::ContentFilter)
+    }
+
+    /// The non-fatal warning to surface for this finish reason (see §2.5 of
+    /// `docs/format.md`): a message when the response ended without a
+    /// recognized `finish_reason` (missing or unknown — all streamed content
+    /// is still preserved), `None` for the known values.
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            FinishReason::Missing => {
+                Some("no finish_reason in response; preserving the streamed content".to_string())
+            }
+            FinishReason::Unknown(raw) => Some(format!(
+                "unrecognized finish_reason '{raw}'; preserving the streamed content"
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Client for an OpenAI-compatible `/v1/chat/completions` endpoint.
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: String,
     model: String,
     api_key: Option<String>,
+    /// Cap on the model's output per response, sent as `max_tokens` in
+    /// every request; `None` omits the field (the endpoint's default).
+    max_output_tokens: Option<u32>,
     http: reqwest::Client,
 }
 
@@ -308,8 +375,21 @@ impl Client {
             endpoint: endpoint.into(),
             model: model.into(),
             api_key,
+            max_output_tokens: None,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Set the per-response output-token limit (sent as `max_tokens`;
+    /// `None` omits the field).
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// The per-response output-token limit, when set.
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
     }
 
     /// The endpoint URL this client posts to.
@@ -339,6 +419,9 @@ impl Client {
             "messages": messages,
             "stream": true,
         });
+        if let Some(n) = self.max_output_tokens {
+            body["max_tokens"] = serde_json::json!(n);
+        }
         if let Some(tools) = tools.filter(|t| !t.is_empty()) {
             body["tools"] = serde_json::Value::Array(tools.to_vec());
         }
@@ -517,6 +600,12 @@ impl AssistantTurn {
     /// `finish_reason`), i.e. the loop must execute tools and continue.
     pub fn wants_tools(&self) -> bool {
         !self.tool_calls.is_empty() || self.finish_reason.as_deref() == Some("tool_calls")
+    }
+
+    /// The response's [`FinishReason`], mapped from
+    /// [`AssistantTurn::finish_reason`].
+    pub fn finish(&self) -> FinishReason {
+        FinishReason::parse(self.finish_reason.as_deref())
     }
 
     fn merge_tool_call(&mut self, d: &ToolCallDelta) {

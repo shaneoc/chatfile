@@ -36,6 +36,12 @@ struct Cli {
     /// `mouse` setting from config.toml).
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     mouse: Option<bool>,
+    /// Cap on the model's output per response, sent as `max_tokens` in the
+    /// API request. Overrides the conversation frontmatter's
+    /// `max_output_tokens` and the active config.toml profile; when unset,
+    /// the field is omitted and the endpoint's default applies.
+    #[arg(long, global = true, value_name = "N")]
+    max_output_tokens: Option<u32>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -70,11 +76,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = config::AppConfig::load()?;
     match cli.command {
-        Some(Command::Run { file }) => run(&file, &config).await,
+        Some(Command::Run { file }) => run(&file, cli.max_output_tokens, &config).await,
         Some(Command::New { file }) => new(&file, &config),
-        Some(Command::Compact { file }) => compact(&file, &config).await,
+        Some(Command::Compact { file }) => compact(&file, cli.max_output_tokens, &config).await,
         None => match cli.file {
-            Some(file) => open_tui(file, cli.mouse, &config).await,
+            Some(file) => open_tui(file, cli.mouse, cli.max_output_tokens, &config).await,
             None => bail!("missing conversation file; try `chatfile --help`"),
         },
     }
@@ -121,7 +127,12 @@ fn require_conversation_ext(path: &Path) -> Result<()> {
 }
 
 /// `chatfile <file>` — open the interactive TUI.
-async fn open_tui(path: PathBuf, mouse: Option<bool>, config: &config::AppConfig) -> Result<()> {
+async fn open_tui(
+    path: PathBuf,
+    mouse: Option<bool>,
+    cli_max_output_tokens: Option<u32>,
+    config: &config::AppConfig,
+) -> Result<()> {
     // Append the extension when none was given; otherwise require it.
     let path = if path.extension().is_none() {
         path.with_extension(CONVERSATION_EXT)
@@ -146,11 +157,15 @@ async fn open_tui(path: PathBuf, mouse: Option<bool>, config: &config::AppConfig
     }
     // The CLI flag overrides the config file when given.
     let mouse = mouse.unwrap_or(config.tui.mouse);
-    tui::run_tui(path, mouse, config).await
+    tui::run_tui(path, mouse, cli_max_output_tokens, config).await
 }
 
 /// `chatfile run <file.chat.md>`
-async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
+async fn run(
+    file: &Path,
+    cli_max_output_tokens: Option<u32>,
+    config: &config::AppConfig,
+) -> Result<()> {
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
@@ -173,6 +188,9 @@ async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
         conv.frontmatter.endpoint.as_deref(),
         conv.frontmatter.model.as_deref(),
     );
+    // Precedence: CLI flag > frontmatter > active profile.
+    let max_output_tokens =
+        config.resolve_max_output_tokens(cli_max_output_tokens, conv.frontmatter.max_output_tokens);
 
     // `build_api_messages` applies the compaction windowing (§5 of
     // docs/format.md: a `compact: true` **User** checkpoint truncates the
@@ -188,7 +206,8 @@ async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
     llm::complete_tool_calls(&mut messages);
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
-    let client = llm::Client::new(endpoint, model.clone(), api_key);
+    let client = llm::Client::new(endpoint, model.clone(), api_key)
+        .with_max_output_tokens(max_output_tokens);
     let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
 
     // Run the (possibly multi-turn) assistant reply. stdout stays a clean
@@ -214,14 +233,34 @@ async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
                 let _ = out.flush();
                 true
             }
-            ResponseEnd { tool_calls } => {
+            ResponseEnd {
+                tool_calls,
+                finish,
+            } => {
+                // Surface how the response ended (§2.5): a truncation notice
+                // for "length", a non-fatal warning for a missing or
+                // unrecognized finish_reason. All streamed content is kept.
+                if finish.is_length() {
+                    eprintln!(
+                        "[chatfile] response truncated at the output-token limit; its tool calls were not executed"
+                    );
+                } else if let Some(w) = finish.warning() {
+                    eprintln!("[chatfile] warning: {w}");
+                }
                 // Persist the response just finished (skipped when it had no
                 // text, no reasoning, and no tool calls).
                 if !(reply.trim().is_empty()
                     && reasoning.trim().is_empty()
                     && tool_calls.is_empty())
                 {
-                    let turn = tools::assistant_turn(&model, &reasoning, &reply, tool_calls);
+                    let turn = tools::assistant_turn(
+                        &model,
+                        &reasoning,
+                        &reply,
+                        tool_calls,
+                        finish.is_length(),
+                        finish.is_content_filter(),
+                    );
                     if tools::append_turn(file, &turn).is_ok() {
                         appended += 1;
                     }
@@ -276,7 +315,11 @@ async fn run(file: &Path, config: &config::AppConfig) -> Result<()> {
 /// an `**Assistant**` turn. The request turn is persisted before the model
 /// is called, so a failed run leaves a well-formed file whose trailing
 /// unanswered request the next `run` (or `compact`) simply answers.
-async fn compact(file: &Path, config: &config::AppConfig) -> Result<()> {
+async fn compact(
+    file: &Path,
+    cli_max_output_tokens: Option<u32>,
+    config: &config::AppConfig,
+) -> Result<()> {
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
@@ -303,9 +346,13 @@ async fn compact(file: &Path, config: &config::AppConfig) -> Result<()> {
         conv.frontmatter.endpoint.as_deref(),
         conv.frontmatter.model.as_deref(),
     );
+    // Precedence: CLI flag > frontmatter > active profile.
+    let max_output_tokens =
+        config.resolve_max_output_tokens(cli_max_output_tokens, conv.frontmatter.max_output_tokens);
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
-    let client = llm::Client::new(endpoint, model.clone(), api_key);
+    let client = llm::Client::new(endpoint, model.clone(), api_key)
+        .with_max_output_tokens(max_output_tokens);
     let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
 
     // Stream the summary: stdout stays a clean stream of answer text, with
@@ -313,7 +360,7 @@ async fn compact(file: &Path, config: &config::AppConfig) -> Result<()> {
     let mut reply = String::new();
     let mut reasoning = String::new();
     let stdout = std::io::stdout();
-    llm::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
+    let summary = llm::run_compact(&client, &conv, &system_prompt, &tool_config, |ev| {
         use tools::LoopEvent::*;
         match ev {
             Reasoning(chunk) => {
@@ -343,9 +390,24 @@ async fn compact(file: &Path, config: &config::AppConfig) -> Result<()> {
         eprintln!("[chatfile] no summary produced; request turn kept, file otherwise unchanged");
         return Ok(());
     }
+    let finish = summary.finish();
+    if finish.is_length() {
+        eprintln!(
+            "[chatfile] summary truncated at the output-token limit; its tool calls were not executed"
+        );
+    } else if let Some(w) = finish.warning() {
+        eprintln!("[chatfile] warning: {w}");
+    }
     tools::append_turn(
         file,
-        &tools::assistant_turn(&model, &reasoning, &reply, &[]),
+        &tools::assistant_turn(
+            &model,
+            &reasoning,
+            &reply,
+            &[],
+            finish.is_length(),
+            finish.is_content_filter(),
+        ),
     )?;
     eprintln!(
         "[chatfile] appended compaction summary ({} chars) to {}",

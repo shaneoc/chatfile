@@ -106,6 +106,7 @@ default_profile = "local"
 endpoint = "http://localhost:9000/v1/chat/completions"
 model = "qwen"
 api_key_env = "MY_KEY"
+max_output_tokens = 512
 scope = "vault"
 tools = ["read_file", "bash"]
 
@@ -141,6 +142,7 @@ Keep it short.
     );
     assert_eq!(local.model.as_deref(), Some("qwen"));
     assert_eq!(local.api_key_env.as_deref(), Some("MY_KEY"));
+    assert_eq!(local.max_output_tokens, Some(512));
     assert_eq!(local.scope.as_deref(), Some("vault"));
     assert_eq!(
         local.tools.as_deref(),
@@ -154,6 +156,7 @@ Keep it short.
     );
     assert_eq!(cloud.model.as_deref(), Some("gpt-x"));
     assert_eq!(cloud.api_key_env, None);
+    assert_eq!(cloud.max_output_tokens, None);
     assert_eq!(cloud.scope, None);
     assert_eq!(cloud.tools, None);
 
@@ -308,6 +311,19 @@ fn load_invalid_scope_is_rejected() {
 }
 
 #[test]
+fn load_zero_max_output_tokens_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[profiles.p]\nmax_output_tokens = 0\n").unwrap();
+
+    let err = AppConfig::load_from(&[file.to_path_buf()]).unwrap_err();
+    assert!(
+        err.to_string().contains("max_output_tokens"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn active_profile_none_when_unset() {
     let config = AppConfig::default();
     assert_eq!(config.active_profile(), None);
@@ -325,6 +341,7 @@ fn profiled_config() -> AppConfig {
             endpoint: Some("http://profile".into()),
             model: Some("profile-model".into()),
             api_key_env: Some("PROFILE_KEY".into()),
+            max_output_tokens: Some(4096),
             scope: None,
             tools: None,
         },
@@ -423,4 +440,38 @@ fn resolve_llm_defaults_when_nothing_is_set() {
     assert_eq!(endpoint, crate::llm::DEFAULT_ENDPOINT);
     assert_eq!(model, DEFAULT_MODEL);
     assert_eq!(api_key, None);
+}
+
+// ---------------------------------------------------------------------------
+// Output-token limit precedence (CLI > frontmatter > profile)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resolve_max_output_tokens_cli_wins_over_frontmatter_and_profile() {
+    // The profile carries Some(4096); the CLI flag must win over both it
+    // and the frontmatter.
+    let config = profiled_config();
+    assert_eq!(
+        resolve_max_output_tokens(&config, Some(100), Some(200)),
+        Some(100)
+    );
+}
+
+#[test]
+fn resolve_max_output_tokens_frontmatter_wins_over_profile() {
+    let config = profiled_config();
+    assert_eq!(
+        resolve_max_output_tokens(&config, None, Some(200)),
+        Some(200)
+    );
+}
+
+#[test]
+fn resolve_max_output_tokens_profile_fallback_and_unset() {
+    // Nothing above the profile: the profile's value applies.
+    let config = profiled_config();
+    assert_eq!(resolve_max_output_tokens(&config, None, None), Some(4096));
+    // No profile (or no value in it): the field is omitted from requests.
+    let empty = AppConfig::default();
+    assert_eq!(resolve_max_output_tokens(&empty, None, None), None);
 }
