@@ -42,7 +42,8 @@ pub const DEFAULT_TOOLS: &[&str] = &[
     "bash",
 ];
 
-/// Hard cap on tool output bytes fed back to the model (and persisted).
+/// Default hard cap on tool output bytes fed back to the model (and
+/// persisted); the active profile's `max_tool_output_bytes` overrides it.
 const MAX_TOOL_OUTPUT: usize = 16384;
 
 /// Cap on `list_files` entries.
@@ -139,6 +140,10 @@ pub struct ToolConfig {
     /// Sandbox policy for the `bash` tool (from `[sandbox]` in
     /// `config.toml`, with built-in defaults).
     pub sandbox: SandboxConfig,
+    /// Hard cap on tool output bytes fed back to the model (and persisted),
+    /// from the active profile's `max_tool_output_bytes` (falling back to
+    /// [`MAX_TOOL_OUTPUT`]).
+    pub max_tool_output_bytes: usize,
 }
 
 impl ToolConfig {
@@ -184,6 +189,10 @@ impl ToolConfig {
             work_dir,
             allowed_tools: config.active_profile().and_then(|p| p.tools.clone()),
             sandbox: config.sandbox.clone(),
+            max_tool_output_bytes: config
+                .active_profile()
+                .and_then(|p| p.max_tool_output_bytes)
+                .unwrap_or(MAX_TOOL_OUTPUT),
         }
     }
 }
@@ -365,7 +374,7 @@ pub async fn execute(name: &str, arguments: &str, config: &ToolConfig) -> String
         "bash" => bash(&args, config).await,
         other => format!("Error: unknown tool '{other}'"),
     };
-    truncate_output(out)
+    truncate_output(out, config.max_tool_output_bytes)
 }
 
 fn arg_str<'a>(args: &'a Json, key: &str) -> Option<&'a str> {
@@ -376,12 +385,12 @@ fn arg_usize(args: &Json, key: &str) -> Option<usize> {
     args.get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
 }
 
-/// Truncate `s` to [`MAX_TOOL_OUTPUT`] bytes on a char boundary.
-fn truncate_output(s: String) -> String {
-    if s.len() <= MAX_TOOL_OUTPUT {
+/// Truncate `s` to `max_bytes` on a char boundary.
+fn truncate_output(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
         return s;
     }
-    let mut end = MAX_TOOL_OUTPUT;
+    let mut end = max_bytes;
     while !s.is_char_boundary(end) {
         end -= 1;
     }
@@ -745,7 +754,7 @@ async fn bash(args: &Json, config: &ToolConfig) -> String {
         &config.work_dir,
         config.network,
         Duration::from_secs(timeout_secs as u64),
-        MAX_TOOL_OUTPUT,
+        config.max_tool_output_bytes,
         "/bin/sh",
         &["-c", command],
     )

@@ -107,6 +107,7 @@ endpoint = "http://localhost:9000/v1/chat/completions"
 model = "qwen"
 api_key_env = "MY_KEY"
 max_output_tokens = 512
+max_tool_output_bytes = 4096
 scope = "vault"
 tools = ["read_file", "bash"]
 
@@ -143,6 +144,7 @@ Keep it short.
     assert_eq!(local.model.as_deref(), Some("qwen"));
     assert_eq!(local.api_key_env.as_deref(), Some("MY_KEY"));
     assert_eq!(local.max_output_tokens, Some(512));
+    assert_eq!(local.max_tool_output_bytes, Some(4096));
     assert_eq!(local.scope.as_deref(), Some("vault"));
     assert_eq!(
         local.tools.as_deref(),
@@ -157,6 +159,7 @@ Keep it short.
     assert_eq!(cloud.model.as_deref(), Some("gpt-x"));
     assert_eq!(cloud.api_key_env, None);
     assert_eq!(cloud.max_output_tokens, None);
+    assert_eq!(cloud.max_tool_output_bytes, None);
     assert_eq!(cloud.scope, None);
     assert_eq!(cloud.tools, None);
 
@@ -324,6 +327,31 @@ fn load_zero_max_output_tokens_is_rejected() {
 }
 
 #[test]
+fn load_max_tool_output_bytes_parses_and_defaults() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[profiles.p]\nmax_tool_output_bytes = 4096\n").unwrap();
+
+    let config = AppConfig::load_from(&[file.to_path_buf()]).unwrap();
+    assert_eq!(config.profiles["p"].max_tool_output_bytes, Some(4096));
+    // Unnamed keys keep the unset value.
+    assert_eq!(config.profiles["p"].max_output_tokens, None);
+}
+
+#[test]
+fn load_zero_max_tool_output_bytes_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[profiles.p]\nmax_tool_output_bytes = 0\n").unwrap();
+
+    let err = AppConfig::load_from(&[file.to_path_buf()]).unwrap_err();
+    assert!(
+        err.to_string().contains("max_tool_output_bytes"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn active_profile_none_when_unset() {
     let config = AppConfig::default();
     assert_eq!(config.active_profile(), None);
@@ -342,6 +370,7 @@ fn profiled_config() -> AppConfig {
             model: Some("profile-model".into()),
             api_key_env: Some("PROFILE_KEY".into()),
             max_output_tokens: Some(4096),
+            max_tool_output_bytes: None,
             scope: None,
             tools: None,
         },

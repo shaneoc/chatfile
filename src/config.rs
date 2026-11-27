@@ -218,6 +218,9 @@ impl AppConfig {
             if profile.max_output_tokens == Some(0) {
                 anyhow::bail!("profiles.{name}.max_output_tokens must be a positive integer");
             }
+            if profile.max_tool_output_bytes == Some(0) {
+                anyhow::bail!("profiles.{name}.max_tool_output_bytes must be a positive integer");
+            }
         }
         Ok(())
     }
@@ -236,6 +239,9 @@ pub struct ProfileConfig {
     /// Cap on the model's output per response (sent as `max_tokens`);
     /// `None` leaves the endpoint's default in effect.
     pub max_output_tokens: Option<u32>,
+    /// Hard cap on tool output bytes fed back to the model (and persisted);
+    /// `None` keeps the built-in default (16 KiB).
+    pub max_tool_output_bytes: Option<usize>,
     /// Default tool scope: `"folder"` or `"vault"`.
     pub scope: Option<String>,
     /// Built-in tools enabled for conversations that use this profile; names
@@ -444,6 +450,7 @@ struct ProfileOverrides {
     model: Option<String>,
     api_key_env: Option<String>,
     max_output_tokens: Option<u32>,
+    max_tool_output_bytes: Option<usize>,
     scope: Option<String>,
     tools: Option<Vec<String>>,
 }
@@ -461,6 +468,9 @@ impl ProfileOverrides {
         }
         if let Some(v) = self.max_output_tokens {
             profile.max_output_tokens = Some(v);
+        }
+        if let Some(v) = self.max_tool_output_bytes {
+            profile.max_tool_output_bytes = Some(v);
         }
         if let Some(v) = self.scope {
             profile.scope = Some(v);

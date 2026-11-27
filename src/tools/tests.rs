@@ -10,7 +10,34 @@ fn config(dir: &Path) -> ToolConfig {
         work_dir: dir.to_path_buf(),
         allowed_tools: None,
         sandbox: SandboxConfig::default(),
+        max_tool_output_bytes: MAX_TOOL_OUTPUT,
     }
+}
+
+#[test]
+fn tool_config_for_file_uses_profile_max_tool_output_bytes() {
+    let dir = TempDir::new().unwrap();
+    let mut profiles = std::collections::HashMap::new();
+    profiles.insert(
+        "p".into(),
+        crate::config::ProfileConfig {
+            max_tool_output_bytes: Some(123),
+            ..Default::default()
+        },
+    );
+    let app = AppConfig {
+        default_profile: Some("p".into()),
+        profiles,
+        ..Default::default()
+    };
+    let fm = parser::Frontmatter::default();
+    let file = dir.path().join("c.chat.md");
+    let cfg = ToolConfig::for_file(&fm, &file, &app);
+    assert_eq!(cfg.max_tool_output_bytes, 123);
+
+    // No profile (or no value in it): the built-in default applies.
+    let cfg = ToolConfig::for_file(&fm, &file, &AppConfig::default());
+    assert_eq!(cfg.max_tool_output_bytes, MAX_TOOL_OUTPUT);
 }
 
 // -----------------------------------------------------------------------
@@ -201,6 +228,45 @@ async fn unknown_tool_and_bad_json_report_errors() {
     assert!(out.contains("unknown tool"), "{out}");
     let out = execute("read_file", "not json", &cfg).await;
     assert!(out.contains("invalid JSON"), "{out}");
+}
+
+#[tokio::test]
+async fn tool_output_truncated_at_custom_byte_limit() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("big.txt"), "x".repeat(100)).unwrap();
+    let mut cfg = config(dir.path());
+    cfg.max_tool_output_bytes = 32;
+    let out = execute("read_file", r#"{"path": "big.txt"}"#, &cfg).await;
+    assert!(out.ends_with("\n[truncated]"), "{out}");
+    let kept = out.strip_suffix("\n[truncated]").unwrap();
+    assert!(
+        kept.len() <= 32,
+        "kept {len} bytes: {out:?}",
+        len = kept.len()
+    );
+    // The cut happened in the middle of the content.
+    assert!(kept.starts_with("1 | xxx"), "{out}");
+}
+
+#[tokio::test]
+async fn tool_output_below_custom_limit_is_untouched() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("small.txt"), "abc").unwrap();
+    let mut cfg = config(dir.path());
+    cfg.max_tool_output_bytes = 64;
+    let out = execute("read_file", r#"{"path": "small.txt"}"#, &cfg).await;
+    assert_eq!(out, "1 | abc\n(1 lines total, showing 1-1)\n");
+}
+
+#[tokio::test]
+async fn tool_output_default_limit_still_truncates_oversized() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("huge.txt"), "x".repeat(30_000)).unwrap();
+    let cfg = config(dir.path());
+    let out = execute("read_file", r#"{"path": "huge.txt"}"#, &cfg).await;
+    assert!(out.ends_with("\n[truncated]"), "{}", out.len());
+    let kept = out.strip_suffix("\n[truncated]").unwrap();
+    assert!(kept.len() <= MAX_TOOL_OUTPUT, "kept {} bytes", kept.len());
 }
 
 // -----------------------------------------------------------------------

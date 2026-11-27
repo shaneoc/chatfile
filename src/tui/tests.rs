@@ -24,6 +24,7 @@ fn test_app() -> App {
             work_dir: PathBuf::from("."),
             allowed_tools: None,
             sandbox: config::SandboxConfig::default(),
+            max_tool_output_bytes: 16384,
         },
         compact_prompt: None,
         input: String::new(),
