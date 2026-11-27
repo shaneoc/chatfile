@@ -352,6 +352,51 @@ fn load_zero_max_tool_output_bytes_is_rejected() {
 }
 
 #[test]
+fn load_reasoning_history_parses_all_values() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[profiles.a]\nreasoning_history = \"active_turn\"\n\
+         [profiles.b]\nreasoning_history = \"all\"\n\
+         [profiles.c]\nreasoning_history = \"none\"\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::load_from(&[file.to_path_buf()]).unwrap();
+    assert_eq!(
+        config.profiles["a"].reasoning_history,
+        Some(ReasoningHistory::ActiveTurn)
+    );
+    assert_eq!(
+        config.profiles["b"].reasoning_history,
+        Some(ReasoningHistory::All)
+    );
+    assert_eq!(
+        config.profiles["c"].reasoning_history,
+        Some(ReasoningHistory::None)
+    );
+}
+
+#[test]
+fn load_invalid_reasoning_history_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[profiles.p]\nreasoning_history = \"sometimes\"\n").unwrap();
+
+    let err = AppConfig::load_from(&[file.to_path_buf()]).unwrap_err();
+    let chain = err
+        .chain()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        chain.contains("reasoning_history"),
+        "unexpected error: {chain}"
+    );
+}
+
+#[test]
 fn active_profile_none_when_unset() {
     let config = AppConfig::default();
     assert_eq!(config.active_profile(), None);
@@ -371,6 +416,7 @@ fn profiled_config() -> AppConfig {
             api_key_env: Some("PROFILE_KEY".into()),
             max_output_tokens: Some(4096),
             max_tool_output_bytes: None,
+            reasoning_history: None,
             scope: None,
             tools: None,
         },

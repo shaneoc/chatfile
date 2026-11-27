@@ -11,7 +11,34 @@ fn config(dir: &Path) -> ToolConfig {
         allowed_tools: None,
         sandbox: SandboxConfig::default(),
         max_tool_output_bytes: MAX_TOOL_OUTPUT,
+        reasoning_history: ReasoningHistory::default(),
     }
+}
+
+#[test]
+fn tool_config_for_file_uses_profile_reasoning_history() {
+    let dir = TempDir::new().unwrap();
+    let mut profiles = std::collections::HashMap::new();
+    profiles.insert(
+        "p".into(),
+        crate::config::ProfileConfig {
+            reasoning_history: Some(crate::config::ReasoningHistory::None),
+            ..Default::default()
+        },
+    );
+    let app = AppConfig {
+        default_profile: Some("p".into()),
+        profiles,
+        ..Default::default()
+    };
+    let fm = parser::Frontmatter::default();
+    let file = dir.path().join("c.chat.md");
+    let cfg = ToolConfig::for_file(&fm, &file, &app);
+    assert_eq!(cfg.reasoning_history, ReasoningHistory::None);
+
+    // No profile (or no value in it): the default applies.
+    let cfg = ToolConfig::for_file(&fm, &file, &AppConfig::default());
+    assert_eq!(cfg.reasoning_history, ReasoningHistory::ActiveTurn);
 }
 
 #[test]
@@ -446,6 +473,13 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arg
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
 data: [DONE]\n\n";
 
+/// A tool-call response that also streams reasoning content first.
+const REASONING_TOOL_CALL_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Let me write the file.\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"hello.txt\\\", \\\"content\\\": \\\"hi there\\\"}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+
 const FINAL_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Done writing.\"}}]}\n\n\
 data: [DONE]\n\n";
 
@@ -523,6 +557,59 @@ async fn run_turn_executes_tool_call_then_finalizes() {
     assert_eq!(v["messages"][2]["tool_call_id"], "call_1");
     // The tool message carries the write_file output, not the content.
     assert_eq!(v["messages"][2]["content"], "Wrote 8 bytes to hello.txt\n");
+}
+
+#[tokio::test]
+async fn run_turn_resends_reasoning_on_intermediate_assistant_message() {
+    let dir = TempDir::new().unwrap();
+    let (url, bodies) =
+        mock_server(vec![sse(REASONING_TOOL_CALL_RESPONSE), sse(FINAL_RESPONSE)]).await;
+    let client = Client::new(url, "test-model", None);
+    let cfg = config(dir.path());
+
+    run_turn(
+        &client,
+        vec![Message::user("write hello.txt")],
+        &cfg,
+        |_| true,
+    )
+    .await
+    .unwrap();
+
+    // The follow-up request re-sends the response's reasoning on the
+    // intermediate assistant message.
+    let b = bodies.lock().unwrap();
+    assert_eq!(b.len(), 2);
+    let v: Json = serde_json::from_str(&b[1]).unwrap();
+    assert_eq!(
+        v["messages"][1]["reasoning_content"],
+        "Let me write the file."
+    );
+}
+
+#[tokio::test]
+async fn run_turn_omits_reasoning_when_history_is_none() {
+    let dir = TempDir::new().unwrap();
+    let (url, bodies) =
+        mock_server(vec![sse(REASONING_TOOL_CALL_RESPONSE), sse(FINAL_RESPONSE)]).await;
+    let client = Client::new(url, "test-model", None);
+    let mut cfg = config(dir.path());
+    cfg.reasoning_history = ReasoningHistory::None;
+
+    run_turn(
+        &client,
+        vec![Message::user("write hello.txt")],
+        &cfg,
+        |_| true,
+    )
+    .await
+    .unwrap();
+
+    // Under `none` the follow-up request carries no reasoning content.
+    let b = bodies.lock().unwrap();
+    assert_eq!(b.len(), 2);
+    let v: Json = serde_json::from_str(&b[1]).unwrap();
+    assert!(v["messages"][1].get("reasoning_content").is_none());
 }
 
 #[tokio::test]

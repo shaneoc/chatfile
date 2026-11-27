@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use serde_json::{Value as Json, json};
 
-use crate::config::{AppConfig, SandboxConfig};
+use crate::config::{AppConfig, ReasoningHistory, SandboxConfig};
 use crate::context;
 use crate::llm::{
     AssistantTurn, Client, CompletedToolCall, FinishReason, Message, StreamDelta, ToolCall,
@@ -144,6 +144,10 @@ pub struct ToolConfig {
     /// from the active profile's `max_tool_output_bytes` (falling back to
     /// [`MAX_TOOL_OUTPUT`]).
     pub max_tool_output_bytes: usize,
+    /// Which assistant turns' persisted reasoning is re-sent as
+    /// `reasoning_content`, from the active profile's `reasoning_history`
+    /// (falling back to the default, [`ReasoningHistory::ActiveTurn`]).
+    pub reasoning_history: ReasoningHistory,
 }
 
 impl ToolConfig {
@@ -193,6 +197,10 @@ impl ToolConfig {
                 .active_profile()
                 .and_then(|p| p.max_tool_output_bytes)
                 .unwrap_or(MAX_TOOL_OUTPUT),
+            reasoning_history: config
+                .active_profile()
+                .and_then(|p| p.reasoning_history)
+                .unwrap_or_default(),
         }
     }
 }
@@ -997,11 +1005,17 @@ pub async fn run_turn(
         }
 
         // Append the assistant message (with its tool calls) to the history,
-        // then execute each call and append a `role: "tool"` result.
+        // then execute each call and append a `role: "tool"` result. The
+        // response's reasoning rides along as `reasoning_content` so the
+        // server can condition on its own thinking — unless the configured
+        // history mode is `None` (the active turn is always in scope).
         let mut assistant = Message::new(
             "assistant",
             (!turn.content.trim().is_empty()).then(|| turn.content.clone()),
         );
+        if config.reasoning_history != ReasoningHistory::None && !turn.reasoning.is_empty() {
+            assistant.reasoning_content = Some(turn.reasoning.clone());
+        }
         for c in &calls {
             assistant.tool_calls.push(ToolCall {
                 id: c.id.clone(),

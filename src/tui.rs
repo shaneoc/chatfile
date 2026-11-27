@@ -796,13 +796,13 @@ async fn submit(
     // message; `complete_tool_calls` answers any call left dangling by a
     // cancelled or interrupted execution, so reloaded histories are valid
     // API payloads.
-    let mut messages = llm::build_api_messages(&app.conv);
+    let tool_config = app.tool_config.clone();
+    let mut messages = llm::build_api_messages(&app.conv, tool_config.reasoning_history);
     llm::set_system_prompt(&mut messages, &system_prompt);
     llm::complete_tool_calls(&mut messages);
 
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone())
         .with_max_output_tokens(app.max_output_tokens);
-    let tool_config = app.tool_config.clone();
     let tx = tx.clone();
     let task = tokio::spawn(async move {
         // The whole (possibly multi-round) turn runs here; each event is

@@ -1847,18 +1847,30 @@ impl Conversation {
     /// messages — see [`crate::llm::complete_tool_calls`] for the
     /// request-prep step that answers dangling tool calls.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {
-        self.project_turns(0..self.turns.len())
+        self.project_turns(0..self.turns.len(), crate::config::ReasoningHistory::None)
     }
 
     /// Project a range of sections into OpenAI wire-format messages with the
     /// same rules as [`Conversation::to_messages`] (System sections skipped,
     /// `**Tool**` turns answered, assistant tool calls attached). Used by
     /// [`crate::llm::build_api_messages`] to window the history.
-    pub(crate) fn project_turns(&self, range: std::ops::Range<usize>) -> Vec<crate::llm::Message> {
+    ///
+    /// `reasoning` selects which intermediate assistant turns (those that
+    /// issued tool calls) re-send their persisted reasoning as
+    /// `reasoning_content` (see [`crate::config::ReasoningHistory`]).
+    pub(crate) fn project_turns(
+        &self,
+        range: std::ops::Range<usize>,
+        reasoning: crate::config::ReasoningHistory,
+    ) -> Vec<crate::llm::Message> {
         use crate::llm::{Message, ToolCall, ToolFunction};
 
+        // The active turn starts after the last user message; under
+        // `ActiveTurn` only assistant turns from there on re-send reasoning.
+        let last_user = self.turns.iter().rposition(|t| t.role == Role::User);
         let mut messages: Vec<Message> = Vec::new();
-        for turn in &self.turns[range] {
+        for i in range {
+            let turn = &self.turns[i];
             match turn.role {
                 Role::System => {}
                 Role::Tool => {
@@ -1870,6 +1882,7 @@ impl Conversation {
                         content: Some(data.output.clone()),
                         tool_calls: Vec::new(),
                         tool_call_id: Some(data.id.clone()),
+                        reasoning_content: None,
                     });
                 }
                 other => {
@@ -1893,6 +1906,21 @@ impl Conversation {
                                 arguments: c.arguments.clone(),
                             },
                         });
+                    }
+                    // Intermediate assistant turns (those that issued tool
+                    // calls) may re-send their persisted reasoning, subject
+                    // to the configured history mode.
+                    if other == Role::Assistant && !m.tool_calls.is_empty() {
+                        let include = match reasoning {
+                            crate::config::ReasoningHistory::All => true,
+                            crate::config::ReasoningHistory::None => false,
+                            crate::config::ReasoningHistory::ActiveTurn => {
+                                last_user.is_none_or(|u| i > u)
+                            }
+                        };
+                        if include && turn.reasoning.as_deref().is_some_and(|r| !r.is_empty()) {
+                            m.reasoning_content = turn.reasoning.clone();
+                        }
                     }
                     messages.push(m);
                 }

@@ -201,14 +201,14 @@ async fn run(
     // `complete_tool_calls` answers any call left dangling by a cancelled
     // or interrupted execution, so reloaded histories are valid API
     // payloads.
-    let mut messages = llm::build_api_messages(&conv);
+    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
+    let mut messages = llm::build_api_messages(&conv, tool_config.reasoning_history);
     llm::set_system_prompt(&mut messages, &system_prompt);
     llm::complete_tool_calls(&mut messages);
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key)
         .with_max_output_tokens(max_output_tokens);
-    let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
 
     // Run the (possibly multi-turn) assistant reply. stdout stays a clean
     // stream of answer text: reasoning and tool results are only persisted

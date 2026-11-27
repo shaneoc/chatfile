@@ -36,6 +36,11 @@ pub struct Message {
     /// For `role: "tool"` messages: the id of the call being answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Assistant messages that issued tool calls: the model's reasoning
+    /// content, re-sent so the server can condition on its own earlier
+    /// thinking (see [`crate::config::ReasoningHistory`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// One tool call in OpenAI wire format (`type` is always `"function"`).
@@ -72,6 +77,7 @@ impl Message {
             content,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            reasoning_content: None,
         }
     }
 
@@ -97,6 +103,7 @@ impl Message {
             content: Some(output.into()),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            reasoning_content: None,
         }
     }
 }
@@ -164,7 +171,14 @@ pub fn complete_tool_calls(messages: &mut Vec<Message>) {
 /// content; callers overlay the hierarchical `AGENTS.md` prompt with
 /// [`set_system_prompt`] before sending, and repair dangling tool calls
 /// with [`complete_tool_calls`].
-pub fn build_api_messages(conv: &crate::parser::Conversation) -> Vec<Message> {
+///
+/// `reasoning` selects which intermediate assistant turns (those that
+/// issued tool calls) re-send their persisted reasoning as
+/// `reasoning_content` (see [`crate::config::ReasoningHistory`]).
+pub fn build_api_messages(
+    conv: &crate::parser::Conversation,
+    reasoning: crate::config::ReasoningHistory,
+) -> Vec<Message> {
     let turns = &conv.turns;
     let n = turns.len();
     let mut messages: Vec<Message> = Vec::new();
@@ -183,7 +197,7 @@ pub fn build_api_messages(conv: &crate::parser::Conversation) -> Vec<Message> {
         Some(i) => i,
         None => usize::from(n > 0 && turns[0].role == crate::parser::Role::System),
     };
-    messages.extend(conv.project_turns(start..n));
+    messages.extend(conv.project_turns(start..n, reasoning));
     messages
 }
 
@@ -262,7 +276,7 @@ pub async fn run_compact(
     config: &ToolConfig,
     mut on_event: impl FnMut(&LoopEvent) -> bool,
 ) -> Result<AssistantTurn> {
-    let mut messages = build_api_messages(conv);
+    let mut messages = build_api_messages(conv, config.reasoning_history);
     set_system_prompt(&mut messages, system_prompt);
     complete_tool_calls(&mut messages);
     let schemas = tools::tool_schemas(config);

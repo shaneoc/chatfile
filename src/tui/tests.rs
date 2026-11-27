@@ -25,6 +25,7 @@ fn test_app() -> App {
             allowed_tools: None,
             sandbox: config::SandboxConfig::default(),
             max_tool_output_bytes: 16384,
+            reasoning_history: config::ReasoningHistory::default(),
         },
         compact_prompt: None,
         input: String::new(),

@@ -226,6 +226,22 @@ impl AppConfig {
     }
 }
 
+/// Which persisted assistant reasoning blocks are re-sent to the API as
+/// `reasoning_content` on outgoing requests (the `reasoning_history`
+/// profile key).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningHistory {
+    /// Only assistant turns of the active turn — those after the last user
+    /// message — re-send their reasoning (the default).
+    #[default]
+    ActiveTurn,
+    /// Every assistant turn with persisted reasoning re-sends it.
+    All,
+    /// No reasoning content is ever re-sent.
+    None,
+}
+
 /// A named endpoint/model profile under `[profiles.<name>]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileConfig {
@@ -242,6 +258,10 @@ pub struct ProfileConfig {
     /// Hard cap on tool output bytes fed back to the model (and persisted);
     /// `None` keeps the built-in default (16 KiB).
     pub max_tool_output_bytes: Option<usize>,
+    /// Which assistant turns' persisted reasoning is re-sent to the API as
+    /// `reasoning_content` (`"active_turn"` (default), `"all"`, or
+    /// `"none"`); `None` keeps the default.
+    pub reasoning_history: Option<ReasoningHistory>,
     /// Default tool scope: `"folder"` or `"vault"`.
     pub scope: Option<String>,
     /// Built-in tools enabled for conversations that use this profile; names
@@ -451,6 +471,7 @@ struct ProfileOverrides {
     api_key_env: Option<String>,
     max_output_tokens: Option<u32>,
     max_tool_output_bytes: Option<usize>,
+    reasoning_history: Option<ReasoningHistory>,
     scope: Option<String>,
     tools: Option<Vec<String>>,
 }
@@ -471,6 +492,9 @@ impl ProfileOverrides {
         }
         if let Some(v) = self.max_tool_output_bytes {
             profile.max_tool_output_bytes = Some(v);
+        }
+        if let Some(v) = self.reasoning_history {
+            profile.reasoning_history = Some(v);
         }
         if let Some(v) = self.scope {
             profile.scope = Some(v);

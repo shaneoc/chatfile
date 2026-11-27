@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ReasoningHistory;
 use crate::parser;
 use futures::StreamExt;
 use std::sync::{Arc, Mutex};
@@ -492,7 +493,7 @@ fn build_api_messages_without_checkpoint_sends_everything() {
 **User**\n\nq2\n",
     );
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![
             ("system", "be terse"),
             ("user", "q1"),
@@ -517,7 +518,7 @@ fn build_api_messages_checkpoint_windows_history() {
     // q1/a1 (before the checkpoint) are omitted; the window starts at the
     // checkpoint user turn itself.
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![
             ("system", "be terse"),
             ("user", "summarize"),
@@ -544,7 +545,7 @@ fn build_api_messages_last_checkpoint_wins() {
 **User**\n\nq5\n",
     );
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![
             ("system", "be terse"),
             ("user", "summarize 2"),
@@ -570,7 +571,7 @@ fn build_api_messages_trailing_compact_request_is_not_a_checkpoint() {
     // (the first checkpoint and its summary) are still sent, and the turns
     // before the previous checkpoint (q1/a1) are omitted.
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![
             ("system", "be terse"),
             ("user", "summarize 1"),
@@ -584,7 +585,7 @@ fn build_api_messages_trailing_compact_request_is_not_a_checkpoint() {
 fn build_api_messages_without_system_section() {
     let c = conv("**User**\n\nq1\n\n---\n**Assistant** | model: m\n\na1\n\n---\n**User**\n\nq2\n");
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![("user", "q1"), ("assistant", "a1"), ("user", "q2")]
     );
 }
@@ -600,7 +601,7 @@ fn build_api_messages_checkpoint_without_system_section() {
 **User**\n\nq3\n",
     );
     assert_eq!(
-        pairs(&build_api_messages(&c)),
+        pairs(&build_api_messages(&c, ReasoningHistory::None)),
         vec![
             ("user", "summarize"),
             ("assistant", "summary"),
@@ -611,7 +612,10 @@ fn build_api_messages_checkpoint_without_system_section() {
 
 #[test]
 fn set_system_prompt_replaces_leading_system_message() {
-    let mut messages = build_api_messages(&conv("**System**\n\nold\n\n---\n**User**\n\nq\n"));
+    let mut messages = build_api_messages(
+        &conv("**System**\n\nold\n\n---\n**User**\n\nq\n"),
+        ReasoningHistory::None,
+    );
     set_system_prompt(&mut messages, "new prompt");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].role, "system");
@@ -620,7 +624,7 @@ fn set_system_prompt_replaces_leading_system_message() {
 
 #[test]
 fn set_system_prompt_inserts_when_no_system_message() {
-    let mut messages = build_api_messages(&conv("**User**\n\nq\n"));
+    let mut messages = build_api_messages(&conv("**User**\n\nq\n"), ReasoningHistory::None);
     set_system_prompt(&mut messages, "new prompt");
     assert_eq!(
         pairs(&messages),
@@ -630,7 +634,120 @@ fn set_system_prompt_inserts_when_no_system_message() {
 
 #[test]
 fn set_system_prompt_empty_is_noop() {
-    let mut messages = build_api_messages(&conv("**User**\n\nq\n"));
+    let mut messages = build_api_messages(&conv("**User**\n\nq\n"), ReasoningHistory::None);
     set_system_prompt(&mut messages, "");
     assert_eq!(pairs(&messages), vec![("user", "q")]);
+}
+
+// ---------------------------------------------------------------------------
+// build_api_messages: reasoning history (reasoning_content)
+// ---------------------------------------------------------------------------
+
+/// An assistant turn that issued one tool call and carries persisted
+/// reasoning.
+fn reasoning_call_turn(reasoning: &str, id: &str) -> parser::Turn {
+    parser::Turn {
+        role: parser::Role::Assistant,
+        content: String::new(),
+        meta: parser::TurnMeta::default(),
+        reasoning: Some(reasoning.to_string()),
+        tool_calls: vec![parser::AssistantToolCall {
+            id: id.to_string(),
+            name: "list_files".to_string(),
+            arguments: "{}".to_string(),
+        }],
+    }
+}
+
+/// `U1, A1 (reasoning + tool call), U2, A2 (reasoning + tool call)`: the
+/// last user turn sits between the two assistant turns.
+fn reasoning_conv() -> parser::Conversation {
+    parser::Conversation {
+        turns: vec![
+            parser::Turn {
+                role: parser::Role::User,
+                content: "one".into(),
+                meta: parser::TurnMeta::default(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            reasoning_call_turn("old thought", "call_1"),
+            parser::Turn {
+                role: parser::Role::User,
+                content: "two".into(),
+                meta: parser::TurnMeta::default(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            reasoning_call_turn("new thought", "call_2"),
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn build_api_messages_active_turn_resends_reasoning_only_after_last_user() {
+    let c = reasoning_conv();
+    let msgs = build_api_messages(&c, ReasoningHistory::ActiveTurn);
+    assert_eq!(msgs.len(), 4);
+    // A1 precedes the last user turn: its reasoning is dropped.
+    assert_eq!(msgs[1].reasoning_content, None);
+    // A2 is part of the active turn: its reasoning is re-sent.
+    assert_eq!(msgs[3].reasoning_content.as_deref(), Some("new thought"));
+}
+
+#[test]
+fn build_api_messages_all_resends_every_reasoning() {
+    let c = reasoning_conv();
+    let msgs = build_api_messages(&c, ReasoningHistory::All);
+    assert_eq!(msgs[1].reasoning_content.as_deref(), Some("old thought"));
+    assert_eq!(msgs[3].reasoning_content.as_deref(), Some("new thought"));
+}
+
+#[test]
+fn build_api_messages_none_never_resends_reasoning() {
+    let c = reasoning_conv();
+    let msgs = build_api_messages(&c, ReasoningHistory::None);
+    assert!(msgs.iter().all(|m| m.reasoning_content.is_none()));
+}
+
+#[test]
+fn build_api_messages_non_intermediate_assistant_carries_no_reasoning() {
+    // An assistant turn without tool calls is never "intermediate", so its
+    // reasoning is dropped even under `all`.
+    let c = parser::Conversation {
+        turns: vec![
+            parser::Turn {
+                role: parser::Role::User,
+                content: "q".into(),
+                meta: parser::TurnMeta::default(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+            },
+            parser::Turn {
+                role: parser::Role::Assistant,
+                content: "answer".into(),
+                meta: parser::TurnMeta::default(),
+                reasoning: Some("a thought".to_string()),
+                tool_calls: Vec::new(),
+            },
+        ],
+        ..Default::default()
+    };
+    let msgs = build_api_messages(&c, ReasoningHistory::All);
+    assert!(msgs.iter().all(|m| m.reasoning_content.is_none()));
+}
+
+#[test]
+fn message_reasoning_content_serializes_only_when_set() {
+    let m = Message::assistant("hi");
+    assert!(
+        !serde_json::to_string(&m)
+            .unwrap()
+            .contains("reasoning_content")
+    );
+    let mut m = Message::assistant("hi");
+    m.reasoning_content = Some("a thought".into());
+    let s = serde_json::to_string(&m).unwrap();
+    assert!(s.contains("\"reasoning_content\":\"a thought\""), "{s}");
 }
