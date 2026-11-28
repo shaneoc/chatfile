@@ -513,6 +513,7 @@ async fn run_turn_executes_tool_call_then_finalizes() {
         &client,
         vec![Message::user("write hello.txt")],
         &cfg,
+        None,
         |ev| {
             events.push(format!("{ev:?}"));
             true
@@ -571,6 +572,7 @@ async fn run_turn_resends_reasoning_on_intermediate_assistant_message() {
         &client,
         vec![Message::user("write hello.txt")],
         &cfg,
+        None,
         |_| true,
     )
     .await
@@ -600,6 +602,7 @@ async fn run_turn_omits_reasoning_when_history_is_none() {
         &client,
         vec![Message::user("write hello.txt")],
         &cfg,
+        None,
         |_| true,
     )
     .await
@@ -620,7 +623,7 @@ async fn run_turn_plain_response_needs_no_tools() {
     let cfg = config(dir.path());
 
     let mut content = String::new();
-    run_turn(&client, vec![Message::user("hi")], &cfg, |ev| {
+    run_turn(&client, vec![Message::user("hi")], &cfg, None, |ev| {
         if let LoopEvent::Content(s) = ev {
             content.push_str(s);
         }
@@ -643,7 +646,7 @@ async fn run_turn_stops_at_max_iterations() {
     let client = Client::new(url, "test-model", None);
     let cfg = config(dir.path());
 
-    let err = run_turn(&client, vec![Message::user("loop")], &cfg, |_| true)
+    let err = run_turn(&client, vec![Message::user("loop")], &cfg, None, |_| true)
         .await
         .unwrap_err();
     assert!(
@@ -662,7 +665,7 @@ async fn run_turn_stops_when_callback_returns_false() {
     // The callback refuses after the first event: the loop must stop
     // cleanly without error.
     let mut seen = 0usize;
-    run_turn(&client, vec![Message::user("hi")], &cfg, |_| {
+    run_turn(&client, vec![Message::user("hi")], &cfg, None, |_| {
         seen += 1;
         false
     })
@@ -687,7 +690,7 @@ async fn run_turn_reports_finish_reasons_on_response_end() {
     // reports.
     let mut finishes = Vec::new();
     for prompt in ["one", "two", "three"] {
-        run_turn(&client, vec![Message::user(prompt)], &cfg, |ev| {
+        run_turn(&client, vec![Message::user(prompt)], &cfg, None, |ev| {
             if let LoopEvent::ResponseEnd { finish, .. } = ev {
                 finishes.push(finish.clone());
             }
@@ -713,7 +716,7 @@ async fn run_turn_length_finish_does_not_execute_partial_calls() {
     let cfg = config(dir.path());
 
     let mut events = Vec::new();
-    run_turn(&client, vec![Message::user("go")], &cfg, |ev| {
+    run_turn(&client, vec![Message::user("go")], &cfg, None, |ev| {
         events.push(format!("{ev:?}"));
         true
     })
@@ -741,7 +744,7 @@ async fn run_turn_sends_max_tokens_when_set() {
     let client = Client::new(url, "test-model", None).with_max_output_tokens(Some(123));
     let cfg = config(dir.path());
 
-    run_turn(&client, vec![Message::user("hi")], &cfg, |_| true)
+    run_turn(&client, vec![Message::user("hi")], &cfg, None, |_| true)
         .await
         .unwrap();
     let v: Json = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
@@ -755,11 +758,126 @@ async fn run_turn_omits_max_tokens_when_unset() {
     let client = Client::new(url, "test-model", None);
     let cfg = config(dir.path());
 
-    run_turn(&client, vec![Message::user("hi")], &cfg, |_| true)
+    run_turn(&client, vec![Message::user("hi")], &cfg, None, |_| true)
         .await
         .unwrap();
     let v: Json = serde_json::from_str(&bodies.lock().unwrap()[0]).unwrap();
     assert!(v.get("max_tokens").is_none());
+}
+
+/// A tool-call response that also reports token usage (100 total) in its
+/// final chunk.
+const TOOL_CALL_USAGE_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\": \\\"hello.txt\\\", \\\"content\\\": \\\"hi there\\\"}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":60,\"completion_tokens\":40,\"total_tokens\":100}}\n\n\
+data: [DONE]\n\n";
+
+/// The compaction summary response (with its own usage report).
+const COMPACT_SUMMARY_RESPONSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"**Goal** write a file. **Next steps** nothing.\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":20,\"total_tokens\":50}}\n\n\
+data: [DONE]\n\n";
+
+#[tokio::test]
+async fn run_turn_mid_loop_auto_compaction_when_usage_crosses_threshold() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("c.chat.md");
+    std::fs::write(&file, "**User**\n\nwrite hello.txt\n").unwrap();
+
+    let (url, bodies) = mock_server(vec![
+        sse(TOOL_CALL_USAGE_RESPONSE),
+        sse(COMPACT_SUMMARY_RESPONSE),
+        sse(FINAL_RESPONSE),
+    ])
+    .await;
+    let client = Client::new(url, "test-model", None);
+    let cfg = config(dir.path());
+    // context_limit 100 with the default 80% → threshold 80; the tool-call
+    // response reports 100 total tokens, so the loop must compact before
+    // its next request.
+    let ac = AutoCompact {
+        file: file.clone(),
+        context_limit: Some(100),
+        auto_compact_percent: None,
+        system_prompt: "be terse".into(),
+        compact_prompt: None,
+        model: "test-model".into(),
+    };
+
+    let mut events = Vec::new();
+    run_turn(
+        &client,
+        vec![Message::user("write hello.txt")],
+        &cfg,
+        Some(&ac),
+        |ev| {
+            events.push(format!("{ev:?}"));
+            // Persist like the CLI does: the compaction re-reads the file.
+            match ev {
+                LoopEvent::ResponseEnd { tool_calls, finish } => {
+                    if !tool_calls.is_empty() {
+                        let turn = assistant_turn(
+                            "test-model",
+                            "",
+                            "",
+                            tool_calls,
+                            finish.is_length(),
+                            finish.is_content_filter(),
+                            None,
+                        );
+                        append_turn(&file, &turn).unwrap();
+                    }
+                }
+                LoopEvent::ToolResult {
+                    id, name, output, ..
+                } => {
+                    append_turn(&file, &tool_turn(name, id, output)).unwrap();
+                }
+                _ => {}
+            }
+            true
+        },
+    )
+    .await
+    .unwrap();
+
+    // The tool ran before the compaction...
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+        "hi there"
+    );
+    // ...and the compaction status events were emitted around it.
+    let start = events
+        .iter()
+        .position(|e| e.contains("CompactionStart"))
+        .expect("a CompactionStart event");
+    let done = events
+        .iter()
+        .position(|e| e.contains("CompactionDone"))
+        .expect("a CompactionDone event");
+    assert!(start < done, "{events:?}");
+
+    // Both checkpoint turns are persisted: the compact request and the
+    // summary (carrying its usage as the tokens: count).
+    let conv = parser::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(conv.turns.len(), 5);
+    assert!(conv.turns[3].meta.compact);
+    assert_eq!(conv.turns[4].role, parser::Role::Assistant);
+    assert_eq!(conv.turns[4].meta.tokens, Some(50));
+
+    // The follow-up request was rebuilt from the checkpoint window: the
+    // overlaid system prompt, the compact request, and the summary.
+    let b = bodies.lock().unwrap();
+    assert_eq!(b.len(), 3);
+    let v: Json = serde_json::from_str(&b[2]).unwrap();
+    let roles: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, vec!["system", "user", "assistant"]);
+    assert_eq!(v["messages"][1]["content"], crate::llm::COMPACT_INSTRUCTION);
 }
 
 // -----------------------------------------------------------------------
@@ -785,7 +903,7 @@ fn tool_turn_helper_builds_persistable_turn() {
 
 #[test]
 fn assistant_turn_helper_sets_reasoning_field() {
-    let turn = assistant_turn("m1", "thinking hard", "the answer", &[], false, false);
+    let turn = assistant_turn("m1", "thinking hard", "the answer", &[], false, false, None);
     assert_eq!(turn.role, parser::Role::Assistant);
     assert_eq!(turn.content, "the answer");
     assert_eq!(turn.reasoning.as_deref(), Some("thinking hard"));
@@ -796,7 +914,7 @@ fn assistant_turn_helper_sets_reasoning_field() {
             .any(|(k, v)| k == "thinking" && v == "true")
     );
     // Empty reasoning is omitted (no tag, no field).
-    let turn = assistant_turn("m1", "  ", "just", &[], false, false);
+    let turn = assistant_turn("m1", "  ", "just", &[], false, false, None);
     assert_eq!(turn.content, "just");
     assert_eq!(turn.reasoning, None);
     assert!(!turn.meta.tags.iter().any(|(k, _)| k == "thinking"));
@@ -806,7 +924,7 @@ fn assistant_turn_helper_sets_reasoning_field() {
 fn assistant_turn_helper_sets_finish_flags() {
     // Both flags set: they land in the meta (not the free-form tags) and
     // render right after the timestamp.
-    let turn = assistant_turn("m1", "", "cut short", &[], true, true);
+    let turn = assistant_turn("m1", "", "cut short", &[], true, true, None);
     assert!(turn.meta.length_limit_reached);
     assert!(turn.meta.content_filtered);
     assert!(
@@ -823,7 +941,7 @@ fn assistant_turn_helper_sets_finish_flags() {
     assert_eq!(parts[2], "content_filtered: true");
     assert_eq!(parts[3], "model: m1");
     // Unset flags are omitted from the header entirely.
-    let turn = assistant_turn("m1", "", "fine", &[], false, false);
+    let turn = assistant_turn("m1", "", "fine", &[], false, false, None);
     assert!(!turn.meta.length_limit_reached);
     assert!(!turn.meta.content_filtered);
     let rendered = turn.meta.render().expect("metadata");
@@ -845,7 +963,7 @@ fn assistant_turn_helper_carries_tool_calls() {
             arguments: r#"{"command": "ls"}"#.into(),
         },
     ];
-    let turn = assistant_turn("m1", "", "checking", &calls, false, false);
+    let turn = assistant_turn("m1", "", "checking", &calls, false, false, None);
     assert_eq!(turn.tool_calls.len(), 2);
     assert_eq!(
         turn.meta.tags,
@@ -855,7 +973,7 @@ fn assistant_turn_helper_carries_tool_calls() {
         ]
     );
     // No calls: no tag, no field.
-    let turn = assistant_turn("m1", "", "plain", &[], false, false);
+    let turn = assistant_turn("m1", "", "plain", &[], false, false, None);
     assert!(!turn.meta.tags.iter().any(|(k, _)| k == "tool_calls"));
     assert!(turn.tool_calls.is_empty());
 }
@@ -870,7 +988,7 @@ fn append_turn_appends_and_round_trips() {
     )
     .unwrap();
 
-    let a = assistant_turn("m", "", "hi there", &[], false, false);
+    let a = assistant_turn("m", "", "hi there", &[], false, false, None);
     append_turn(&path, &a).unwrap();
     let t = tool_turn("list_files", "c1", "x.md  1");
     append_turn(&path, &t).unwrap();

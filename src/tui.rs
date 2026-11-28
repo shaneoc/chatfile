@@ -60,6 +60,14 @@ enum StreamEvent {
         name: String,
         output: String,
     },
+    /// Automatic compaction has started (§5.4 of `docs/format.md`): the
+    /// `compact: true` request turn is persisted and the summary is
+    /// streaming.
+    CompactionStarted,
+    /// Automatic compaction finished; both checkpoint turns are persisted.
+    /// `tokens` is the summary response's total usage when reported (the
+    /// new context size).
+    CompactionDone { tokens: Option<u64> },
     /// The whole turn finished successfully.
     Done,
     /// The turn failed with an error message.
@@ -91,6 +99,22 @@ pub struct App {
     /// Custom compaction prompt from `[prompts] compact` in config.toml,
     /// when set.
     pub compact_prompt: Option<String>,
+    /// The model's context window in tokens (the active profile's
+    /// `context_limit`); `None` disables the limit part of the context
+    /// meter and automatic compaction (§5.4 of `docs/format.md`).
+    pub context_limit: Option<u64>,
+    /// Percentage of `context_limit` at which to auto-compact (the active
+    /// profile's `auto_compact_percent`); `None` keeps the default of 80.
+    pub auto_compact_percent: Option<u8>,
+    /// The context size in tokens shown by the status-bar meter: seeded
+    /// from the persisted `tokens:` count of the most recent assistant turn
+    /// in the window ([`parser::Conversation::last_assistant_tokens_in_window`])
+    /// and updated on every streamed usage report.
+    pub context_used: Option<u64>,
+    /// The total token usage of the response currently streaming (from its
+    /// final chunk's `usage`); persisted as the `tokens:` count when the
+    /// response is saved.
+    pub last_usage: Option<u64>,
     /// Multi-line input buffer.
     pub input: String,
     /// Byte offset of the cursor within `input`.
@@ -154,6 +178,10 @@ impl App {
             .resolve_max_output_tokens(cli_max_output_tokens, conv.frontmatter.max_output_tokens);
         let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, &path, app_config);
         let compact_prompt = app_config.prompts.compact.clone();
+        let profile = app_config.active_profile();
+        // Seed the context meter from the persisted `tokens:` count of the
+        // most recent assistant turn in the window.
+        let context_used = conv.last_assistant_tokens_in_window();
         Ok(Self {
             path,
             conv,
@@ -163,6 +191,10 @@ impl App {
             max_output_tokens,
             tool_config,
             compact_prompt,
+            context_limit: profile.and_then(|p| p.context_limit),
+            auto_compact_percent: profile.and_then(|p| p.auto_compact_percent),
+            context_used,
+            last_usage: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -337,6 +369,7 @@ impl App {
                 compact: false,
                 length_limit_reached: false,
                 content_filtered: false,
+                tokens: None,
             };
             let reason = (!self.reason_buf.is_empty()).then_some(self.reason_buf.as_str());
             push_turn(
@@ -485,9 +518,26 @@ impl App {
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("?");
+            // Context meter: `ctx: 18.4k/262k (7%)` when the profile sets a
+            // `context_limit`, `ctx: 18.4k` otherwise; hidden until a token
+            // count is known (seeded at load, updated on usage reports).
+            let ctx = self.context_used.map(|used| match self.context_limit {
+                Some(limit) if limit > 0 => format!(
+                    "ctx: {}/{} ({}%)",
+                    format_tokens(used),
+                    format_tokens(limit),
+                    used * 100 / limit
+                ),
+                _ => format!("ctx: {}", format_tokens(used)),
+            });
+            let mut parts = vec![name.to_string(), format!("model: {}", self.model)];
+            if let Some(ctx) = ctx {
+                parts.push(ctx);
+            }
+            parts.push(state);
             let text = format!(
-                " {} | model: {} | {} | Enter send · /compact summarize · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel/quit",
-                name, self.model, state
+                " {} | Enter send · /compact summarize · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+C cancel/quit",
+                parts.join(" | ")
             );
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -563,6 +613,20 @@ fn push_tool_turn(lines: &mut Vec<Line<'static>>, t: &parser::Turn) {
                 lines.push(Line::from(Span::styled(format!("  {l}"), dim)));
             }
         }
+    }
+}
+
+/// Format a token count for the status-bar context meter (`18432` →
+/// `18.4k`, `262144` → `262k`, `1234567` → `1.2M`).
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 100_000 {
+        format!("{:.0}k", n as f64 / 1000.0)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        format!("{n}")
     }
 }
 
@@ -687,18 +751,48 @@ async fn event_loop(
                     Some(StreamEvent::Delta(llm::StreamDelta::Content(s))) => {
                         app.stream_buf.push_str(&s);
                     }
+                    // The response's usage updates the context meter and is
+                    // persisted as the `tokens:` count of the saved turn.
+                    Some(StreamEvent::Delta(llm::StreamDelta::Usage(u))) => {
+                        app.context_used = Some(u.total_tokens);
+                        app.last_usage = Some(u.total_tokens);
+                    }
                     // Tool-call fragments and finish markers are consumed by
                     // the loop itself; they never reach the UI.
                     Some(StreamEvent::Delta(_)) => {}
+                    Some(StreamEvent::CompactionStarted) => {
+                        app.status = "compacting…".into();
+                    }
+                    Some(StreamEvent::CompactionDone { tokens }) => {
+                        if let Some(t) = tokens {
+                            app.context_used = Some(t);
+                        }
+                        // The summary was displayed only; its turn is already
+                        // persisted by the compaction itself. Drop the
+                        // displayed text and the summary's usage (which must
+                        // not leak into the next saved turn), and re-read the
+                        // file so the history shows the new checkpoint turns.
+                        app.reason_buf.clear();
+                        app.stream_buf.clear();
+                        app.last_usage = None;
+                        if let Ok(raw) = std::fs::read_to_string(&app.path) {
+                            if let Ok(c) = parser::parse(&raw) {
+                                app.conv = c;
+                            }
+                        }
+                        app.status = "compacted".into();
+                    }
                     Some(StreamEvent::ResponseEnd {
                         tool_calls,
                         finish,
                     }) => {
+                        let tokens = app.last_usage.take();
                         finalize_response(
                             app,
                             &tool_calls,
                             finish.is_length(),
                             finish.is_content_filter(),
+                            tokens,
                         )?;
                         app.last_finish = Some(finish);
                     }
@@ -776,6 +870,7 @@ async fn submit(
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -790,48 +885,118 @@ async fn submit(
         .filter(|t| t.role == parser::Role::System)
         .map(|t| t.content.as_str());
     let system_prompt = context::build_system_prompt(&app.path, system_section);
-    // `build_api_messages` applies the compaction windowing (§5 of
-    // docs/format.md) and projects the surviving turns; `set_system_prompt`
-    // overlays the hierarchical AGENTS.md prompt on the leading system
-    // message; `complete_tool_calls` answers any call left dangling by a
-    // cancelled or interrupted execution, so reloaded histories are valid
-    // API payloads.
-    let tool_config = app.tool_config.clone();
-    let mut messages = llm::build_api_messages(&app.conv, tool_config.reasoning_history);
-    llm::set_system_prompt(&mut messages, &system_prompt);
-    llm::complete_tool_calls(&mut messages);
 
+    let tool_config = app.tool_config.clone();
+    let auto_compact = app.context_limit.map(|limit| tools::AutoCompact {
+        file: app.path.clone(),
+        context_limit: Some(limit),
+        auto_compact_percent: app.auto_compact_percent,
+        system_prompt: system_prompt.clone(),
+        compact_prompt: app.compact_prompt.clone(),
+        model: app.model.clone(),
+    });
     let client = llm::Client::new(app.endpoint.clone(), app.model.clone(), app.api_key.clone())
         .with_max_output_tokens(app.max_output_tokens);
+    // The conversation as of now, including the just-persisted prompt; the
+    // task re-reads the file when pre-turn compaction runs.
+    let conv = app.conv.clone();
+
     let tx = tx.clone();
     let task = tokio::spawn(async move {
+        // Automatic compaction before the first request (§5.4 of
+        // docs/format.md): when the profile sets `context_limit` and the
+        // persisted `tokens:` count of the most recent assistant turn in
+        // the window has reached the threshold, compact so the new request
+        // starts from the handoff summary (both checkpoint turns are
+        // persisted to the file). The trailing user turn — the prompt being
+        // answered — is moved after the new checkpoint so the rebuilt
+        // request answers it with the summary as context. Runs in this task
+        // (not synchronously in `submit`) so the UI stays responsive and
+        // cancellable while the summary streams.
+        let conv = match auto_compact.as_ref() {
+            Some(ac) => {
+                match tools::pre_turn_auto_compact(&client, ac, &tool_config, &conv, |ev| {
+                    let ev = match ev {
+                        tools::LoopEvent::Reasoning(s) => {
+                            StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone()))
+                        }
+                        tools::LoopEvent::Content(s) => {
+                            StreamEvent::Delta(llm::StreamDelta::Content(s.clone()))
+                        }
+                        tools::LoopEvent::Usage(u) => {
+                            StreamEvent::Delta(llm::StreamDelta::Usage(*u))
+                        }
+                        tools::LoopEvent::CompactionStart => StreamEvent::CompactionStarted,
+                        tools::LoopEvent::CompactionDone { tokens } => {
+                            StreamEvent::CompactionDone { tokens: *tokens }
+                        }
+                        _ => return true,
+                    };
+                    tx.send(ev).is_ok()
+                })
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => conv,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Failed(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            None => conv,
+        };
+
+        // `build_api_messages` applies the compaction windowing (§5 of
+        // docs/format.md) and projects the surviving turns; `set_system_prompt`
+        // overlays the hierarchical AGENTS.md prompt on the leading system
+        // message; `complete_tool_calls` answers any call left dangling by a
+        // cancelled or interrupted execution, so reloaded histories are valid
+        // API payloads.
+        let mut messages = llm::build_api_messages(&conv, tool_config.reasoning_history);
+        llm::set_system_prompt(&mut messages, &system_prompt);
+        llm::complete_tool_calls(&mut messages);
+
         // The whole (possibly multi-round) turn runs here; each event is
         // forwarded to the UI over the channel.
-        let res = tools::run_turn(&client, messages, &tool_config, |ev| {
-            let ev = match ev {
-                tools::LoopEvent::Reasoning(s) => {
-                    StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone()))
-                }
-                tools::LoopEvent::Content(s) => {
-                    StreamEvent::Delta(llm::StreamDelta::Content(s.clone()))
-                }
-                tools::LoopEvent::ResponseEnd { tool_calls, finish } => StreamEvent::ResponseEnd {
-                    tool_calls: tool_calls.clone(),
-                    finish: finish.clone(),
-                },
-                tools::LoopEvent::ToolResult {
-                    id,
-                    name,
-                    arguments: _,
-                    output,
-                } => StreamEvent::ToolResult {
-                    id: id.clone(),
-                    name: name.clone(),
-                    output: output.clone(),
-                },
-            };
-            tx.send(ev).is_ok()
-        })
+        let res = tools::run_turn(
+            &client,
+            messages,
+            &tool_config,
+            auto_compact.as_ref(),
+            |ev| {
+                let ev = match ev {
+                    tools::LoopEvent::Reasoning(s) => {
+                        StreamEvent::Delta(llm::StreamDelta::Reasoning(s.clone()))
+                    }
+                    tools::LoopEvent::Content(s) => {
+                        StreamEvent::Delta(llm::StreamDelta::Content(s.clone()))
+                    }
+                    tools::LoopEvent::Usage(u) => StreamEvent::Delta(llm::StreamDelta::Usage(*u)),
+                    tools::LoopEvent::CompactionStart => StreamEvent::CompactionStarted,
+                    tools::LoopEvent::CompactionDone { tokens } => {
+                        StreamEvent::CompactionDone { tokens: *tokens }
+                    }
+                    tools::LoopEvent::ResponseEnd { tool_calls, finish } => {
+                        StreamEvent::ResponseEnd {
+                            tool_calls: tool_calls.clone(),
+                            finish: finish.clone(),
+                        }
+                    }
+                    tools::LoopEvent::ToolResult {
+                        id,
+                        name,
+                        arguments: _,
+                        output,
+                    } => StreamEvent::ToolResult {
+                        id: id.clone(),
+                        name: name.clone(),
+                        output: output.clone(),
+                    },
+                };
+                tx.send(ev).is_ok()
+            },
+        )
         .await;
         match res {
             Ok(()) => {
@@ -882,7 +1047,11 @@ async fn compact(
                 tools::LoopEvent::Content(s) => tx
                     .send(StreamEvent::Delta(llm::StreamDelta::Content(s.clone())))
                     .is_ok(),
-                // run_compact emits only Reasoning/Content deltas.
+                // The summary's usage refreshes the context meter (the new
+                // window starts at this checkpoint).
+                tools::LoopEvent::Usage(u) => tx
+                    .send(StreamEvent::Delta(llm::StreamDelta::Usage(*u)))
+                    .is_ok(),
                 _ => true,
             }
         })
@@ -913,8 +1082,9 @@ async fn compact(
 
 /// Persist the assistant response that just ended (reasoning in a
 /// collapsible Thinking block ahead of the answer, tool calls as trailing
-/// blocks, and the `length_limit_reached` / `content_filtered` header tags
-/// when set — §2.5 of `docs/format.md`) and push it into the in-memory
+/// blocks, the `length_limit_reached` / `content_filtered` header tags when
+/// set — §2.5 of `docs/format.md` — and the `tokens:` count from the
+/// response's streamed usage, when reported) and push it into the in-memory
 /// conversation. A response with neither text, reasoning, nor tool calls is
 /// skipped.
 fn finalize_response(
@@ -922,6 +1092,7 @@ fn finalize_response(
     tool_calls: &[crate::llm::CompletedToolCall],
     length_limit_reached: bool,
     content_filtered: bool,
+    tokens: Option<u64>,
 ) -> Result<()> {
     let reply = app.stream_buf.trim_end().to_string();
     let reasoning = app.reason_buf.trim_end().to_string();
@@ -937,6 +1108,7 @@ fn finalize_response(
         tool_calls,
         length_limit_reached,
         content_filtered,
+        tokens,
     );
     tools::append_turn(&app.path, &turn)?;
     app.conv.turns.push(turn);

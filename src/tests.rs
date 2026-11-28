@@ -5,13 +5,24 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A one-shot mock `/v1/chat/completions` server: answers every request with
 /// `raw_response` and records each request body (headers stripped).
 async fn mock_completions(raw_response: Vec<u8>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    mock_completions_multi(vec![raw_response]).await
+}
+
+/// A mock `/v1/chat/completions` server that answers the Nth request with
+/// `responses[N]` (repeating the last one) and records each request body
+/// (headers stripped).
+async fn mock_completions_multi(
+    responses: Vec<Vec<u8>>,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let bodies: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = Arc::clone(&bodies);
     tokio::spawn(async move {
+        let mut n = 0usize;
         while let Ok((mut sock, _)) = listener.accept().await {
-            let raw = raw_response.clone();
+            let raw = responses[n.min(responses.len() - 1)].clone();
+            n += 1;
             // Read the request headers, then exactly the declared body.
             // (Reading to EOF would deadlock: the client keeps the
             // connection open until it gets the response.)
@@ -178,6 +189,99 @@ data: [DONE]\n\n";
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&bodies.lock().unwrap()[2]).unwrap();
     assert!(v.get("max_tokens").is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn run_auto_compacts_before_turn_when_persisted_usage_crosses_threshold() {
+    let dir = std::env::temp_dir().join(format!("chatfile-autocompact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Bound the AGENTS.md walk to this directory.
+    std::fs::write(dir.join(".chatfile"), "").unwrap();
+
+    // The compaction summary (with usage) and the real reply (with usage).
+    let summary = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"**Goal** do the thing. **Next steps** finish it.\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":30,\"completion_tokens\":20,\"total_tokens\":50}}\n\n\
+data: [DONE]\n\n";
+    let reply = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"the reply\"}}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":10,\"total_tokens\":50}}\n\n\
+data: [DONE]\n\n";
+    let (endpoint, bodies) = mock_completions_multi(vec![summary.to_vec(), reply.to_vec()]).await;
+
+    let file = dir.join("conv.chat.md");
+    std::fs::write(
+        &file,
+        format!(
+            "---\nmodel: test-model\nendpoint: {endpoint}\ntools: false\n---\n\
+             **System**\n\nbe terse\n\n---\n\
+             **User**\n\nq1\n\n---\n\
+             **Assistant** | model: test-model | tokens: 250000\n\na1\n\n---\n\
+             **User**\n\nq2\n"
+        ),
+    )
+    .unwrap();
+
+    // context_limit 262144 with the default 80% → threshold 209715 < 250000.
+    let mut profiles = std::collections::HashMap::new();
+    profiles.insert(
+        "p".into(),
+        config::ProfileConfig {
+            context_limit: Some(262144),
+            ..Default::default()
+        },
+    );
+    let config = config::AppConfig {
+        default_profile: Some("p".into()),
+        profiles,
+        ..Default::default()
+    };
+
+    run(&file, None, &config).await.unwrap();
+
+    // Two requests: the compaction, then the turn rebuilt from the window.
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2);
+    let v0: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let roles0: Vec<&str> = v0["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    // The summary request covers the full history *including* the pending
+    // prompt, so the handoff mentions it.
+    assert_eq!(roles0, vec!["system", "user", "assistant", "user", "user"]);
+    assert_eq!(v0["messages"][4]["content"], llm::COMPACT_INSTRUCTION);
+
+    let v1: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let msgs1 = v1["messages"].as_array().unwrap();
+    let roles1: Vec<&str> = msgs1.iter().map(|m| m["role"].as_str().unwrap()).collect();
+    assert_eq!(roles1, vec!["system", "user", "assistant", "user"]);
+    // Window = [compact request, summary, the moved prompt].
+    assert_eq!(msgs1[1]["content"], llm::COMPACT_INSTRUCTION);
+    assert!(msgs1[2]["content"].as_str().unwrap().contains("Goal"));
+    assert_eq!(msgs1[3]["content"], "q2");
+
+    // File: history, checkpoint pair, the moved prompt, and the reply.
+    let conv = parser::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(conv.turns.len(), 7);
+    assert!(conv.turns[3].meta.compact);
+    assert_eq!(conv.turns[4].role, parser::Role::Assistant);
+    assert_eq!(conv.turns[4].meta.tokens, Some(50));
+    assert_eq!(conv.turns[5].content, "q2");
+    assert_eq!(conv.turns[6].role, parser::Role::Assistant);
+    assert_eq!(conv.turns[6].content, "the reply");
+    assert_eq!(conv.turns[6].meta.tokens, Some(50));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

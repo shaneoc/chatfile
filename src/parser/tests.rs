@@ -59,6 +59,7 @@ exit code 0
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
     assert_eq!(conv.turns[2].role, Role::Assistant);
@@ -71,6 +72,7 @@ exit code 0
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
     assert_eq!(conv.turns[3].role, Role::Tool);
@@ -189,6 +191,7 @@ fn parse_header_tags_without_timestamp_ok() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
 }
@@ -242,6 +245,7 @@ fn parse_metadata_optional_variants() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
 
@@ -258,6 +262,7 @@ fn parse_metadata_optional_variants() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
 
@@ -277,6 +282,7 @@ fn parse_metadata_optional_variants() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
 }
@@ -406,6 +412,7 @@ fn serialize_canonical_form() {
                     compact: false,
                     length_limit_reached: false,
                     content_filtered: false,
+                    tokens: None,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),
@@ -809,6 +816,7 @@ fn turn_meta_render() {
         compact: false,
         length_limit_reached: false,
         content_filtered: false,
+        tokens: None,
     };
     // Empty values keep the `key: ` prefix (a bare key would not re-parse).
     assert_eq!(
@@ -949,6 +957,7 @@ fn thinking_conv(reasoning: &str, answer: &str) -> Conversation {
                     compact: false,
                     length_limit_reached: false,
                     content_filtered: false,
+                    tokens: None,
                 },
                 reasoning: Some(reasoning.to_string()),
                 tool_calls: Vec::new(),
@@ -1212,6 +1221,7 @@ fn tool_turn_fixture(name: &str, id: &str, output: &str) -> Turn {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1309,6 +1319,7 @@ fn parse_tool_turn_rejects_malformed() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1333,6 +1344,7 @@ fn parse_tool_turn_rejects_malformed() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -1587,6 +1599,7 @@ fn assistant_turn_fixture(content: &str, calls: &[AssistantToolCall]) -> Turn {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: calls.to_vec(),
@@ -1688,6 +1701,7 @@ fn tool_call_with_thinking_and_content_round_trips() {
                     compact: false,
                     length_limit_reached: false,
                     content_filtered: false,
+                    tokens: None,
                 },
                 reasoning: Some("Let me think.".into()),
                 tool_calls: calls.clone(),
@@ -1731,6 +1745,7 @@ fn tool_call_with_thinking_without_content_round_trips() {
                     compact: false,
                     length_limit_reached: false,
                     content_filtered: false,
+                    tokens: None,
                 },
                 reasoning: Some("Quick check.".into()),
                 tool_calls: vec![call.clone()],
@@ -1877,6 +1892,7 @@ fn compact_round_trip_with_timestamp() {
             compact: true,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         }
     );
     // It is rendered right after the timestamp.
@@ -2029,6 +2045,154 @@ fn finish_flags_non_true_value_rejected() {
             );
         }
     }
+}
+
+#[test]
+fn tokens_round_trip_on_assistant_header() {
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | 2026-11-23 22:42 +00:00 | model: m | tokens: 18432\n\na\n"
+    );
+    let conv = parse(&input).unwrap();
+    // Lifted out of the free-form tags, which keep only the model tag.
+    assert_eq!(
+        conv.turns[1].meta,
+        TurnMeta {
+            timestamp: Some("2026-11-23 22:42 +00:00".into()),
+            tags: vec![("model".into(), "m".into())],
+            compact: false,
+            length_limit_reached: false,
+            content_filtered: false,
+            tokens: Some(18432),
+        }
+    );
+    // Rendered after every other tag.
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**Assistant** | 2026-11-23 22:42 +00:00 | model: m | tokens: 18432\n"),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn tokens_round_trip_with_thinking_and_tool_calls() {
+    // The canonical order is model, thinking, tool_calls, …, tokens last.
+    let input = format!(
+        "{USER_PREAMBLE}**Assistant** | model: m | thinking: true | tool_calls: 1 | tokens: 99\n\n\
+         <details>\n<summary>Thinking</summary>\n\nr\n\n</details>\n\na\n\n{}",
+        tc_block("bash", "c1", "{}")
+    );
+    let conv = parse(&input).unwrap();
+    assert_eq!(conv.turns[1].meta.tokens, Some(99));
+    let once = to_markdown(&conv);
+    assert!(
+        once.contains("**Assistant** | model: m | thinking: true | tool_calls: 1 | tokens: 99\n"),
+        "{once}"
+    );
+    assert_eq!(parse(&once).unwrap(), conv);
+}
+
+#[test]
+fn tokens_on_non_assistant_header_rejected() {
+    // System on line 1.
+    let err = parse("**System** | tokens: 100\n\nbe terse\n").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 1: 'tokens' metadata is only allowed on **Assistant** headers"
+    );
+
+    // User on line 6.
+    let input = format!("{USER_PREAMBLE}**User** | tokens: 100\n\nhi\n");
+    let err = parse(&input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 6: 'tokens' metadata is only allowed on **Assistant** headers"
+    );
+
+    // Tool on line 11.
+    let input = "**User** | 2026-11-22 14:30 +00:00\n\nq\n\n---\n**Assistant** | 2026-11-22 14:31 +00:00\n\na\n\n---\n**Tool** | tokens: 100";
+    let err = parse(input).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "line 11: 'tokens' metadata is only allowed on **Assistant** headers"
+    );
+}
+
+#[test]
+fn tokens_non_positive_or_non_integer_rejected() {
+    for v in ["0", "-1", "1.5", "true", ""] {
+        let input = format!("{USER_PREAMBLE}**Assistant** | tokens: {v}\n\na\n");
+        let err = parse(&input).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 6: 'tokens' metadata must be a positive integer",
+            "value: {v:?}"
+        );
+    }
+}
+
+#[test]
+fn last_assistant_tokens_in_window_without_checkpoint() {
+    // The most recent assistant turn with a count wins; turns without one
+    // are skipped.
+    let conv = parse(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m | tokens: 100\n\na1\n\n---\n\
+**User**\n\nq2\n\n---\n\
+**Assistant** | model: m\n\na2 (no usage)\n\n---\n\
+**User**\n\nq3\n\n---\n\
+**Assistant** | model: m | tokens: 500\n\na3\n",
+    )
+    .unwrap();
+    assert_eq!(conv.last_assistant_tokens_in_window(), Some(500));
+
+    // No assistant turn carries a count.
+    let conv = parse("**User**\n\nq\n\n---\n**Assistant** | model: m\n\na\n").unwrap();
+    assert_eq!(conv.last_assistant_tokens_in_window(), None);
+}
+
+#[test]
+fn last_assistant_tokens_in_window_starts_at_last_checkpoint() {
+    let conv = parse(
+        "\
+**System**\n\nbe terse\n\n---\n\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m | tokens: 9000\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize\n\n---\n\
+**Assistant** | model: m | tokens: 200\n\nsummary\n\n---\n\
+**User**\n\nq3\n\n---\n\
+**Assistant** | model: m | tokens: 18432\n\na3\n",
+    )
+    .unwrap();
+    // The pre-checkpoint count (9000) is outside the window.
+    assert_eq!(conv.last_assistant_tokens_in_window(), Some(18432));
+
+    // …and when the post-checkpoint turns carry no count, the pre-checkpoint
+    // one must not leak in either.
+    let conv = parse(
+        "\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m | tokens: 9000\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize\n\n---\n\
+**Assistant** | model: m\n\nsummary (no usage)\n",
+    )
+    .unwrap();
+    assert_eq!(conv.last_assistant_tokens_in_window(), None);
+}
+
+#[test]
+fn last_assistant_tokens_in_window_ignores_trailing_compact_request() {
+    // A trailing unanswered `compact: true` request is not a checkpoint.
+    let conv = parse(
+        "\
+**User**\n\nq1\n\n---\n\
+**Assistant** | model: m | tokens: 700\n\na1\n\n---\n\
+**User** | compact: true\n\nsummarize\n",
+    )
+    .unwrap();
+    assert_eq!(conv.last_assistant_tokens_in_window(), Some(700));
 }
 
 #[test]
@@ -2353,6 +2517,7 @@ fn tool_turn_body_with_extra_blanks_round_trips() {
                     compact: false,
                     length_limit_reached: false,
                     content_filtered: false,
+                    tokens: None,
                 },
                 reasoning: None,
                 tool_calls: Vec::new(),

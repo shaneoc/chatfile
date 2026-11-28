@@ -130,6 +130,8 @@ model = "qwen"
 api_key_env = "MY_KEY"           # name of the env var holding the key (never the key itself)
 scope = "vault"                  # default tool scope: "folder" (default) or "vault"
 tools = ["read_file", "bash"]    # optional allow-list of built-in tools
+context_limit = 262144           # model context window in tokens; enables the TUI's ctx meter
+auto_compact_percent = 80        # compact automatically at this % of context_limit (1..=100)
 
 [profiles.cloud]
 endpoint = "https://api.example.com/v1/chat/completions"
@@ -166,6 +168,21 @@ frontmatter; `fetch_url` and `bash` still require the frontmatter's
 
 The `[tui] mouse` setting (default `true`) can be overridden per invocation
 with `chatfile --mouse <file>` or `chatfile --mouse=false <file>`.
+
+### Context meter and automatic compaction
+
+Every request asks the endpoint for per-response token usage
+(`stream_options: { "include_usage": true }`), and each persisted assistant
+turn that receives one records it as a `tokens: <n>` header tag. When a
+profile sets `context_limit`, the TUI status bar shows a meter
+(`ctx: 18.4k/262k (7%)`; `ctx: 18.4k` without a limit), seeded from the
+persisted count of the most recent assistant turn in the current window and
+updated on every usage report. When that count reaches
+`auto_compact_percent` (default `80`) of `context_limit`, chatfile runs the
+same compaction as `/compact` automatically — before the first request of a
+run/submit, and mid tool-loop when a streamed response crosses the
+threshold — persisting both checkpoint turns and continuing from the
+handoff summary. See §5.4 of [docs/format.md](docs/format.md).
 
 ### Sandbox behavior
 

@@ -28,6 +28,10 @@ fn test_app() -> App {
             reasoning_history: config::ReasoningHistory::default(),
         },
         compact_prompt: None,
+        context_limit: None,
+        auto_compact_percent: None,
+        context_used: None,
+        last_usage: None,
         input: String::new(),
         cursor: 0,
         scroll: 0,
@@ -82,6 +86,34 @@ fn render_80x24_shows_history_and_status() {
 }
 
 #[test]
+fn render_status_bar_shows_context_meter_with_limit() {
+    let mut app = test_app();
+    app.context_used = Some(18432);
+    app.context_limit = Some(262144);
+    let screen = render(&app, 80, 24).join("\n");
+    // `ctx: <used>/<limit> (<pct>%)`, with k-formatted counts.
+    assert!(screen.contains("ctx: 18.4k/262k (7%)"), "{screen}");
+}
+
+#[test]
+fn render_status_bar_shows_context_meter_without_limit() {
+    let mut app = test_app();
+    app.context_used = Some(18432);
+    app.context_limit = None;
+    let screen = render(&app, 80, 24).join("\n");
+    // No limit: the bare used count, no `/` part.
+    assert!(screen.contains("ctx: 18.4k"), "{screen}");
+    assert!(!screen.contains("ctx: 18.4k/"), "{screen}");
+
+    // No count at all: the meter is hidden entirely.
+    let mut app = test_app();
+    app.context_used = None;
+    app.context_limit = Some(262144);
+    let screen = render(&app, 80, 24).join("\n");
+    assert!(!screen.contains("ctx:"), "{screen}");
+}
+
+#[test]
 fn render_narrow_20x10_no_panic() {
     let mut app = test_app();
     app.input = "a very long input line that must wrap in a narrow pane".into();
@@ -122,6 +154,7 @@ fn render_persisted_turn_splits_reasoning_from_answer() {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: Some("because 6*9".into()),
         tool_calls: Vec::new(),

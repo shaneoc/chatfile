@@ -221,6 +221,16 @@ impl AppConfig {
             if profile.max_tool_output_bytes == Some(0) {
                 anyhow::bail!("profiles.{name}.max_tool_output_bytes must be a positive integer");
             }
+            if profile.context_limit == Some(0) {
+                anyhow::bail!("profiles.{name}.context_limit must be a positive integer");
+            }
+            if let Some(percent) = profile.auto_compact_percent {
+                if !(1..=100).contains(&percent) {
+                    anyhow::bail!(
+                        "profiles.{name}.auto_compact_percent must be between 1 and 100, found {percent}"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -269,6 +279,14 @@ pub struct ProfileConfig {
     /// `search_files`, `fetch_url`, `bash` (`fetch_url` and `bash` still
     /// require the conversation frontmatter's `network`/`allow_shell`).
     pub tools: Option<Vec<String>>,
+    /// The model's context window in tokens (a positive integer); when set,
+    /// it drives the TUI's context meter and automatic compaction (§5.4 of
+    /// `docs/format.md`). `None` disables both.
+    pub context_limit: Option<u64>,
+    /// Percentage (`1..=100`) of `context_limit` at which chatfile
+    /// automatically compacts the conversation; `None` keeps the built-in
+    /// default of 80. Only meaningful when `context_limit` is set.
+    pub auto_compact_percent: Option<u8>,
 }
 
 /// Sandbox policy for the `bash` tool (the `[sandbox]` table).
@@ -474,6 +492,8 @@ struct ProfileOverrides {
     reasoning_history: Option<ReasoningHistory>,
     scope: Option<String>,
     tools: Option<Vec<String>>,
+    context_limit: Option<u64>,
+    auto_compact_percent: Option<u8>,
 }
 
 impl ProfileOverrides {
@@ -501,6 +521,12 @@ impl ProfileOverrides {
         }
         if let Some(v) = self.tools {
             profile.tools = Some(v);
+        }
+        if let Some(v) = self.context_limit {
+            profile.context_limit = Some(v);
+        }
+        if let Some(v) = self.auto_compact_percent {
+            profile.auto_compact_percent = Some(v);
         }
     }
 }

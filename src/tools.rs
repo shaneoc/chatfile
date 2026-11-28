@@ -20,8 +20,9 @@ use serde_json::{Value as Json, json};
 use crate::config::{AppConfig, ReasoningHistory, SandboxConfig};
 use crate::context;
 use crate::llm::{
-    AssistantTurn, Client, CompletedToolCall, FinishReason, Message, StreamDelta, ToolCall,
-    ToolFunction,
+    AssistantTurn, Client, CompletedToolCall, FinishReason, Message, StreamDelta, TokenUsage,
+    ToolCall, ToolFunction, build_api_messages, complete_tool_calls, set_system_prompt,
+    should_auto_compact,
 };
 use crate::parser;
 use crate::sandbox;
@@ -203,6 +204,31 @@ impl ToolConfig {
                 .unwrap_or_default(),
         }
     }
+}
+
+/// Everything needed to run automatic compaction (§5.4 of `docs/format.md`):
+/// the conversation file the checkpoint turns are persisted into, the
+/// threshold settings from the active profile, and the request ingredients
+/// (system prompt, compaction prompt override, model name).
+#[derive(Debug, Clone)]
+pub struct AutoCompact {
+    /// The conversation file to persist the `compact: true` request turn and
+    /// the summary turn into.
+    pub file: PathBuf,
+    /// The model's context window in tokens; `None` disables automatic
+    /// compaction entirely.
+    pub context_limit: Option<u64>,
+    /// Percentage (`1..=100`) of `context_limit` at which to compact;
+    /// `None` keeps the built-in default of 80.
+    pub auto_compact_percent: Option<u8>,
+    /// The hierarchical system prompt overlaid on the compaction request
+    /// (see [`crate::context::build_system_prompt`]).
+    pub system_prompt: String,
+    /// Override for the `compact: true` request body (`[prompts] compact`),
+    /// when set.
+    pub compact_prompt: Option<String>,
+    /// Model name recorded on the persisted summary turn.
+    pub model: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -804,6 +830,7 @@ pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
             compact: false,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -816,9 +843,11 @@ pub fn tool_turn(name: &str, id: &str, output: &str) -> parser::Turn {
 /// collapsible `<details><summary>Thinking</summary>` block), — when tool
 /// calls were issued — a `tool_calls: <N>` header tag and the calls carried
 /// in [`parser::Turn::tool_calls`] (serialized as trailing Tool Call
-/// blocks), and — when set — the `length_limit_reached: true` /
+/// blocks), — when set — the `length_limit_reached: true` /
 /// `content_filtered: true` header tags recording how the response ended
-/// (§2.5 of `docs/format.md`).
+/// (§2.5 of `docs/format.md`), and — when the server reported a positive
+/// token count — the `tokens: <n>` header tag (rendered after every other
+/// tag, §2.2 of `docs/format.md`).
 pub fn assistant_turn(
     model: &str,
     reasoning: &str,
@@ -826,6 +855,7 @@ pub fn assistant_turn(
     tool_calls: &[CompletedToolCall],
     length_limit_reached: bool,
     content_filtered: bool,
+    tokens: Option<u64>,
 ) -> parser::Turn {
     let has_reasoning = !reasoning.trim().is_empty();
     let mut tags = vec![("model".to_string(), model.to_string())];
@@ -844,6 +874,7 @@ pub fn assistant_turn(
             compact: false,
             length_limit_reached,
             content_filtered,
+            tokens: tokens.filter(|&n| n > 0),
         },
         reasoning: has_reasoning.then(|| reasoning.trim().to_string()),
         tool_calls: tool_calls
@@ -922,6 +953,135 @@ pub enum LoopEvent {
         /// The tool's output (or `Error: ...` text on failure).
         output: String,
     },
+    /// A response's token usage arrived (the final chunk's `usage`,
+    /// §2.2/§5.4 of `docs/format.md`); its `total_tokens` feeds the context
+    /// meter and the automatic-compaction check.
+    Usage(TokenUsage),
+    /// Automatic compaction has started (§5.4): the `compact: true` request
+    /// turn is persisted and the model's handoff summary is streaming.
+    CompactionStart,
+    /// Automatic compaction finished: both checkpoint turns are persisted
+    /// and the message list was rebuilt from the new window. `tokens` is
+    /// the summary response's total usage when reported (the new context
+    /// size), else `None`.
+    CompactionDone {
+        /// The summary response's total token usage, when reported.
+        tokens: Option<u64>,
+    },
+}
+
+/// Run one automatic compaction (§5.4 of `docs/format.md`): re-read
+/// `ac.file`, append a `**User** | compact: true` request turn, stream the
+/// model's handoff summary (no tool loop), and append it as an
+/// `**Assistant**` turn carrying its streamed usage as the `tokens:` count —
+/// persisting both checkpoint turns. Emits [`LoopEvent::CompactionStart`]
+/// before streaming and forwards the summary's deltas (reasoning, content,
+/// usage) through `on_event`; a summary with no text and no reasoning is not
+/// persisted (the file keeps its well-formed trailing request). Returns the
+/// conversation re-parsed from the file, ready for
+/// [`build_api_messages`] to window at the new checkpoint.
+pub async fn run_auto_compact(
+    client: &Client,
+    ac: &AutoCompact,
+    config: &ToolConfig,
+    mut on_event: impl FnMut(&LoopEvent) -> bool,
+) -> Result<parser::Conversation> {
+    let raw = std::fs::read_to_string(&ac.file)
+        .with_context(|| format!("failed to read {}", ac.file.display()))?;
+    let mut conv =
+        parser::parse(&raw).with_context(|| format!("failed to parse {}", ac.file.display()))?;
+
+    // The request turn is persisted before the model is called, so a failed
+    // run leaves a well-formed file whose trailing unanswered request the
+    // next run (or compact) simply answers.
+    let request = crate::llm::compact_request_turn(ac.compact_prompt.as_deref());
+    append_turn(&ac.file, &request)?;
+    conv.turns.push(request);
+
+    if !on_event(&LoopEvent::CompactionStart) {
+        return Ok(conv);
+    }
+    let summary = crate::llm::run_compact(client, &conv, &ac.system_prompt, config, |ev| {
+        // Forward the summary's streamed deltas to the outer handler; the
+        // compaction runs no tool loop, so nothing else is emitted.
+        match ev {
+            LoopEvent::Reasoning(s) => on_event(&LoopEvent::Reasoning(s.clone())),
+            LoopEvent::Content(s) => on_event(&LoopEvent::Content(s.clone())),
+            LoopEvent::Usage(u) => on_event(&LoopEvent::Usage(*u)),
+            _ => true,
+        }
+    })
+    .await?;
+
+    // Persist the summary only when the model produced something.
+    let tokens = summary.usage.map(|u| u.total_tokens);
+    if !(summary.content.trim().is_empty() && summary.reasoning.trim().is_empty()) {
+        let finish = summary.finish();
+        let turn = assistant_turn(
+            &ac.model,
+            &summary.reasoning,
+            &summary.content,
+            &[],
+            finish.is_length(),
+            finish.is_content_filter(),
+            tokens,
+        );
+        append_turn(&ac.file, &turn)?;
+        conv.turns.push(turn);
+    }
+    let _ = on_event(&LoopEvent::CompactionDone { tokens });
+    Ok(conv)
+}
+
+/// Pre-turn automatic compaction (§5.4 of `docs/format.md`): when the
+/// persisted `tokens:` count of the most recent `**Assistant**` turn inside
+/// the window has reached the threshold, run [`run_auto_compact`] and return
+/// the re-parsed conversation; otherwise return `None`.
+///
+/// When `conv` ends with an unanswered, non-`compact` `**User**` turn — the
+/// prompt the caller is about to answer — it would land *before* the new
+/// checkpoint and be dropped from the windowed request, so after compaction
+/// it is moved to after the summary (the file is rewritten with the turn at
+/// the end). The next request then asks the model to answer the prompt with
+/// the handoff summary as context. Compaction runs *before* the move, so an
+/// aborted run leaves the prompt in the file (ahead of the unanswered
+/// `compact: true` request) instead of losing it.
+pub async fn pre_turn_auto_compact(
+    client: &Client,
+    ac: &AutoCompact,
+    config: &ToolConfig,
+    conv: &parser::Conversation,
+    mut on_event: impl FnMut(&LoopEvent) -> bool,
+) -> Result<Option<parser::Conversation>> {
+    let Some(used) = conv.last_assistant_tokens_in_window() else {
+        return Ok(None);
+    };
+    if !should_auto_compact(used, ac.context_limit, ac.auto_compact_percent) {
+        return Ok(None);
+    }
+    let pending = conv
+        .turns
+        .last()
+        .filter(|t| t.role == parser::Role::User && !t.meta.compact)
+        .cloned();
+    // The compaction only appends turns, so the pending prompt — the last
+    // turn of `conv` — keeps its original index, immediately before the new
+    // checkpoint.
+    let pending_pos = pending.as_ref().map(|_| conv.turns.len() - 1);
+    let mut conv = run_auto_compact(client, ac, config, &mut on_event).await?;
+    if let (Some(turn), Some(pos)) = (pending, pending_pos) {
+        if conv.turns[pos] != turn {
+            bail!(
+                "internal error: pending user turn not found before the new checkpoint in {}",
+                ac.file.display()
+            );
+        }
+        let moved = conv.turns.remove(pos);
+        conv.turns.push(moved);
+        std::fs::write(&ac.file, parser::to_markdown(&conv))
+            .with_context(|| format!("failed to write {}", ac.file.display()))?;
+    }
+    Ok(Some(conv))
 }
 
 /// Drive one user turn end-to-end: stream an assistant response, execute any
@@ -941,10 +1101,20 @@ pub enum LoopEvent {
 /// the caller persists them on the assistant turn with the
 /// `length_limit_reached` flag, and [`crate::llm::complete_tool_calls`]
 /// answers them synthetically on the next request.
+///
+/// When `auto_compact` is `Some` and the response that just issued tool
+/// calls reported usage past the threshold (`should_auto_compact`), the loop
+/// runs an automatic compaction ([`run_auto_compact`], §5.4) before the next
+/// request and rebuilds `messages` from the new checkpoint window via
+/// [`build_api_messages`], [`set_system_prompt`], and
+/// [`complete_tool_calls`]. The caller must persist each `ResponseEnd` /
+/// `ToolResult` into `auto_compact.file` as it arrives, since the
+/// compaction re-reads the file from disk.
 pub async fn run_turn(
     client: &Client,
     mut messages: Vec<Message>,
     config: &ToolConfig,
+    auto_compact: Option<&AutoCompact>,
     mut on_event: impl FnMut(&LoopEvent) -> bool,
 ) -> Result<()> {
     let schemas = tool_schemas(config);
@@ -958,6 +1128,7 @@ pub async fn run_turn(
             let stop = match &delta {
                 StreamDelta::Reasoning(s) => !on_event(&LoopEvent::Reasoning(s.clone())),
                 StreamDelta::Content(s) => !on_event(&LoopEvent::Content(s.clone())),
+                StreamDelta::Usage(u) => !on_event(&LoopEvent::Usage(*u)),
                 _ => false,
             };
             turn.push(&delta);
@@ -1038,6 +1209,28 @@ pub async fn run_turn(
                 return Ok(());
             }
             messages.push(Message::tool_result(&c.id, output));
+        }
+
+        // Mid-loop automatic compaction (§5.4): when the response that just
+        // issued these tool calls reported usage past the threshold, compact
+        // before the next request. The caller has persisted the assistant
+        // turn (on `ResponseEnd`) and every tool result (on `ToolResult`),
+        // so the compaction — which re-reads the file — sees the complete
+        // history; the rebuilt message list then replaces the one built
+        // before the turn.
+        if let Some(ac) = auto_compact {
+            if let Some(usage) = turn.usage {
+                if should_auto_compact(
+                    usage.total_tokens,
+                    ac.context_limit,
+                    ac.auto_compact_percent,
+                ) {
+                    let conv = run_auto_compact(client, ac, config, &mut on_event).await?;
+                    messages = build_api_messages(&conv, config.reasoning_history);
+                    set_system_prompt(&mut messages, &ac.system_prompt);
+                    complete_tool_calls(&mut messages);
+                }
+            }
         }
     }
     bail!("no final reply after {MAX_TOOL_ITERATIONS} tool iterations")

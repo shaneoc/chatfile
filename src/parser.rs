@@ -130,14 +130,20 @@ pub struct TurnMeta {
     /// cut the response; see §2.5 of `docs/format.md`). Lifted out of
     /// [`TurnMeta::tags`] on parse like [`TurnMeta::compact`].
     pub content_filtered: bool,
+    /// The `tokens: <n>` count from the server's streamed `usage` for this
+    /// `**Assistant**` turn (an `**Assistant**`-only positive integer; see
+    /// §2.2 of `docs/format.md`). Lifted out of [`TurnMeta::tags`] on parse
+    /// like [`TurnMeta::compact`].
+    pub tokens: Option<u64>,
 }
 
 impl TurnMeta {
     /// The metadata as it appears after the role in a header line — plain
     /// segments joined by ` | ` (timestamp first, then `compact: true`,
     /// `length_limit_reached: true`, and `content_filtered: true` when set,
-    /// then the remaining `key: value` pairs) — or `None` when there is
-    /// none.
+    /// then the remaining `key: value` pairs, and finally `tokens: <n>`
+    /// when set — so it comes after `model`, `thinking`, and `tool_calls`)
+    /// — or `None` when there is none.
     pub fn render(&self) -> Option<String> {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ts) = &self.timestamp {
@@ -156,6 +162,9 @@ impl TurnMeta {
             // Always `key: value` (a bare key would not re-parse); an empty
             // value leaves a trailing space, which the parser trims.
             parts.push(format!("{k}: {v}"));
+        }
+        if let Some(n) = self.tokens {
+            parts.push(format!("tokens: {n}"));
         }
         if parts.is_empty() {
             None
@@ -774,6 +783,30 @@ fn parse_header_line(line: &str, line_no: usize) -> Result<(Role, TurnMeta)> {
                 ));
             }
         }
+    }
+    // The `tokens` tag is an assistant-only positive integer: the server's
+    // streamed `usage` token count for the response. When present it is
+    // lifted out of the free-form tags into [`TurnMeta::tokens`] (rendered
+    // after every other tag).
+    for (k, v) in &meta.tags {
+        if k == "tokens" {
+            if role != Role::Assistant {
+                return Err(line_error(
+                    line_no,
+                    "'tokens' metadata is only allowed on **Assistant** headers",
+                ));
+            }
+            if v.parse::<u64>().map_or(true, |n| n == 0) {
+                return Err(line_error(
+                    line_no,
+                    "'tokens' metadata must be a positive integer",
+                ));
+            }
+        }
+    }
+    if let Some((_, v)) = meta.tags.iter().find(|(k, _)| k == "tokens") {
+        meta.tokens = Some(v.parse::<u64>().expect("validated above"));
+        meta.tags.retain(|(k, _)| k != "tokens");
     }
     // The `tool` and `id` tags name a tool call and are only allowed on
     // **Tool** headers.
@@ -1848,6 +1881,34 @@ impl Conversation {
     /// request-prep step that answers dangling tool calls.
     pub fn to_messages(&self) -> Vec<crate::llm::Message> {
         self.project_turns(0..self.turns.len(), crate::config::ReasoningHistory::None)
+    }
+
+    /// The `tokens:` count from the most recent `**Assistant**` turn inside
+    /// the current context window — the §5 compaction window: everything
+    /// from the last `compact: true` checkpoint onward, or the whole file
+    /// (after the system section) when there is no checkpoint. A trailing
+    /// unanswered `**User**` turn is excluded from the checkpoint search,
+    /// exactly as in [`crate::llm::build_api_messages`]. `None` when no
+    /// assistant turn in the window carries a `tokens:` count.
+    pub fn last_assistant_tokens_in_window(&self) -> Option<u64> {
+        let turns = &self.turns;
+        let n = turns.len();
+        // A trailing **User** turn has no **Assistant** reply after it, so
+        // it is the prompt being answered (possibly a new `compact: true`
+        // request) and is excluded from the checkpoint search.
+        let trailing_user = n > 0 && turns[n - 1].role == Role::User;
+        let search_end = n - usize::from(trailing_user);
+        let checkpoint = (0..search_end)
+            .rev()
+            .find(|&i| turns[i].role == Role::User && turns[i].meta.compact);
+        let start = match checkpoint {
+            Some(i) => i,
+            None => usize::from(n > 0 && turns[0].role == Role::System),
+        };
+        (start..n)
+            .rev()
+            .filter(|&i| turns[i].role == Role::Assistant)
+            .find_map(|i| turns[i].meta.tokens)
     }
 
     /// Project a range of sections into OpenAI wire-format messages with the

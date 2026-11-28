@@ -169,7 +169,7 @@ async fn run(
     require_conversation_ext(file)?;
     let raw = std::fs::read_to_string(file)
         .with_context(|| format!("failed to read {}", file.display()))?;
-    let conv =
+    let mut conv =
         parser::parse(&raw).with_context(|| format!("failed to parse {}", file.display()))?;
 
     if !conv.turns.iter().any(|t| t.role == parser::Role::User) {
@@ -202,13 +202,51 @@ async fn run(
     // or interrupted execution, so reloaded histories are valid API
     // payloads.
     let tool_config = tools::ToolConfig::for_file(&conv.frontmatter, file, config);
-    let mut messages = llm::build_api_messages(&conv, tool_config.reasoning_history);
-    llm::set_system_prompt(&mut messages, &system_prompt);
-    llm::complete_tool_calls(&mut messages);
 
     eprintln!("[chatfile] model={} endpoint={}", model, endpoint);
     let client = llm::Client::new(endpoint, model.clone(), api_key)
         .with_max_output_tokens(max_output_tokens);
+
+    // Automatic compaction (§5.4 of docs/format.md): when the active
+    // profile sets `context_limit` and the persisted `tokens:` count of the
+    // most recent assistant turn in the window has reached the threshold,
+    // compact before the first request so it starts from the handoff
+    // summary (both checkpoint turns are persisted to the file).
+    let auto_compact = config
+        .active_profile()
+        .and_then(|p| p.context_limit)
+        .map(|limit| tools::AutoCompact {
+            file: file.to_path_buf(),
+            context_limit: Some(limit),
+            auto_compact_percent: config.active_profile().and_then(|p| p.auto_compact_percent),
+            system_prompt: system_prompt.clone(),
+            compact_prompt: config.prompts.compact.clone(),
+            model: model.clone(),
+        });
+    if let Some(ac) = &auto_compact {
+        if let Some(new_conv) =
+            tools::pre_turn_auto_compact(&client, ac, &tool_config, &conv, |ev| match ev {
+                tools::LoopEvent::CompactionStart => {
+                    eprintln!("[chatfile] context limit reached; compacting before the turn");
+                    true
+                }
+                tools::LoopEvent::CompactionDone { tokens } => {
+                    if let Some(t) = tokens {
+                        eprintln!("[chatfile] compacted; context now at {t} tokens");
+                    }
+                    true
+                }
+                _ => true,
+            })
+            .await?
+        {
+            conv = new_conv;
+        }
+    }
+
+    let mut messages = llm::build_api_messages(&conv, tool_config.reasoning_history);
+    llm::set_system_prompt(&mut messages, &system_prompt);
+    llm::complete_tool_calls(&mut messages);
 
     // Run the (possibly multi-turn) assistant reply. stdout stays a clean
     // stream of answer text: reasoning and tool results are only persisted
@@ -218,8 +256,11 @@ async fn run(
     let mut final_reply = String::new();
     let mut reasoning_chars = 0usize;
     let mut appended = 0usize;
+    // The total token usage of the response currently streaming (its final
+    // chunk's `usage`); persisted as the `tokens:` count when saved.
+    let mut last_usage: Option<u64> = None;
     let stdout = std::io::stdout();
-    tools::run_turn(&client, messages, &tool_config, |ev| {
+    tools::run_turn(&client, messages, &tool_config, auto_compact.as_ref(), |ev| {
         use tools::LoopEvent::*;
         match ev {
             Reasoning(chunk) => {
@@ -231,6 +272,24 @@ async fn run(
                 let mut out = stdout.lock();
                 let _ = out.write_all(chunk.as_bytes());
                 let _ = out.flush();
+                true
+            }
+            Usage(u) => {
+                eprintln!(
+                    "[chatfile] usage: {} prompt + {} completion = {} total tokens",
+                    u.prompt_tokens, u.completion_tokens, u.total_tokens
+                );
+                last_usage = Some(u.total_tokens);
+                true
+            }
+            CompactionStart => {
+                eprintln!("[chatfile] context limit reached; compacting…");
+                true
+            }
+            CompactionDone { tokens } => {
+                if let Some(t) = tokens {
+                    eprintln!("[chatfile] compacted; context now at {t} tokens");
+                }
                 true
             }
             ResponseEnd {
@@ -260,6 +319,7 @@ async fn run(
                         tool_calls,
                         finish.is_length(),
                         finish.is_content_filter(),
+                        last_usage.take(),
                     );
                     if tools::append_turn(file, &turn).is_ok() {
                         appended += 1;
@@ -407,6 +467,7 @@ async fn compact(
             &[],
             finish.is_length(),
             finish.is_content_filter(),
+            summary.usage.map(|u| u.total_tokens),
         ),
     )?;
     eprintln!(

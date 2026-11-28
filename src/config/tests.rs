@@ -352,6 +352,67 @@ fn load_zero_max_tool_output_bytes_is_rejected() {
 }
 
 #[test]
+fn load_context_limit_and_auto_compact_percent_parse() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(
+        &file,
+        "[profiles.a]\ncontext_limit = 262144\nauto_compact_percent = 75\n\
+         [profiles.b]\ncontext_limit = 32768\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::load_from(&[file.to_path_buf()]).unwrap();
+    assert_eq!(config.profiles["a"].context_limit, Some(262144));
+    assert_eq!(config.profiles["a"].auto_compact_percent, Some(75));
+    // Unnamed keys keep the unset value (the default of 80 applies at use
+    // time, not in the config).
+    assert_eq!(config.profiles["b"].context_limit, Some(32768));
+    assert_eq!(config.profiles["b"].auto_compact_percent, None);
+}
+
+#[test]
+fn load_zero_context_limit_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("config.toml");
+    std::fs::write(&file, "[profiles.p]\ncontext_limit = 0\n").unwrap();
+
+    let err = AppConfig::load_from(&[file.to_path_buf()]).unwrap_err();
+    assert!(
+        err.to_string().contains("context_limit"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn load_out_of_range_auto_compact_percent_is_rejected() {
+    for v in [0, 101] {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, format!("[profiles.p]\nauto_compact_percent = {v}\n")).unwrap();
+
+        let err = AppConfig::load_from(&[file.to_path_buf()]).unwrap_err();
+        assert!(
+            err.to_string().contains("auto_compact_percent"),
+            "unexpected error for {v}: {err}"
+        );
+    }
+    // The boundaries are accepted.
+    for v in [1, 100] {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, format!("[profiles.p]\nauto_compact_percent = {v}\n")).unwrap();
+        assert_eq!(
+            AppConfig::load_from(&[file.to_path_buf()])
+                .unwrap()
+                .profiles["p"]
+                .auto_compact_percent,
+            Some(v)
+        );
+    }
+}
+
+#[test]
 fn load_reasoning_history_parses_all_values() {
     let dir = TempDir::new().unwrap();
     let file = dir.path().join("config.toml");
@@ -419,6 +480,8 @@ fn profiled_config() -> AppConfig {
             reasoning_history: None,
             scope: None,
             tools: None,
+            context_limit: None,
+            auto_compact_percent: None,
         },
     );
     AppConfig {

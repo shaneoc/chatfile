@@ -195,6 +195,27 @@ The `tool_calls` tag is special:
 - The tag is emitted only when the turn carries at least one tool call; the
   canonical tag order is `model`, then `thinking`, then `tool_calls`.
 
+The `tokens` tag is special:
+
+- It is **only allowed on `**Assistant**` headers**; on any other role it is a
+  header-format error (§4.3).
+- Its value must be a **positive integer**; `0`, negatives, decimals, and
+  non-integers (`true`, `1.5`, empty, …) are header-format errors (§4.3).
+- It records the server's streamed `usage` token count for the response
+  (the `total_tokens` of the final SSE chunk, when the endpoint reports
+  usage with `stream_options: { "include_usage": true }`). chatfile emits it
+  on every persisted assistant turn that carries one; hand-edited files may
+  carry it on any assistant turn.
+- It is rendered **after every other tag** — the canonical header order is
+  the timestamp, then `model`, `thinking`, `tool_calls`,
+  `length_limit_reached`, `content_filtered`, and finally `tokens: <n>`;
+  parsing lifts it out of the free-form tag list, so its position among the
+  other tags is not significant.
+- The count seeds the context meter and the automatic-compaction threshold
+  (§5.4): requests are built from the window that starts at the last
+  `compact: true` checkpoint, so only the `tokens:` count of the most recent
+  assistant turn inside that window is considered.
+
 The `compact` tag is special:
 
 - It is **only allowed on `**User**` headers**; on any other role it is a
@@ -244,6 +265,7 @@ The `length_limit_reached` and `content_filtered` tags are special:
 **User** | model: m1                                  ← valid (tags, no timestamp)
 **Assistant** | 2026-11-23 22:42 +00:00 | model: local-model ← valid (canonical form)
 **Assistant** | model: m1 | thinking: true | tool_calls: 2 ← valid
+**Assistant** | 2026-11-23 22:42 +00:00 | model: m | tokens: 18432 ← valid (usage count)
 **Tool** | 2026-11-23 22:42 +00:00 | tool: bash | id: call_1 ← valid
 **User** | 2026-11-23 22:42 +00:00 | compact: true           ← valid (compaction checkpoint)
 **Assistant** | 2026-11-23 22:42 +00:00 | length_limit_reached: true | model: m ← valid (truncated response)
@@ -264,6 +286,8 @@ The `length_limit_reached` and `content_filtered` tags are special:
 **User** | compact: false                             ← INVALID: must be the literal 'true'
 **User** | length_limit_reached: true                 ← INVALID: 'length_limit_reached' is **Assistant**-only
 **Assistant** | content_filtered: false               ← INVALID: must be the literal 'true'
+**User** | tokens: 100                                 ← INVALID: 'tokens' is **Assistant**-only
+**Assistant** | tokens: 0                              ← INVALID: must be a positive integer
 ```
 
 ### 2.5 Finish reasons and their metadata tags
@@ -636,6 +660,8 @@ content and never triggers them.
 | `line N: 'content_filtered' metadata must be the literal value 'true'` | The `content_filtered` tag's value is not exactly the lowercase literal `true` (`false`, `True`, empty, …). | `**Assistant** \| content_filtered: True` |
 | `line N: 'tool_calls' metadata is only allowed on **Assistant** headers` | A `tool_calls:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tool_calls: 1` |
 | `line N: 'tool_calls' metadata must be a positive integer` | The `tool_calls` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tool_calls: 0` |
+| `line N: 'tokens' metadata is only allowed on **Assistant** headers` | A `tokens:` tag appears on a `**System**`, `**User**`, or `**Tool**` header (§2.2). | `**User** \| tokens: 100` |
+| `line N: 'tokens' metadata must be a positive integer` | The `tokens` tag's value is not a positive integer (`0`, `-1`, `1.5`, `true`, empty, …). | `**Assistant** \| tokens: 0` |
 | `line N: duplicate metadata key '<key>' in header` | The same `key:` appears more than once in one header (keys are case-sensitive; timestamps are not keys and have their own duplicate check). | `**Assistant** \| model: a \| model: b` |
 | `line N: 'tool' metadata is only allowed on **Tool** headers` | A `tool:` tag appears on a `**System**`, `**User**`, or `**Assistant**` header (§2.2). | `**User** \| tool: bash` |
 | `line N: 'id' metadata is only allowed on **Tool** headers` | An `id:` tag appears on a `**System**`, `**User**`, or `**Assistant**` header (§2.2). | `**Assistant** \| id: call_1` |
@@ -751,3 +777,37 @@ The request turn is persisted *before* the model is called, so a failed run
 leaves a well-formed file whose trailing unanswered request the next `run`
 (or `compact`) simply answers. The file always keeps its full history; only
 the sent messages are windowed.
+
+### 5.4 Automatic compaction (`context_limit`)
+
+When the active profile sets `context_limit` (a positive integer token count,
+`config.toml`), chatfile compacts automatically instead of waiting for a
+manual `/compact`:
+
+- The estimate is the `tokens: <n>` count (§2.2) of the most recent
+  `**Assistant**` turn inside the current window — i.e. after the last
+  `compact: true` checkpoint, or from the start of the file when there is no
+  checkpoint. Requests ask the endpoint for per-response usage
+  (`stream_options: { "include_usage": true }`), and every persisted
+  assistant turn that receives a count carries it in its header.
+- Compaction triggers when `used_tokens ≥ context_limit ×
+  auto_compact_percent / 100`, where `auto_compact_percent` (default `80`)
+  is the profile's threshold percentage (`1..=100`). With no `context_limit`
+  set, nothing ever triggers.
+- Two trigger points: **pre-turn** (before the first request of a `run` or a
+  TUI submission, using the persisted count) and **mid-tool-loop** (inside
+  the tool loop, after an assistant tool-call response and its tool results
+  have been persisted, using the streamed `usage` of that response).
+- A trigger runs exactly what `/compact` runs: it appends the
+  `compact: true` request turn, streams one assistant summary (no tool
+  loop), and appends it — both turns persisted to the file. The loop then
+  rebuilds its message list from the checkpointed window and continues.
+- Pre-turn, if the file ends with an unanswered, non-`compact` `**User**`
+  turn (the prompt about to be answered), that turn would land *before* the
+  new checkpoint and be dropped from the windowed request; it is therefore
+  moved to after the summary. Compaction runs first — so the handoff
+  request covers the prompt, too — and the file is then rewritten with the
+  turn at the end. The next request asks the model to answer the prompt
+  with the handoff summary as context. If the run aborts mid-compaction,
+  the prompt stays in the file ahead of the unanswered `compact: true`
+  request instead of being lost.

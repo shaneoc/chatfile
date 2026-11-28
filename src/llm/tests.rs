@@ -467,6 +467,141 @@ data: [DONE]\n\n";
     assert!(v.get("tools").is_none());
 }
 
+#[tokio::test]
+async fn stream_options_include_usage_is_sent_in_request_body() {
+    let raw = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n\
+data: [DONE]\n\n";
+    let (url, bodies) = serve_multi(vec![raw.to_vec()]).await;
+
+    let client = Client::new(url, "test-model", None);
+    let mut stream = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap();
+    while stream.next().await.is_some() {}
+
+    let body = &bodies.lock().unwrap()[0];
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["stream_options"]["include_usage"], true);
+}
+
+#[test]
+fn parse_usage_object_from_final_chunk() {
+    // The usage object rides on the final chunk, whose `choices` is empty.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":80,"total_tokens":200}}"#;
+    let ev = parse_sse_line(line);
+    assert_eq!(
+        ev.usage,
+        Some(TokenUsage {
+            prompt_tokens: 120,
+            completion_tokens: 80,
+            total_tokens: 200,
+        })
+    );
+    // No delta content in that chunk.
+    assert_eq!(ev.content, None);
+    assert!(ev.tool_calls.is_empty());
+}
+
+#[test]
+fn parse_usage_missing_or_incomplete_is_none() {
+    assert_eq!(parse_sse_line("data: {\"choices\":[]}").usage, None);
+    // A field missing is not a usage report.
+    let line = r#"data: {"usage":{"prompt_tokens":1,"completion_tokens":2}}"#;
+    assert_eq!(parse_sse_line(line).usage, None);
+    // Non-numeric fields are not a usage report.
+    let line = r#"data: {"usage":{"prompt_tokens":"a","completion_tokens":2,"total_tokens":3}}"#;
+    assert_eq!(parse_sse_line(line).usage, None);
+}
+
+#[tokio::test]
+async fn stream_yields_usage_delta_and_finalized_turn_carries_it() {
+    let raw = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: close\r\n\
+\r\n\
+data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+data: {\"choices\":[],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":80,\"total_tokens\":200}}\n\n\
+data: [DONE]\n\n";
+    let url = serve_once(raw.to_vec()).await;
+
+    let client = Client::new(url, "test-model", None);
+    let mut stream = client
+        .stream_chat(&[Message::user("hi")], None)
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    let mut turn = AssistantTurn::default();
+    while let Some(delta) = stream.next().await {
+        let delta = delta.unwrap();
+        deltas.push(delta.clone());
+        turn.push(&delta);
+    }
+    assert_eq!(
+        deltas,
+        vec![
+            StreamDelta::Content("Hi".into()),
+            StreamDelta::Finished(Some("stop".into())),
+            StreamDelta::Usage(TokenUsage {
+                prompt_tokens: 120,
+                completion_tokens: 80,
+                total_tokens: 200,
+            })
+        ]
+    );
+    assert_eq!(
+        turn.usage,
+        Some(TokenUsage {
+            prompt_tokens: 120,
+            completion_tokens: 80,
+            total_tokens: 200,
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// should_auto_compact (§5.4 of docs/format.md)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn should_auto_compact_requires_a_context_limit() {
+    // No limit: never compacts, no matter the usage or percentage.
+    assert!(!should_auto_compact(u64::MAX, None, Some(1)));
+    assert!(!should_auto_compact(u64::MAX, None, None));
+}
+
+#[test]
+fn should_auto_compact_boundary_at_threshold() {
+    // Threshold: 262144 * 80 / 100 = 209715.
+    let limit = Some(262144);
+    assert!(!should_auto_compact(209_714, limit, None));
+    assert!(should_auto_compact(209_715, limit, None));
+    assert!(should_auto_compact(300_000, limit, None));
+}
+
+#[test]
+fn should_auto_compact_respects_custom_percent() {
+    // 1000 * 50 / 100 = 500; 1000 * 100 / 100 = 1000; 1000 * 1 / 100 = 10.
+    assert!(!should_auto_compact(499, Some(1000), Some(50)));
+    assert!(should_auto_compact(500, Some(1000), Some(50)));
+    assert!(!should_auto_compact(999, Some(1000), Some(100)));
+    assert!(should_auto_compact(1000, Some(1000), Some(100)));
+    assert!(!should_auto_compact(9, Some(1000), Some(1)));
+    assert!(should_auto_compact(10, Some(1000), Some(1)));
+}
+
+#[test]
+fn should_auto_compact_defaults_percent_to_80() {
+    // 100 * 80 / 100 = 80.
+    assert!(!should_auto_compact(79, Some(100), None));
+    assert!(should_auto_compact(80, Some(100), None));
+}
+
 // ---------------------------------------------------------------------------
 // build_api_messages: the compaction windowing (§5 of docs/format.md)
 // ---------------------------------------------------------------------------

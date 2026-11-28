@@ -252,6 +252,7 @@ pub fn compact_request_turn(custom_prompt: Option<&str>) -> parser::Turn {
             compact: true,
             length_limit_reached: false,
             content_filtered: false,
+            tokens: None,
         },
         reasoning: None,
         tool_calls: Vec::new(),
@@ -289,6 +290,9 @@ pub async fn run_compact(
         let stop = match &delta {
             StreamDelta::Reasoning(s) => !on_event(&LoopEvent::Reasoning(s.clone())),
             StreamDelta::Content(s) => !on_event(&LoopEvent::Content(s.clone())),
+            // The summary's usage updates the context meter (the new window
+            // starts at this checkpoint).
+            StreamDelta::Usage(u) => !on_event(&LoopEvent::Usage(*u)),
             _ => false,
         };
         turn.push(&delta);
@@ -432,6 +436,9 @@ impl Client {
             "model": self.model,
             "messages": messages,
             "stream": true,
+            // Ask for per-response token usage in the final chunk so the
+            // persisted `tokens:` counts and the context meter stay fed.
+            "stream_options": { "include_usage": true },
         });
         if let Some(n) = self.max_output_tokens {
             body["max_tokens"] = serde_json::json!(n);
@@ -460,6 +467,19 @@ impl Client {
     }
 }
 
+/// Token usage reported by the server in the final SSE chunk of a streamed
+/// response (the top-level `usage` object, requested via
+/// `stream_options: { "include_usage": true }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Tokens in the prompt (system message plus history).
+    pub prompt_tokens: u64,
+    /// Tokens in the completion.
+    pub completion_tokens: u64,
+    /// Total tokens for the request (`prompt + completion`, as reported).
+    pub total_tokens: u64,
+}
+
 /// One streamed delta.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamDelta {
@@ -469,9 +489,28 @@ pub enum StreamDelta {
     Content(String),
     /// A tool-call fragment from `delta.tool_calls` (see [`ToolCallDelta`]).
     ToolCall(ToolCallDelta),
+    /// The response's token usage (`usage` in the final chunk), sent once.
+    Usage(TokenUsage),
     /// The choice's `finish_reason` (e.g. `"stop"`, `"tool_calls"`), sent
     /// once, after all other deltas of the response.
     Finished(Option<String>),
+}
+
+/// Whether a conversation should be compacted automatically (§5.4 of
+/// `docs/format.md`): `true` when `context_limit` is set and `used_tokens`
+/// has reached or passed `auto_compact_percent` percent of it.
+/// `auto_compact_percent` defaults to 80 when unset; with no
+/// `context_limit` nothing ever triggers.
+pub fn should_auto_compact(
+    used_tokens: u64,
+    context_limit: Option<u64>,
+    auto_compact_percent: Option<u8>,
+) -> bool {
+    let Some(limit) = context_limit else {
+        return false;
+    };
+    let percent = auto_compact_percent.unwrap_or(80);
+    used_tokens >= limit.saturating_mul(u64::from(percent)) / 100
 }
 
 /// One tool-call fragment from `delta.tool_calls`.
@@ -504,6 +543,9 @@ pub struct SseEvent {
     pub content: Option<String>,
     /// Tool-call fragments from `delta.tool_calls`, in order.
     pub tool_calls: Vec<ToolCallDelta>,
+    /// The response's token usage (top-level `usage`), when present — the
+    /// final chunk of a stream requested with `include_usage`.
+    pub usage: Option<TokenUsage>,
     /// The choice's `finish_reason`, when present.
     pub finish_reason: Option<String>,
 }
@@ -567,6 +609,15 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
             }
         }
     }
+    // The usage object rides on the final chunk (whose `choices` is empty),
+    // at the top level of the payload.
+    ev.usage = v.get("usage").and_then(|u| {
+        Some(TokenUsage {
+            prompt_tokens: u.get("prompt_tokens")?.as_u64()?,
+            completion_tokens: u.get("completion_tokens")?.as_u64()?,
+            total_tokens: u.get("total_tokens")?.as_u64()?,
+        })
+    });
     ev.finish_reason = choice
         .and_then(|c| c.get("finish_reason"))
         .and_then(|f| f.as_str())
@@ -584,6 +635,9 @@ pub struct AssistantTurn {
     pub reasoning: String,
     /// Tool calls accumulated by stream index.
     pub tool_calls: Vec<CompletedToolCall>,
+    /// The response's token usage, when the server reported it (the final
+    /// chunk's `usage`; see [`TokenUsage`]).
+    pub usage: Option<TokenUsage>,
     /// The choice's `finish_reason`, when the server sent one.
     pub finish_reason: Option<String>,
 }
@@ -606,6 +660,7 @@ impl AssistantTurn {
             StreamDelta::Reasoning(s) => self.reasoning.push_str(s),
             StreamDelta::Content(s) => self.content.push_str(s),
             StreamDelta::ToolCall(d) => self.merge_tool_call(d),
+            StreamDelta::Usage(u) => self.usage = Some(*u),
             StreamDelta::Finished(r) => self.finish_reason = r.clone(),
         }
     }
@@ -699,6 +754,11 @@ impl SseStream {
         if let Some(reason) = ev.finish_reason {
             self.finished = true;
             self.pending.push_back(StreamDelta::Finished(Some(reason)));
+        }
+        // The usage chunk arrives after the finish reason (or as the only
+        // final chunk), so it is queued last.
+        if let Some(u) = ev.usage {
+            self.pending.push_back(StreamDelta::Usage(u));
         }
     }
 }
